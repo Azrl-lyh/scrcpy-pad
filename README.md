@@ -49,7 +49,7 @@ Windows 无需任何特殊权限。
 ## 编译
 
 ```bash
-git clone https://github.com/你的用户名/scrcpy-pad.git
+git clone https://github.com/Azrl-lyh/scrcpy-pad.git
 cd scrcpy-pad
 cargo build --release
 ```
