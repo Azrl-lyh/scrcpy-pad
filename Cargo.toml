@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2024"
 description = "A keyboard-mapping game console layered on top of scrcpy (virtual joystick, tap/hold/swipe injection)"
 license = "MIT"
-repository = ""
+repository = "https://github.com/Azrl-lyh/scrcpy-pad"
 keywords = ["scrcpy", "android", "gamepad", "keymapping"]
 categories = ["emulators", "games"]
 
