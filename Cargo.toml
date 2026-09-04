@@ -1,0 +1,32 @@
+[package]
+name = "scrcpy-pad"
+version = "0.2.0"
+edition = "2024"
+description = "A keyboard-mapping game console layered on top of scrcpy (virtual joystick, tap/hold/swipe injection)"
+license = "MIT"
+repository = ""
+keywords = ["scrcpy", "android", "gamepad", "keymapping"]
+categories = ["emulators", "games"]
+
+[dependencies]
+anyhow = "1.0.104"
+directories = "6.0.0"
+eframe = { version = "0.36.1", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+egui = "0.36.1"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+# Linux: evdev 全局键盘捕获(Wayland/X11 均可,需 input 组权限)
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.13.2"
+
+# Windows: rdev 低级键盘钩子(无需管理员权限)
+[target.'cfg(windows)'.dependencies]
+rdev = "0.5.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = 2
