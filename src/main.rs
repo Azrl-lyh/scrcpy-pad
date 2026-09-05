@@ -3,6 +3,7 @@ mod app;
 mod capture;
 mod control;
 mod engine;
+mod filedialog;
 mod keymap;
 
 fn main() -> eframe::Result<()> {
@@ -24,7 +25,7 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// 无界面自检:验证键盘捕获权限 / adb / 控制通道 / 协议注入(仅发无害 hover)
+/// 无界面自检:验证键盘捕获权限 / adb / scrcpy 定位 / 控制通道 / 协议注入(仅发无害 hover)
 fn selftest() {
     let mut failed = false;
     let mut check = |name: &str, ok: bool, detail: &str| {
@@ -53,7 +54,20 @@ fn selftest() {
     #[cfg(windows)]
     check("键盘捕获(rdev)", true, "(Windows 无需特殊权限)");
 
-    // 2. adb 设备
+    // 2. scrcpy 定位与版本
+    let exe = adb::find_scrcpy();
+    check("自动寻找 scrcpy", exe.is_some(), "");
+    let Some(exe) = exe else { std::process::exit(1) };
+    let ver = adb::scrcpy_version_at(&exe.display().to_string());
+    check("scrcpy 版本", ver.is_some(), &format!("{ver:?}"));
+    let Some(version) = ver else { std::process::exit(1) };
+
+    let server_file = adb::find_server(Some(&exe));
+    check("定位 scrcpy-server", server_file.is_some(), "");
+    let Some(server_file) = server_file else { std::process::exit(1) };
+    let server_path = server_file.display().to_string();
+
+    // 3. adb 设备
     let devices = adb::list_devices();
     check("adb 设备在线", !devices.is_empty(), &format!("({} 台)", devices.len()));
     if devices.is_empty() {
@@ -61,20 +75,13 @@ fn selftest() {
     }
     let serial = devices[0].clone();
 
-    // 3. 分辨率
+    // 4. 分辨率
     let size = adb::screen_size(&serial);
     check("读取分辨率", size.is_ok(), &format!("{size:?}"));
     let Ok((w, h)) = size else { std::process::exit(1) };
 
-    // 4. scrcpy-server 控制通道
-    let version = adb::scrcpy_version().unwrap_or_else(|| "4.1".into());
-    let server = adb::start_control_server(
-        &serial,
-        adb::default_server_path(),
-        &version,
-        0x1a2b3c4d,
-        28383,
-    );
+    // 5. scrcpy-server 控制通道
+    let server = adb::start_control_server(&serial, &server_path, &version, 0x1a2b3c4d, 28383);
     let Ok(server) = server else {
         check("启动 control server", false, &format!("{:?}", server.err()));
         std::process::exit(1);
@@ -94,7 +101,7 @@ fn selftest() {
     check("TCP 连接控制通道", client.is_some(), "");
     let Some(client) = client else { std::process::exit(1) };
 
-    // 5. 协议注入(hover 移动,不触碰屏幕内容)
+    // 6. 协议注入(hover 移动,不触碰屏幕内容)
     let mouse = u64::MAX;
     client.send(control::ControlCmd::Touch { action: 7, pointer_id: mouse, x: 640, y: 1386 });
     client.send(control::ControlCmd::Touch { action: 7, pointer_id: mouse, x: 700, y: 1400 });

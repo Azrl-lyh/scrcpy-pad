@@ -1,6 +1,6 @@
 [package]
 name = "scrcpy-pad"
-version = "0.2.0"
+version = "0.1.0"
 edition = "2024"
 description = "A keyboard-mapping game console layered on top of scrcpy (virtual joystick, tap/hold/swipe injection)"
 license = "MIT"
@@ -17,13 +17,17 @@ image = { version = "0.25.10", default-features = false, features = ["png"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 
-# Linux: evdev 全局键盘捕获(Wayland/X11 均可,需 input 组权限)
+# Linux: evdev 全局键盘捕获 + xdg-portal 原生文件对话框
+# (rfd 的 xdg-portal 后端要求配套 async 运行时特性,选 async-std)
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = "0.13.2"
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+pollster = "0.4"
 
-# Windows: rdev 低级键盘钩子(无需管理员权限)
+# Windows: rdev 低级键盘钩子(无需管理员权限) + 原生文件对话框
 [target.'cfg(windows)'.dependencies]
 rdev = "0.5.3"
+rfd = { version = "0.15", default-features = false }
 
 [profile.release]
 lto = "thin"

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 fn adb_cmd(serial: Option<&str>) -> Command {
@@ -60,9 +61,97 @@ pub fn screencap_png(serial: &str) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-/// 解析本机 scrcpy 版本号 (如 "4.1")
-pub fn scrcpy_version() -> Option<String> {
-    let out = Command::new("scrcpy").arg("--version").output().ok()?;
+// ===================== scrcpy 定位与测试 =====================
+
+/// 在 PATH 环境变量中查找可执行文件
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path_env = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_env) {
+        let p = dir.join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// 自动寻找 scrcpy 可执行文件:PATH 优先,其次各平台常见安装位置
+pub fn find_scrcpy() -> Option<PathBuf> {
+    let path_names: &[&str] = if cfg!(windows) {
+        &["scrcpy.exe"]
+    } else {
+        &["scrcpy"]
+    };
+    for name in path_names {
+        if let Some(p) = find_in_path(name) {
+            return Some(p);
+        }
+    }
+
+    let candidates: Vec<PathBuf> = if cfg!(windows) {
+        let mut v = vec![
+            PathBuf::from(r"C:\Program Files\scrcpy\scrcpy.exe"),
+            PathBuf::from(r"C:\Program Files (x86)\scrcpy\scrcpy.exe"),
+        ];
+        if let Some(lo) = std::env::var_os("LOCALAPPDATA") {
+            v.push(PathBuf::from(&lo).join(r"Programs\scrcpy\scrcpy.exe"));
+        }
+        if let Some(home) = std::env::var_os("USERPROFILE") {
+            v.push(PathBuf::from(&home).join(r"scoop\shims\scrcpy.exe"));
+        }
+        v.push(PathBuf::from(r"C:\ProgramData\chocolatey\bin\scrcpy.exe"));
+        v
+    } else {
+        let mut v = vec![
+            PathBuf::from("/usr/bin/scrcpy"),
+            PathBuf::from("/usr/local/bin/scrcpy"),
+            PathBuf::from("/opt/scrcpy/scrcpy"),
+            PathBuf::from("/snap/bin/scrcpy"),
+        ];
+        if let Some(home) = std::env::var_os("HOME") {
+            v.push(PathBuf::from(&home).join(".local/bin/scrcpy"));
+        }
+        v
+    };
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// 给定 scrcpy 可执行文件位置,寻找配套 scrcpy-server:
+/// 优先与可执行文件同目录(官方发行包布局),其次系统共享目录
+pub fn find_server(scrcpy_path: Option<&Path>) -> Option<PathBuf> {
+    if let Some(exe) = scrcpy_path {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join("scrcpy-server");
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    if cfg!(target_os = "linux") {
+        for s in ["/usr/share/scrcpy/scrcpy-server", "/usr/local/share/scrcpy/scrcpy-server"] {
+            let p = PathBuf::from(s);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// 各平台默认的 scrcpy-server 位置(静态回退,优先用 find_server 自动发现)
+pub fn default_server_path() -> &'static str {
+    if cfg!(windows) {
+        "scrcpy-server"
+    } else {
+        "/usr/share/scrcpy/scrcpy-server"
+    }
+}
+
+/// 运行 scrcpy --version 解析版本号(如 "4.1")。
+/// exe 为空时视为 PATH 中的 "scrcpy"。
+pub fn scrcpy_version_at(exe: &str) -> Option<String> {
+    let exe = if exe.trim().is_empty() { "scrcpy" } else { exe };
+    let out = Command::new(exe).arg("--version").output().ok()?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     // 第一行: "scrcpy 4.1 <https://...>"
     stdout
@@ -71,17 +160,45 @@ pub fn scrcpy_version() -> Option<String> {
         .split_whitespace()
         .nth(1)
         .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
 }
 
-/// 各平台默认的 scrcpy-server 位置
-pub fn default_server_path() -> &'static str {
-    if cfg!(windows) {
-        // Windows: scrcpy 官方发行包里 server 与 scrcpy.exe 同目录
-        "scrcpy-server"
-    } else {
-        "/usr/share/scrcpy/scrcpy-server"
+/// 设备信息(用于日志)
+pub struct DeviceInfo {
+    pub serial: String,
+    pub brand: String,
+    pub model: String,
+    pub android: String,
+    pub screen: String,
+    pub host_os: String,
+    pub scrcpy: String,
+}
+
+/// 收集设备与环境信息(全部为只读 adb 查询)
+pub fn device_info(serial: &str, scrcpy_ver: &str) -> DeviceInfo {
+    let getprop = |prop: &str| {
+        adb_cmd(Some(serial))
+            .args(["shell", "getprop", prop])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    };
+    let screen = screen_size(serial)
+        .map(|(w, h)| format!("{w}x{h}"))
+        .unwrap_or_else(|_| "未知".into());
+    DeviceInfo {
+        serial: serial.to_string(),
+        brand: getprop("ro.product.brand"),
+        model: getprop("ro.product.model"),
+        android: getprop("ro.build.version.release"),
+        screen,
+        host_os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+        scrcpy: scrcpy_ver.to_string(),
     }
 }
+
+// ===================== 控制通道 =====================
 
 /// 启动一个 control-only 的 scrcpy-server(无视频无音频,仅控制通道),
 /// 返回 (server 子进程, 本地转发端口)。
@@ -96,6 +213,7 @@ pub fn start_control_server(
     const DEVICE_JAR: &str = "/data/local/tmp/scrcpy-server-pad.jar";
 
     // server 必须推送到设备侧路径(scrcpy 官方行为相同,推入 /data/local/tmp)
+    // 路径直接作为参数传递,不经 shell,空格/中文路径安全
     let st = adb_cmd(Some(serial))
         .args(["push", server_path, DEVICE_JAR])
         .output()
@@ -153,8 +271,9 @@ impl Drop for ControlServer {
 }
 
 /// 启动常规 scrcpy 窗口(独立子进程,关闭本程序时不强杀,由用户自行关闭窗口)
-pub fn launch_scrcpy(serial: &str, extra_args: &str) -> Result<Child> {
-    let mut cmd = Command::new("scrcpy");
+pub fn launch_scrcpy(exe: &str, serial: &str, extra_args: &str) -> Result<Child> {
+    let exe = if exe.trim().is_empty() { "scrcpy" } else { exe };
+    let mut cmd = Command::new(exe);
     if !serial.is_empty() {
         cmd.args(["-s", serial]);
     }

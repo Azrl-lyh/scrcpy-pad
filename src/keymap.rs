@@ -45,6 +45,23 @@ pub struct KeyBind {
     pub action: Action,
 }
 
+/// 临时摇杆的启用模式
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TempMode {
+    /// 按住启用键期间生效,松开即失效
+    Hold,
+    /// 按一下启用,再按一下失效
+    Toggle,
+}
+
+/// 临时摇杆:设置启用键后,方向键仅在启用期间归摇杆,期间同键位的其它绑定失效
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TempWheel {
+    /// 启用键
+    pub key: u16,
+    pub mode: TempMode,
+}
+
 /// 虚拟轮盘:四个方向键控制一个以 (cx, cy) 为中心、radius 为半径的虚拟摇杆
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Wheel {
@@ -55,6 +72,9 @@ pub struct Wheel {
     pub cx: i32,
     pub cy: i32,
     pub radius: u32,
+    /// None=永久摇杆;Some=临时摇杆(按启用键期间方向键归摇杆)
+    #[serde(default)]
+    pub temp: Option<TempWheel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +100,7 @@ impl Default for Profile {
                 cx: 300,
                 cy: 900,
                 radius: 120,
+                temp: None,
             }],
         }
     }

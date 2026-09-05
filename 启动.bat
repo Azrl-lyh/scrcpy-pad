@@ -1,12 +1,12 @@
 @echo off
-chcp 65001 >nul
+chcp 936 >nul
 cd /d %~dp0
 
-if not exist target\release\scrcpy-pad.exe (
-    echo æœªæ‰¾åˆ°ç¼–è¯‘äº§ç‰©,å¼€å§‹ç¼–è¯‘(ä»…é¦–æ¬¡éœ€è¦)...
+if not exist .\target\release\scrcpy-pad.exe (
+    echo Î´ÕÒµ½±àÒë²úÎï£¬¿ªÊ¼±àÒë£¨½öÊ×´ÎĞèÒª£©...
     cargo build --release
     if errorlevel 1 (
-        echo ç¼–è¯‘å¤±è´¥,è¯·ç¡®è®¤å·²å®‰è£… Rust: https://rustup.rs
+        echo ±àÒëÊ§°Ü£¬ÇëÈ·±£ÒÑ°²×° Rust: https://rustup.rs
         pause
         exit /b 1
     )

@@ -2,7 +2,7 @@ use crate::adb::{self, ControlServer};
 use crate::capture::{Capture, CaptureKey};
 use crate::control::ControlClient;
 use crate::engine::{Shared, SharedState};
-use crate::keymap::{Action, KeyBind, Profile, Wheel, key_name};
+use crate::keymap::{Action, KeyBind, Profile, TempMode, TempWheel, Wheel, key_name};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,12 +12,15 @@ use std::time::Duration;
 
 const SCID: u32 = 0x1a2b3c4d;
 const LOCAL_PORT: u16 = 28383;
+const REPO_URL: &str = "https://github.com/Azrl-lyh/scrcpy-pad";
+const AUTHOR: &str = "Azrl-lyh";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum KeySlot {
     NewBind,
     Bind(usize),
     WheelDir { wheel: usize, dir: usize }, // dir: 0上 1下 2左 3右
+    WheelEnable(usize),                   // 临时轮盘启用键
     Toggle,
 }
 
@@ -26,6 +29,35 @@ enum CoordSlot {
     NewBind,
     Bind(usize),
     WheelCenter(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OverlayFilter {
+    All,
+    Keys,
+    Wheels,
+    PermWheels,
+    TempWheels,
+}
+
+impl OverlayFilter {
+    fn label(&self) -> &'static str {
+        match self {
+            OverlayFilter::All => "全部",
+            OverlayFilter::Keys => "仅键位",
+            OverlayFilter::Wheels => "仅摇杆",
+            OverlayFilter::PermWheels => "永久摇杆",
+            OverlayFilter::TempWheels => "临时摇杆",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DialogPurpose {
+    ScrcpyExe,
+    ServerJar,
+    SaveLog,
+    SaveProfileAs,
 }
 
 struct DraftBind {
@@ -62,8 +94,12 @@ pub struct PadApp {
     devices: Vec<String>,
     selected: usize,
     scrcpy_args: String,
+    /// scrcpy 可执行文件路径(空 = 使用 PATH 中的 scrcpy)
+    scrcpy_path: String,
     server_path: String,
+    /// 由[测试]/[自动寻找]检测出的版本,只读显示
     server_version: String,
+    test_msg: Option<(bool, String)>,
 
     server: Option<ControlServer>,
     connect_rx: Option<Receiver<Result<(ControlServer, ControlClient), String>>>,
@@ -72,11 +108,22 @@ pub struct PadApp {
     picking: Option<CoordSlot>,
     shot: Option<(egui::TextureHandle, u32, u32)>,
     shot_rx: Option<Receiver<Result<egui::ColorImage, String>>>,
+    overlay_filter: OverlayFilter,
 
     draft: DraftBind,
     logs: VecDeque<String>,
     profile_path: PathBuf,
     grab_enabled: bool,
+
+    about_open: bool,
+    dialog: Option<crate::filedialog::FileDialogHandle>,
+    dialog_purpose: DialogPurpose,
+    loginfo_rx: Option<Receiver<adb::DeviceInfo>>,
+    pending_log: Option<String>,
+
+    // 撤销/重做栈
+    undo_stack: Vec<Profile>,
+    redo_stack: Vec<Profile>,
 }
 
 /// egui 默认字体不含 CJK,从系统加载中文字体作为回退
@@ -163,7 +210,31 @@ impl PadApp {
             std::thread::spawn(move || crate::engine::run(shared, cap_rx, gui_tx));
         }
 
-        let version = adb::scrcpy_version().unwrap_or_else(|| "4.1".into());
+        // 自动寻找 scrcpy 与 server
+        let (scrcpy_path, server_path, version, found_msg) = {
+            let exe = adb::find_scrcpy();
+            let server = adb::find_server(exe.as_deref())
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| adb::default_server_path().to_string());
+            match exe {
+                Some(p) => {
+                    let ps = p.display().to_string();
+                    let v = adb::scrcpy_version_at(&ps).unwrap_or_default();
+                    (
+                        ps.clone(),
+                        server,
+                        v,
+                        format!("已自动找到 scrcpy: {ps}"),
+                    )
+                }
+                None => (
+                    String::new(),
+                    server,
+                    String::new(),
+                    "未找到 scrcpy,请在左栏手动指定路径".to_string(),
+                ),
+            }
+        };
 
         let mut app = Self {
             shared,
@@ -174,20 +245,31 @@ impl PadApp {
             devices: adb::list_devices(),
             selected: 0,
             scrcpy_args: "--stay-awake".into(),
-            server_path: adb::default_server_path().into(),
+            scrcpy_path,
+            server_path,
             server_version: version,
+            test_msg: None,
             server: None,
             connect_rx: None,
             waiting_key: None,
             picking: None,
             shot: None,
             shot_rx: None,
+            overlay_filter: OverlayFilter::All,
             draft: DraftBind::default(),
             logs: VecDeque::new(),
             profile_path,
             grab_enabled: false,
+            about_open: false,
+            dialog: None,
+            dialog_purpose: DialogPurpose::ScrcpyExe,
+            loginfo_rx: None,
+            pending_log: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         };
         app.log("就绪。顺序: 连接手机 -> [连接控制] -> [启动 scrcpy] -> 按总开关键开启映射");
+        app.log(found_msg);
         let _ = cc;
         app
     }
@@ -203,6 +285,31 @@ impl PadApp {
         self.devices.get(self.selected).cloned().unwrap_or_default()
     }
 
+    /// 测试 scrcpy:能否运行 + server 是否存在,并更新只读版本显示
+    fn test_scrcpy(&mut self) {
+        let ver = adb::scrcpy_version_at(&self.scrcpy_path);
+        let srv_ok = PathBuf::from(&self.server_path).is_file();
+        match ver {
+            Some(v) if srv_ok => {
+                self.server_version = v.clone();
+                self.test_msg = Some((true, format!("scrcpy {v} · server 就绪")));
+                self.log(format!("scrcpy 测试通过: 版本 {v},server: {}", self.server_path));
+            }
+            Some(v) => {
+                self.server_version = v.clone();
+                self.test_msg = Some((
+                    false,
+                    format!("scrcpy {v} 可用,但 scrcpy-server 不存在,请指定"),
+                ));
+                self.log("scrcpy 测试: server 文件缺失");
+            }
+            None => {
+                self.test_msg = Some((false, "无法运行 scrcpy,请检查程序路径".into()));
+                self.log("scrcpy 测试失败: 无法执行(检查路径)");
+            }
+        }
+    }
+
     fn connect_control(&mut self) {
         let serial = self.serial();
         if serial.is_empty() {
@@ -210,7 +317,11 @@ impl PadApp {
             return;
         }
         let server_path = self.server_path.clone();
-        let version = self.server_version.clone();
+        let version = if self.server_version.is_empty() {
+            adb::scrcpy_version_at(&self.scrcpy_path).unwrap_or_else(|| "4.1".into())
+        } else {
+            self.server_version.clone()
+        };
         let (tx, rx) = channel();
         self.connect_rx = Some(rx);
         self.log("正在启动 control-only scrcpy-server...");
@@ -271,6 +382,7 @@ impl PadApp {
     }
 
     fn assign_key(&mut self, slot: KeySlot, code: u16) {
+        self.push_undo();
         {
             let mut g = self.shared.lock().unwrap();
             match slot {
@@ -290,6 +402,16 @@ impl PadApp {
                         }
                     }
                 }
+                KeySlot::WheelEnable(i) => {
+                    if let Some(w) = g.profile.wheels.get_mut(i) {
+                        let mode = w
+                            .temp
+                            .as_ref()
+                            .map(|t| t.mode)
+                            .unwrap_or(TempMode::Hold);
+                        w.temp = Some(TempWheel { key: code, mode });
+                    }
+                }
                 KeySlot::Toggle => g.profile.toggle_key = code,
             }
         }
@@ -297,6 +419,7 @@ impl PadApp {
     }
 
     fn assign_coord(&mut self, slot: CoordSlot, x: i32, y: i32) {
+        self.push_undo();
         {
             let mut g = self.shared.lock().unwrap();
             match slot {
@@ -325,6 +448,33 @@ impl PadApp {
         self.log(format!("坐标已设置: ({x}, {y})"));
     }
 
+    /// 组装完整日志文本(含环境信息)
+    fn build_log_content(&self, info: &adb::DeviceInfo) -> String {
+        let mut s = String::new();
+        s.push_str("scrcpy-pad 运行日志\n");
+        s.push_str(&format!("保存时间: {}\n", fmt_timestamp(std::time::SystemTime::now())));
+        s.push_str(&format!("程序版本: {}\n", env!("CARGO_PKG_VERSION")));
+        s.push_str(&format!("主机环境: {}\n", info.host_os));
+        s.push_str(&format!(
+            "scrcpy: {} ({})\n",
+            info.scrcpy,
+            if self.scrcpy_path.is_empty() { "PATH" } else { &self.scrcpy_path }
+        ));
+        s.push_str(&format!("server: {}\n", self.server_path));
+        s.push('\n');
+        s.push_str(&format!("设备: {}\n", info.serial));
+        s.push_str(&format!("品牌/型号: {} {}\n", info.brand, info.model));
+        s.push_str(&format!("Android: {}\n", info.android));
+        s.push_str(&format!("分辨率: {}\n", info.screen));
+        s.push('\n');
+        s.push_str("===== 运行日志 =====\n");
+        for l in self.logs.iter() {
+            s.push_str(l);
+            s.push('\n');
+        }
+        s
+    }
+
     fn key_button(ui: &mut egui::Ui, waiting: bool, code: Option<u16>) -> egui::Response {
         let label = if waiting {
             "按任意键...".to_string()
@@ -333,12 +483,98 @@ impl PadApp {
         };
         ui.add(egui::Button::new(label).min_size(egui::vec2(110.0, 0.0)))
     }
+
+    /// 保存当前配置快照到撤销栈
+    fn push_undo(&mut self) {
+        let profile = self.shared.lock().unwrap().profile.clone();
+        self.undo_stack.push(profile);
+        self.redo_stack.clear();
+        // 限制栈大小
+        if self.undo_stack.len() > 50 {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    /// 撤销
+    fn undo(&mut self) {
+        if let Some(profile) = self.undo_stack.pop() {
+            let current = self.shared.lock().unwrap().profile.clone();
+            self.redo_stack.push(current);
+            self.shared.lock().unwrap().profile = profile;
+            self.log("已撤销");
+        }
+    }
+
+    /// 重做
+    fn redo(&mut self) {
+        if let Some(profile) = self.redo_stack.pop() {
+            let current = self.shared.lock().unwrap().profile.clone();
+            self.undo_stack.push(current);
+            self.shared.lock().unwrap().profile = profile;
+            self.log("已重做");
+        }
+    }
+
+    /// 保存配置
+    fn save_profile(&mut self) {
+        let json = {
+            let g = self.shared.lock().unwrap();
+            serde_json::to_string_pretty(&g.profile)
+        };
+        match json {
+            Ok(json) => {
+                if let Some(parent) = self.profile_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match std::fs::write(&self.profile_path, json) {
+                    Ok(_) => self.log(format!("已保存到 {}", self.profile_path.display())),
+                    Err(e) => self.log(format!("保存失败: {e}")),
+                }
+            }
+            Err(e) => self.log(format!("序列化失败: {e}")),
+        }
+    }
+
+    /// 刷新设备列表
+    fn refresh_devices(&mut self) {
+        self.devices = adb::list_devices();
+        self.selected = 0;
+        self.log(format!("设备已刷新,共 {} 台", self.devices.len()));
+    }
 }
 
 impl eframe::App for PadApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
+
+        // ---- 全局快捷键: 撤销/重做/保存/另存为/刷新设备 ----
+        // 键位捕获或取点进行中、正在输入文本时不拦截,保证 Ctrl+Z 等可作为待绑定键
+        if self.waiting_key.is_none() && self.picking.is_none() && !ctx.egui_wants_keyboard_input() {
+            let (k_undo, k_redo, k_save, k_save_as, k_refresh) = ctx.input(|i| {
+                let ctrl = i.modifiers.ctrl;
+                let shift = i.modifiers.shift;
+                (
+                    ctrl && !shift && i.key_pressed(egui::Key::Z),
+                    ctrl && !shift && i.key_pressed(egui::Key::Y),
+                    ctrl && !shift && i.key_pressed(egui::Key::S),
+                    ctrl && shift && i.key_pressed(egui::Key::S),
+                    !ctrl && !shift && i.key_pressed(egui::Key::F5),
+                )
+            });
+            if k_undo {
+                self.undo();
+            } else if k_redo {
+                self.redo();
+            } else if k_save {
+                self.save_profile();
+            } else if k_save_as {
+                self.dialog = Some(crate::filedialog::save_file("scrcpy-pad-profile.json"));
+                self.dialog_purpose = DialogPurpose::SaveProfileAs;
+            } else if k_refresh {
+                self.refresh_devices();
+            }
+        }
 
         // ---- 异步任务回收 ----
         if let Some(rx) = &self.connect_rx {
@@ -366,6 +602,63 @@ impl eframe::App for PadApp {
                     }
                     Err(e) => self.log(format!("截图失败: {e}")),
                 }
+            }
+        }
+
+        // ---- 文件对话框回收 ----
+        if let Some(d) = &self.dialog {
+            if let Some(res) = d.try_result() {
+                self.dialog = None;
+                let purpose = self.dialog_purpose;
+                match (purpose, res) {
+                    (_, None) => self.log("已取消"),
+                    (DialogPurpose::ScrcpyExe, Some(p)) => {
+                        self.scrcpy_path = p.display().to_string();
+                        self.log(format!("已选择 scrcpy: {}", self.scrcpy_path));
+                        self.test_scrcpy();
+                    }
+                    (DialogPurpose::ServerJar, Some(p)) => {
+                        self.server_path = p.display().to_string();
+                        self.log(format!("已选择 server: {}", self.server_path));
+                        self.test_scrcpy();
+                    }
+                    (DialogPurpose::SaveLog, Some(p)) => {
+                        let content = self.pending_log.take().unwrap_or_default();
+                        match std::fs::write(&p, content) {
+                            Ok(_) => self.log(format!("日志已保存到 {}", p.display())),
+                            Err(e) => self.log(format!("日志保存失败: {e}")),
+                        }
+                    }
+                    (DialogPurpose::SaveProfileAs, Some(p)) => {
+                        let json = {
+                            let g = self.shared.lock().unwrap();
+                            serde_json::to_string_pretty(&g.profile)
+                        };
+                        match json {
+                            Ok(json) => match std::fs::write(&p, json) {
+                                Ok(_) => self.log(format!(
+                                    "配置已另存到 {}(可直接分享该文件)",
+                                    p.display()
+                                )),
+                                Err(e) => self.log(format!("另存失败: {e}")),
+                            },
+                            Err(e) => self.log(format!("序列化失败: {e}")),
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- 日志环境信息收集完成 -> 打开另存对话框 ----
+        if let Some(rx) = &self.loginfo_rx {
+            if let Ok(info) = rx.try_recv() {
+                self.loginfo_rx = None;
+                let content = self.build_log_content(&info);
+                self.pending_log = Some(content);
+                let name = format!("scrcpy-pad-log-{}.txt", timestamp_compact());
+                self.dialog = Some(crate::filedialog::save_file(&name));
+                self.dialog_purpose = DialogPurpose::SaveLog;
+                self.log("请选择日志保存位置...");
             }
         }
 
@@ -400,6 +693,15 @@ impl eframe::App for PadApp {
         // ================= 顶栏 =================
         egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal(|ui| {
+                // 撤销/重做按钮
+                if ui.button("⟲ 撤销").clicked() {
+                    self.undo();
+                }
+                if ui.button("⟳ 重做").clicked() {
+                    self.redo();
+                }
+                ui.separator();
+
                 ui.label("设备:");
                 let cur = self.serial();
                 egui::ComboBox::from_id_salt("dev")
@@ -410,15 +712,15 @@ impl eframe::App for PadApp {
                         }
                     });
                 if ui.button("刷新").clicked() {
-                    self.devices = adb::list_devices();
-                    self.selected = 0;
+                    self.refresh_devices();
                 }
 
                 ui.separator();
                 ui.label("scrcpy参数:");
-                ui.add(egui::TextEdit::singleline(&mut self.scrcpy_args).desired_width(200.0));
+                ui.add(egui::TextEdit::singleline(&mut self.scrcpy_args).desired_width(160.0));
                 if ui.button("启动 scrcpy").clicked() {
-                    match adb::launch_scrcpy(&self.serial(), &self.scrcpy_args) {
+                    match adb::launch_scrcpy(&self.scrcpy_path, &self.serial(), &self.scrcpy_args)
+                    {
                         Ok(_) => self.log("scrcpy 已启动"),
                         Err(e) => self.log(format!("启动失败: {e:#}")),
                     }
@@ -456,6 +758,11 @@ impl eframe::App for PadApp {
                     let mut g = self.shared.lock().unwrap();
                     g.enabled = !g.enabled;
                 }
+
+                ui.separator();
+                if ui.button("关于").clicked() {
+                    self.about_open = true;
+                }
             });
         });
 
@@ -468,15 +775,21 @@ impl eframe::App for PadApp {
                         "1. 手机开 USB 调试并连接\n\
                          2. 顶栏选设备 → [连接控制]\n\
                          3. [启动 scrcpy] 出画面\n\
-                         4. 在右侧添加键位/轮盘:\n\
-                           [截取手机屏幕]后点图取点\n\
-                         5. 按 F8(可改)开映射\n\
-                         6. 关闭映射后再按 F8 恢复\n\
+                         4. 右侧添加键位/轮盘,截图取点\n\
+                         5. 按总开关键(默认F8)开映射\n\
                          \n\
-                         动作类型:\n\
-                         点按=单击 长按=按住不放\n\
-                         滑动=一次轨迹 系统键=返回等\n\
-                         轮盘=WASD 式虚拟摇杆",
+                         临时轮盘:设置[启用键]后,\n\
+                         该轮盘仅在启用期间生效,\n\
+                         期间方向键的其它绑定自动让位\n\
+                         \n\
+                         动作:点按/长按/滑动/系统键\n\
+                         长短按可用[转长按]按钮互切\n\
+                         \n\
+                         快捷键(键位捕获/取点/打字时不生效):\n\
+                         Ctrl+Z 撤销 ⟳恢复用 Ctrl+Y\n\
+                         Ctrl+S 保存配置\n\
+                         Ctrl+Shift+S 另存为\n\
+                         F5 刷新设备",
                     );
                 });
             ui.separator();
@@ -489,35 +802,42 @@ impl eframe::App for PadApp {
             ui.heading("配置");
             ui.horizontal(|ui| {
                 if ui.button("保存配置").clicked() {
-                    let json = {
-                        let g = self.shared.lock().unwrap();
-                        serde_json::to_string_pretty(&g.profile)
-                    };
-                    match json {
-                        Ok(json) => {
-                            if let Some(parent) = self.profile_path.parent() {
-                                let _ = std::fs::create_dir_all(parent);
-                            }
-                            match std::fs::write(&self.profile_path, json) {
-                                Ok(_) => {
-                                    self.log(format!("已保存到 {}", self.profile_path.display()))
-                                }
-                                Err(e) => self.log(format!("保存失败: {e}")),
-                            }
-                        }
-                        Err(e) => self.log(format!("序列化失败: {e}")),
-                    }
+                    self.save_profile();
+                }
+                if ui.button("另存为...").clicked() {
+                    self.dialog = Some(crate::filedialog::save_file("scrcpy-pad-profile.json"));
+                    self.dialog_purpose = DialogPurpose::SaveProfileAs;
                 }
                 if ui.button("重新加载").clicked() {
                     match load_profile() {
                         Some(p) => {
+                            self.push_undo();
                             self.shared.lock().unwrap().profile = p;
-                            self.log("配置已重新加载");
+                            self.log("配置已重新加载(可用撤销回退)");
                         }
                         None => self.log("加载失败或配置文件不存在"),
                     }
                 }
             });
+            if ui.button("保存日志...").clicked() {
+                let serial = self.serial();
+                if serial.is_empty() {
+                    self.log("错误: 未选择设备(日志需包含设备信息)");
+                } else {
+                    let ver = if self.server_version.is_empty() {
+                        adb::scrcpy_version_at(&self.scrcpy_path).unwrap_or_default()
+                    } else {
+                        self.server_version.clone()
+                    };
+                    let (tx, rx) = channel();
+                    self.loginfo_rx = Some(rx);
+                    self.log("正在收集设备信息...");
+                    std::thread::spawn(move || {
+                        let info = adb::device_info(&serial, &ver);
+                        let _ = tx.send(info);
+                    });
+                }
+            }
 
             ui.horizontal(|ui| {
                 ui.label("总开关键:");
@@ -533,11 +853,47 @@ impl eframe::App for PadApp {
             );
 
             ui.separator();
-            ui.heading("服务端");
+            ui.heading("scrcpy");
+            ui.label("程序路径(留空=PATH):");
+            ui.text_edit_singleline(&mut self.scrcpy_path);
+            ui.horizontal(|ui| {
+                if ui.button("浏览...").clicked() {
+                    self.dialog = Some(crate::filedialog::pick_file());
+                    self.dialog_purpose = DialogPurpose::ScrcpyExe;
+                }
+                if ui.button("自动寻找").clicked() {
+                    match adb::find_scrcpy() {
+                        Some(p) => {
+                            self.scrcpy_path = p.display().to_string();
+                            if let Some(s) = adb::find_server(Some(&p)) {
+                                self.server_path = s.display().to_string();
+                            }
+                            self.log(format!("已找到 scrcpy: {}", self.scrcpy_path));
+                            self.test_scrcpy();
+                        }
+                        None => self.log("未找到 scrcpy,请手动指定路径"),
+                    }
+                }
+                if ui.button("测试").clicked() {
+                    self.test_scrcpy();
+                }
+            });
+            if let Some((ok, msg)) = &self.test_msg {
+                ui.colored_label(
+                    if *ok { egui::Color32::GREEN } else { egui::Color32::RED },
+                    msg,
+                );
+            }
             ui.label("scrcpy-server 路径:");
             ui.text_edit_singleline(&mut self.server_path);
-            ui.label("版本:");
-            ui.text_edit_singleline(&mut self.server_version);
+            if ui.button("浏览...").clicked() {
+                self.dialog = Some(crate::filedialog::pick_file());
+                self.dialog_purpose = DialogPurpose::ServerJar;
+            }
+            ui.label(format!(
+                "检测版本: {}",
+                if self.server_version.is_empty() { "未检测" } else { &self.server_version }
+            ));
 
             ui.separator();
             ui.heading("日志");
@@ -560,6 +916,21 @@ impl eframe::App for PadApp {
                 self.ui_picker(ui);
             });
         });
+
+        // ================= 关于窗口 =================
+        if self.about_open {
+            egui::Window::new("关于")
+                .open(&mut self.about_open)
+                .show(ctx, |ui| {
+                    ui.heading("scrcpy-pad");
+                    ui.label(format!("版本 v{}", env!("CARGO_PKG_VERSION")));
+                    ui.label(format!("作者: {AUTHOR}"));
+                    ui.hyperlink(REPO_URL);
+                    ui.separator();
+                    ui.label("基于 scrcpy 控制协议的键鼠映射游戏控制台");
+                    ui.label("MIT License © 2026 Azrl");
+                });
+        }
 
         ctx.request_repaint_after(Duration::from_millis(120));
     }
@@ -648,6 +1019,7 @@ impl PadApp {
                         .button(if is_tap { "转长按" } else { "转点按" })
                         .clicked()
                     {
+                        self.push_undo();
                         let mut g = self.shared.lock().unwrap();
                         if let Some(b) = g.profile.binds.get_mut(i) {
                             b.action = match &b.action {
@@ -664,7 +1036,9 @@ impl PadApp {
             });
         }
         if let Some(i) = to_delete {
+            self.push_undo();
             self.shared.lock().unwrap().profile.binds.remove(i);
+            self.log("已删除绑定");
         }
 
         // ---- 新增绑定 ----
@@ -712,6 +1086,7 @@ impl PadApp {
             }
             if ui.button("添加").clicked() {
                 if let Some(key) = self.draft.key {
+                    self.push_undo();
                     let action = match self.draft.kind {
                         0 => Action::Tap {
                             x: self.draft.x,
@@ -746,13 +1121,65 @@ impl PadApp {
 
     fn ui_wheels(&mut self, ui: &mut egui::Ui) {
         ui.heading("轮盘(虚拟摇杆)");
+        ui.label("设置[启用键]后变为临时轮盘:仅在启用期间生效,期间方向键的其它绑定让位");
         let mut to_delete: Option<usize> = None;
         let wheel_count = self.shared.lock().unwrap().profile.wheels.len();
         let dir_names = ["上", "下", "左", "右"];
 
         for i in 0..wheel_count {
             ui.horizontal(|ui| {
-                ui.label(format!("轮盘{}", i + 1));
+                let temp_info = {
+                    let g = self.shared.lock().unwrap();
+                    let w = &g.profile.wheels[i];
+                    (
+                        w.temp.as_ref().map(|t| (t.key, t.mode)),
+                        format!(
+                            "轮盘{}{}",
+                            i + 1,
+                            if w.temp.is_some() { "(临时)" } else { "" }
+                        ),
+                    )
+                };
+                let (temp, title) = temp_info;
+                ui.label(title);
+
+                // 启用键(设置后变为临时轮盘)
+                ui.label("启用键:");
+                let ek = temp.map(|(k, _)| k);
+                let waiting_e = self.waiting_key == Some(KeySlot::WheelEnable(i));
+                if Self::key_button(ui, waiting_e, ek).clicked() {
+                    self.waiting_key = Some(KeySlot::WheelEnable(i));
+                }
+                if let Some((_, mode)) = temp {
+                    if ui
+                        .button(match mode {
+                            TempMode::Hold => "模式:长按启用",
+                            TempMode::Toggle => "模式:再按切换",
+                        })
+                        .clicked()
+                    {
+                        self.push_undo();
+                        let mut g = self.shared.lock().unwrap();
+                        if let Some(t) = g.profile.wheels[i].temp.as_mut() {
+                            t.mode = match t.mode {
+                                TempMode::Hold => TempMode::Toggle,
+                                TempMode::Toggle => TempMode::Hold,
+                            };
+                        }
+                    }
+                    if ui.button("设为永久").clicked() {
+                        self.push_undo();
+                        {
+                            let mut g = self.shared.lock().unwrap();
+                            g.profile.wheels[i].temp = None;
+                        }
+                        self.log("已设为永久轮盘");
+                    }
+                } else {
+                    ui.label("(永久)");
+                }
+            });
+            ui.horizontal(|ui| {
                 for d in 0..4 {
                     ui.label(dir_names[d]);
                     let code = {
@@ -788,9 +1215,12 @@ impl PadApp {
             });
         }
         if let Some(i) = to_delete {
+            self.push_undo();
             self.shared.lock().unwrap().profile.wheels.remove(i);
+            self.log("已删除轮盘");
         }
         if ui.button("添加轮盘").clicked() {
+            self.push_undo();
             self.shared.lock().unwrap().profile.wheels.push(Wheel {
                 up: 17,
                 down: 31,
@@ -799,6 +1229,7 @@ impl PadApp {
                 cx: 300,
                 cy: 900,
                 radius: 120,
+                temp: None,
             });
         }
     }
@@ -812,77 +1243,127 @@ impl PadApp {
         let short_name = |code: u16| key_name(code).replace("KEY_", "");
 
         let g = self.shared.lock().unwrap();
-        for b in &g.profile.binds {
-            match &b.action {
-                Action::Tap { x, y } | Action::Hold { x, y } => {
-                    let p = to_screen(*x, *y);
-                    let (ring, fill) = if matches!(b.action, Action::Tap { .. }) {
-                        (Color32::GREEN, Color32::from_rgba_unmultiplied(0, 200, 0, 60))
-                    } else {
-                        (Color32::ORANGE, Color32::from_rgba_unmultiplied(255, 165, 0, 60))
-                    };
-                    painter.circle_filled(p, 16.0, fill);
-                    painter.circle_stroke(p, 16.0, Stroke::new(2.0, ring));
-                    painter.text(
-                        p,
-                        Align2::CENTER_CENTER,
-                        short_name(b.key),
-                        FontId::proportional(12.0),
-                        Color32::WHITE,
-                    );
-                }
-                Action::Swipe { points, .. } => {
-                    if points.len() >= 2 {
-                        let pts: Vec<egui::Pos2> =
-                            points.iter().map(|&(x, y)| to_screen(x, y)).collect();
-                        painter.add(egui::Shape::line(
-                            pts,
-                            Stroke::new(2.0, Color32::LIGHT_BLUE),
-                        ));
-                        let p0 = to_screen(points[0].0, points[0].1);
-                        painter.circle_stroke(p0, 12.0, Stroke::new(2.0, Color32::LIGHT_BLUE));
+
+        // 键位(含草稿标记)仅在"全部/仅键位"时显示
+        if matches!(self.overlay_filter, OverlayFilter::All | OverlayFilter::Keys) {
+            for b in &g.profile.binds {
+                match &b.action {
+                    Action::Tap { x, y } | Action::Hold { x, y } => {
+                        let p = to_screen(*x, *y);
+                        let (ring, fill) = if matches!(b.action, Action::Tap { .. }) {
+                            (Color32::GREEN, Color32::from_rgba_unmultiplied(0, 200, 0, 60))
+                        } else {
+                            (Color32::ORANGE, Color32::from_rgba_unmultiplied(255, 165, 0, 60))
+                        };
+                        painter.circle_filled(p, 16.0, fill);
+                        painter.circle_stroke(p, 16.0, Stroke::new(2.0, ring));
                         painter.text(
-                            p0,
+                            p,
                             Align2::CENTER_CENTER,
                             short_name(b.key),
-                            FontId::proportional(11.0),
+                            FontId::proportional(12.0),
                             Color32::WHITE,
                         );
                     }
+                    Action::Swipe { points, .. } => {
+                        if points.len() >= 2 {
+                            let pts: Vec<egui::Pos2> =
+                                points.iter().map(|&(x, y)| to_screen(x, y)).collect();
+                            painter.add(egui::Shape::line(
+                                pts,
+                                Stroke::new(2.0, Color32::LIGHT_BLUE),
+                            ));
+                            let p0 = to_screen(points[0].0, points[0].1);
+                            painter
+                                .circle_stroke(p0, 12.0, Stroke::new(2.0, Color32::LIGHT_BLUE));
+                            painter.text(
+                                p0,
+                                Align2::CENTER_CENTER,
+                                short_name(b.key),
+                                FontId::proportional(11.0),
+                                Color32::WHITE,
+                            );
+                        }
+                    }
+                    Action::AndroidKey { .. } => {}
                 }
-                Action::AndroidKey { .. } => {}
             }
-        }
-        for w in &g.profile.wheels {
-            let c = to_screen(w.cx, w.cy);
-            let r = w.radius as f32 * scale;
-            painter.circle_stroke(c, r, Stroke::new(2.0, Color32::from_rgb(0, 200, 255)));
-            painter.circle_filled(c, 5.0, Color32::from_rgb(0, 200, 255));
-            painter.circle_stroke(c, 18.0, Stroke::new(1.0, Color32::WHITE));
+            // 草稿(新增绑定)位置高亮
+            let dp = to_screen(self.draft.x, self.draft.y);
+            painter.circle_stroke(dp, 16.0, Stroke::new(2.0, Color32::YELLOW));
             painter.text(
-                c - vec2(0.0, r + 14.0),
+                dp + vec2(0.0, 26.0),
                 Align2::CENTER_CENTER,
-                format!(
-                    "摇杆 {}/{}/{}/{}",
+                "新增",
+                FontId::proportional(11.0),
+                Color32::YELLOW,
+            );
+        }
+
+        // 轮盘按过滤条件显示;临时轮盘用虚线圆环区分
+        if !matches!(self.overlay_filter, OverlayFilter::Keys) {
+            for w in &g.profile.wheels {
+                let show = match self.overlay_filter {
+                    OverlayFilter::PermWheels => w.temp.is_none(),
+                    OverlayFilter::TempWheels => w.temp.is_some(),
+                    _ => true,
+                };
+                if !show {
+                    continue;
+                }
+                let c = to_screen(w.cx, w.cy);
+                let r = w.radius as f32 * scale;
+                let dirs_label = format!(
+                    "{}/{}/{}/{}",
                     short_name(w.up),
                     short_name(w.left),
                     short_name(w.down),
                     short_name(w.right)
-                ),
-                FontId::proportional(12.0),
-                Color32::from_rgb(0, 220, 255),
-            );
+                );
+                if let Some(t) = &w.temp {
+                    // 临时轮盘:品红虚线圆环
+                    let color = Color32::from_rgb(255, 90, 220);
+                    let n = 48;
+                    let pts: Vec<egui::Pos2> = (0..=n)
+                        .map(|i| {
+                            let a = i as f32 * std::f32::consts::TAU / n as f32;
+                            c + vec2(a.cos() * r, a.sin() * r)
+                        })
+                        .collect();
+                    for shape in
+                        egui::Shape::dashed_line(&pts, Stroke::new(2.0, color), 6.0, 5.0)
+                    {
+                        painter.add(shape);
+                    }
+                    painter.circle_filled(c, 5.0, color);
+                    painter.circle_stroke(c, 18.0, Stroke::new(1.0, Color32::WHITE));
+                    let mode = match t.mode {
+                        TempMode::Hold => "按住",
+                        TempMode::Toggle => "切换",
+                    };
+                    painter.text(
+                        c - vec2(0.0, r + 14.0),
+                        Align2::CENTER_CENTER,
+                        format!("临时摇杆[{}·{}] {dirs_label}", short_name(t.key), mode),
+                        FontId::proportional(12.0),
+                        Color32::from_rgb(255, 130, 235),
+                    );
+                } else {
+                    // 永久轮盘:青色实线圆环
+                    let color = Color32::from_rgb(0, 200, 255);
+                    painter.circle_stroke(c, r, Stroke::new(2.0, color));
+                    painter.circle_filled(c, 5.0, color);
+                    painter.circle_stroke(c, 18.0, Stroke::new(1.0, Color32::WHITE));
+                    painter.text(
+                        c - vec2(0.0, r + 14.0),
+                        Align2::CENTER_CENTER,
+                        format!("摇杆 {dirs_label}"),
+                        FontId::proportional(12.0),
+                        Color32::from_rgb(0, 220, 255),
+                    );
+                }
+            }
         }
-        // 草稿(新增绑定)位置高亮
-        let dp = to_screen(self.draft.x, self.draft.y);
-        painter.circle_stroke(dp, 16.0, Stroke::new(2.0, Color32::YELLOW));
-        painter.text(
-            dp + vec2(0.0, 26.0),
-            Align2::CENTER_CENTER,
-            "新增",
-            FontId::proportional(11.0),
-            Color32::YELLOW,
-        );
     }
 
     fn ui_picker(&mut self, ui: &mut egui::Ui) {
@@ -896,6 +1377,22 @@ impl PadApp {
             {
                 self.take_screenshot();
             }
+            // 浮层显示过滤
+            ui.label("显示:");
+            let sel = self.overlay_filter;
+            egui::ComboBox::from_id_salt("overlayfilter")
+                .selected_text(sel.label())
+                .show_ui(ui, |ui| {
+                    for f in [
+                        OverlayFilter::All,
+                        OverlayFilter::Keys,
+                        OverlayFilter::Wheels,
+                        OverlayFilter::PermWheels,
+                        OverlayFilter::TempWheels,
+                    ] {
+                        ui.selectable_value(&mut self.overlay_filter, f, f.label());
+                    }
+                });
             if self.picking.is_some() {
                 ui.colored_label(egui::Color32::YELLOW, "取点中: 请点击截图上的目标位置");
                 if ui.button("取消取点").clicked() {
@@ -955,4 +1452,40 @@ fn load_profile() -> Option<Profile> {
     let path = profile_path();
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+/// epoch 秒 -> "2026-09-05 14:25:30"(本地时区,民用历算法)
+fn fmt_timestamp(t: std::time::SystemTime) -> String {
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let (y, mo, d) = civil_from_days(days);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}")
+}
+
+/// epoch 秒 -> "20260905-142530"(用于文件名)
+fn timestamp_compact() -> String {
+    fmt_timestamp(std::time::SystemTime::now())
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .take(14)
+        .collect()
+}
+
+/// 自 epoch 起的天数 -> (年, 月, 日)(Howard Hinnant 民用历算法)
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }

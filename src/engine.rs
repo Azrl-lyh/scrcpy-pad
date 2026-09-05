@@ -4,10 +4,12 @@
 //!   Hold  - 按下 -> 触点落下,松开 -> 抬起
 //!   Swipe - 按下 -> 沿折线匀速滑动
 //!   Wheel - 方向键组合 -> 虚拟摇杆(圆心按下 + 向方向移动 + 松开回中抬起)
+//!          永久轮盘始终生效;临时轮盘仅在启用期间生效(Hold=按住启用键,
+//!          Toggle=按一下开/再按关),启用期间方向键归摇杆、同键位的其它绑定失效。
 
 use crate::capture::CaptureKey;
 use crate::control::ControlClient;
-use crate::keymap::{Action, Profile};
+use crate::keymap::{Action, Profile, TempMode, Wheel};
 use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -32,6 +34,8 @@ struct WheelState {
     pressed: [bool; 4], // up down left right
     down: bool,
     last: (i32, i32),
+    /// 临时轮盘当前是否处于启用状态(永久轮盘恒为 true)
+    active: bool,
 }
 
 pub fn run(
@@ -89,7 +93,7 @@ pub fn run(
             g.enabled = !g.enabled;
             let now_enabled = g.enabled;
             if !now_enabled {
-                // 关闭时释放所有触点
+                // 关闭时释放所有触点,并停用全部临时轮盘
                 if let Some(c) = g.control.as_ref() {
                     for idx in active_holds.drain() {
                         let (x, y) = bind_point(&g.profile, idx);
@@ -106,6 +110,7 @@ pub fn run(
                             ws.down = false;
                         }
                         ws.pressed = [false; 4];
+                        ws.active = false;
                     }
                 } else {
                     active_holds.clear();
@@ -113,6 +118,7 @@ pub fn run(
                     for ws in wheels.iter_mut() {
                         ws.down = false;
                         ws.pressed = [false; 4];
+                        ws.active = false;
                     }
                 }
             }
@@ -138,9 +144,59 @@ pub fn run(
             wheel_count = profile.wheels.len();
         }
 
-        // ---- 轮盘方向键 ----
+        // ---- 临时轮盘启用键 ----
+        let mut consumed = false;
+        for (j, w) in profile.wheels.iter().enumerate() {
+            let Some(t) = &w.temp else { continue };
+            if ev.code != t.key {
+                continue;
+            }
+            match t.mode {
+                TempMode::Hold => {
+                    if ev.pressed {
+                        wheels[j].active = true;
+                        // 启用瞬间,释放与方向键冲突的普通绑定,避免触点卡死
+                        release_conflicting_binds(
+                            ctl,
+                            profile,
+                            &mut active_holds,
+                            &mut active_android_keys,
+                            w,
+                        );
+                    } else {
+                        deactivate_wheel(ctl, j, w, &mut wheels[j]);
+                    }
+                }
+                TempMode::Toggle => {
+                    if ev.pressed {
+                        if wheels[j].active {
+                            deactivate_wheel(ctl, j, w, &mut wheels[j]);
+                        } else {
+                            wheels[j].active = true;
+                            release_conflicting_binds(
+                                ctl,
+                                profile,
+                                &mut active_holds,
+                                &mut active_android_keys,
+                                w,
+                            );
+                        }
+                    }
+                }
+            }
+            consumed = true;
+        }
+        if consumed {
+            continue;
+        }
+
+        // ---- 轮盘方向键(仅生效中的轮盘:永久 或 已启用的临时) ----
         let mut handled = false;
         for (j, w) in profile.wheels.iter().enumerate() {
+            let engaged = w.temp.is_none() || wheels[j].active;
+            if !engaged {
+                continue;
+            }
             let dir_idx = if ev.code == w.up {
                 Some(0)
             } else if ev.code == w.down {
@@ -234,7 +290,48 @@ fn bind_point(profile: &Profile, idx: usize) -> (i32, i32) {
     }
 }
 
-fn update_wheel(ctl: &ControlClient, j: usize, w: &crate::keymap::Wheel, st: &mut WheelState) {
+/// 停用一个轮盘:释放触点、清方向状态(临时轮盘专用,但通用无害)
+fn deactivate_wheel(ctl: &ControlClient, j: usize, w: &Wheel, st: &mut WheelState) {
+    st.active = false;
+    st.pressed = [false; 4];
+    if st.down {
+        let pid = wheel_pid(j);
+        ctl.touch_move(pid, w.cx, w.cy);
+        ctl.touch_up(pid, w.cx, w.cy);
+        st.down = false;
+    }
+}
+
+/// 临时轮盘启用的瞬间,释放所有与该轮盘方向键冲突的普通绑定触点
+fn release_conflicting_binds(
+    ctl: &ControlClient,
+    profile: &Profile,
+    active_holds: &mut HashSet<usize>,
+    active_android_keys: &mut HashSet<u16>,
+    w: &Wheel,
+) {
+    let dirs = [w.up, w.down, w.left, w.right];
+    let idxs: Vec<usize> = profile
+        .binds
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| dirs.contains(&b.key))
+        .map(|(i, _)| i)
+        .collect();
+    for i in idxs {
+        if active_holds.remove(&i) {
+            let (x, y) = bind_point(profile, i);
+            ctl.touch_up(bind_pid(i), x, y);
+        }
+    }
+    for kc in dirs {
+        if active_android_keys.remove(&kc) {
+            ctl.key(false, kc as u32);
+        }
+    }
+}
+
+fn update_wheel(ctl: &ControlClient, j: usize, w: &Wheel, st: &mut WheelState) {
     let pid = wheel_pid(j);
     let dx = st.pressed[3] as i32 - st.pressed[2] as i32; // right - left
     let dy = st.pressed[1] as i32 - st.pressed[0] as i32; // down - up
