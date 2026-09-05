@@ -120,10 +120,6 @@ pub struct PadApp {
     dialog_purpose: DialogPurpose,
     loginfo_rx: Option<Receiver<adb::DeviceInfo>>,
     pending_log: Option<String>,
-
-    // 撤销/重做栈
-    undo_stack: Vec<Profile>,
-    redo_stack: Vec<Profile>,
 }
 
 /// egui 默认字体不含 CJK,从系统加载中文字体作为回退
@@ -265,8 +261,6 @@ impl PadApp {
             dialog_purpose: DialogPurpose::ScrcpyExe,
             loginfo_rx: None,
             pending_log: None,
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
         };
         app.log("就绪。顺序: 连接手机 -> [连接控制] -> [启动 scrcpy] -> 按总开关键开启映射");
         app.log(found_msg);
@@ -382,7 +376,6 @@ impl PadApp {
     }
 
     fn assign_key(&mut self, slot: KeySlot, code: u16) {
-        self.push_undo();
         {
             let mut g = self.shared.lock().unwrap();
             match slot {
@@ -419,7 +412,6 @@ impl PadApp {
     }
 
     fn assign_coord(&mut self, slot: CoordSlot, x: i32, y: i32) {
-        self.push_undo();
         {
             let mut g = self.shared.lock().unwrap();
             match slot {
@@ -483,98 +475,12 @@ impl PadApp {
         };
         ui.add(egui::Button::new(label).min_size(egui::vec2(110.0, 0.0)))
     }
-
-    /// 保存当前配置快照到撤销栈
-    fn push_undo(&mut self) {
-        let profile = self.shared.lock().unwrap().profile.clone();
-        self.undo_stack.push(profile);
-        self.redo_stack.clear();
-        // 限制栈大小
-        if self.undo_stack.len() > 50 {
-            self.undo_stack.remove(0);
-        }
-    }
-
-    /// 撤销
-    fn undo(&mut self) {
-        if let Some(profile) = self.undo_stack.pop() {
-            let current = self.shared.lock().unwrap().profile.clone();
-            self.redo_stack.push(current);
-            self.shared.lock().unwrap().profile = profile;
-            self.log("已撤销");
-        }
-    }
-
-    /// 重做
-    fn redo(&mut self) {
-        if let Some(profile) = self.redo_stack.pop() {
-            let current = self.shared.lock().unwrap().profile.clone();
-            self.undo_stack.push(current);
-            self.shared.lock().unwrap().profile = profile;
-            self.log("已重做");
-        }
-    }
-
-    /// 保存配置
-    fn save_profile(&mut self) {
-        let json = {
-            let g = self.shared.lock().unwrap();
-            serde_json::to_string_pretty(&g.profile)
-        };
-        match json {
-            Ok(json) => {
-                if let Some(parent) = self.profile_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                match std::fs::write(&self.profile_path, json) {
-                    Ok(_) => self.log(format!("已保存到 {}", self.profile_path.display())),
-                    Err(e) => self.log(format!("保存失败: {e}")),
-                }
-            }
-            Err(e) => self.log(format!("序列化失败: {e}")),
-        }
-    }
-
-    /// 刷新设备列表
-    fn refresh_devices(&mut self) {
-        self.devices = adb::list_devices();
-        self.selected = 0;
-        self.log(format!("设备已刷新,共 {} 台", self.devices.len()));
-    }
 }
 
 impl eframe::App for PadApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
-
-        // ---- 全局快捷键: 撤销/重做/保存/另存为/刷新设备 ----
-        // 键位捕获或取点进行中、正在输入文本时不拦截,保证 Ctrl+Z 等可作为待绑定键
-        if self.waiting_key.is_none() && self.picking.is_none() && !ctx.egui_wants_keyboard_input() {
-            let (k_undo, k_redo, k_save, k_save_as, k_refresh) = ctx.input(|i| {
-                let ctrl = i.modifiers.ctrl;
-                let shift = i.modifiers.shift;
-                (
-                    ctrl && !shift && i.key_pressed(egui::Key::Z),
-                    ctrl && !shift && i.key_pressed(egui::Key::Y),
-                    ctrl && !shift && i.key_pressed(egui::Key::S),
-                    ctrl && shift && i.key_pressed(egui::Key::S),
-                    !ctrl && !shift && i.key_pressed(egui::Key::F5),
-                )
-            });
-            if k_undo {
-                self.undo();
-            } else if k_redo {
-                self.redo();
-            } else if k_save {
-                self.save_profile();
-            } else if k_save_as {
-                self.dialog = Some(crate::filedialog::save_file("scrcpy-pad-profile.json"));
-                self.dialog_purpose = DialogPurpose::SaveProfileAs;
-            } else if k_refresh {
-                self.refresh_devices();
-            }
-        }
 
         // ---- 异步任务回收 ----
         if let Some(rx) = &self.connect_rx {
@@ -693,15 +599,6 @@ impl eframe::App for PadApp {
         // ================= 顶栏 =================
         egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal(|ui| {
-                // 撤销/重做按钮
-                if ui.button("⟲ 撤销").clicked() {
-                    self.undo();
-                }
-                if ui.button("⟳ 重做").clicked() {
-                    self.redo();
-                }
-                ui.separator();
-
                 ui.label("设备:");
                 let cur = self.serial();
                 egui::ComboBox::from_id_salt("dev")
@@ -712,7 +609,8 @@ impl eframe::App for PadApp {
                         }
                     });
                 if ui.button("刷新").clicked() {
-                    self.refresh_devices();
+                    self.devices = adb::list_devices();
+                    self.selected = 0;
                 }
 
                 ui.separator();
@@ -783,13 +681,7 @@ impl eframe::App for PadApp {
                          期间方向键的其它绑定自动让位\n\
                          \n\
                          动作:点按/长按/滑动/系统键\n\
-                         长短按可用[转长按]按钮互切\n\
-                         \n\
-                         快捷键(键位捕获/取点/打字时不生效):\n\
-                         Ctrl+Z 撤销 ⟳恢复用 Ctrl+Y\n\
-                         Ctrl+S 保存配置\n\
-                         Ctrl+Shift+S 另存为\n\
-                         F5 刷新设备",
+                         长短按可用[转长按]按钮互切",
                     );
                 });
             ui.separator();
@@ -802,7 +694,24 @@ impl eframe::App for PadApp {
             ui.heading("配置");
             ui.horizontal(|ui| {
                 if ui.button("保存配置").clicked() {
-                    self.save_profile();
+                    let json = {
+                        let g = self.shared.lock().unwrap();
+                        serde_json::to_string_pretty(&g.profile)
+                    };
+                    match json {
+                        Ok(json) => {
+                            if let Some(parent) = self.profile_path.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            match std::fs::write(&self.profile_path, json) {
+                                Ok(_) => {
+                                    self.log(format!("已保存到 {}", self.profile_path.display()))
+                                }
+                                Err(e) => self.log(format!("保存失败: {e}")),
+                            }
+                        }
+                        Err(e) => self.log(format!("序列化失败: {e}")),
+                    }
                 }
                 if ui.button("另存为...").clicked() {
                     self.dialog = Some(crate::filedialog::save_file("scrcpy-pad-profile.json"));
@@ -811,9 +720,8 @@ impl eframe::App for PadApp {
                 if ui.button("重新加载").clicked() {
                     match load_profile() {
                         Some(p) => {
-                            self.push_undo();
                             self.shared.lock().unwrap().profile = p;
-                            self.log("配置已重新加载(可用撤销回退)");
+                            self.log("配置已重新加载");
                         }
                         None => self.log("加载失败或配置文件不存在"),
                     }
@@ -1019,7 +927,6 @@ impl PadApp {
                         .button(if is_tap { "转长按" } else { "转点按" })
                         .clicked()
                     {
-                        self.push_undo();
                         let mut g = self.shared.lock().unwrap();
                         if let Some(b) = g.profile.binds.get_mut(i) {
                             b.action = match &b.action {
@@ -1036,9 +943,7 @@ impl PadApp {
             });
         }
         if let Some(i) = to_delete {
-            self.push_undo();
             self.shared.lock().unwrap().profile.binds.remove(i);
-            self.log("已删除绑定");
         }
 
         // ---- 新增绑定 ----
@@ -1086,7 +991,6 @@ impl PadApp {
             }
             if ui.button("添加").clicked() {
                 if let Some(key) = self.draft.key {
-                    self.push_undo();
                     let action = match self.draft.kind {
                         0 => Action::Tap {
                             x: self.draft.x,
@@ -1158,7 +1062,6 @@ impl PadApp {
                         })
                         .clicked()
                     {
-                        self.push_undo();
                         let mut g = self.shared.lock().unwrap();
                         if let Some(t) = g.profile.wheels[i].temp.as_mut() {
                             t.mode = match t.mode {
@@ -1168,7 +1071,6 @@ impl PadApp {
                         }
                     }
                     if ui.button("设为永久").clicked() {
-                        self.push_undo();
                         {
                             let mut g = self.shared.lock().unwrap();
                             g.profile.wheels[i].temp = None;
@@ -1215,12 +1117,9 @@ impl PadApp {
             });
         }
         if let Some(i) = to_delete {
-            self.push_undo();
             self.shared.lock().unwrap().profile.wheels.remove(i);
-            self.log("已删除轮盘");
         }
         if ui.button("添加轮盘").clicked() {
-            self.push_undo();
             self.shared.lock().unwrap().profile.wheels.push(Wheel {
                 up: 17,
                 down: 31,
