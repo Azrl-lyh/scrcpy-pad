@@ -67,7 +67,19 @@ fn selftest() {
     let Some(server_file) = server_file else { std::process::exit(1) };
     let server_path = server_file.display().to_string();
 
-    // 3. adb 设备
+    // 3. adb 定位(优先 scrcpy 同目录,对应 Windows 发行包同目录 adb.exe 场景)
+    let adb_path = adb::find_adb(Some(&exe));
+    adb::set_adb_bin(adb_path.as_deref());
+    let adb_detail = adb_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(仅 PATH)".to_string());
+    check("定位 adb", adb_path.is_some(), &adb_detail);
+    if adb_path.is_none() {
+        std::process::exit(1);
+    }
+
+    // 4. adb 设备
     let devices = adb::list_devices();
     check("adb 设备在线", !devices.is_empty(), &format!("({} 台)", devices.len()));
     if devices.is_empty() {
@@ -75,12 +87,12 @@ fn selftest() {
     }
     let serial = devices[0].clone();
 
-    // 4. 分辨率
+    // 5. 分辨率
     let size = adb::screen_size(&serial);
     check("读取分辨率", size.is_ok(), &format!("{size:?}"));
     let Ok((w, h)) = size else { std::process::exit(1) };
 
-    // 5. scrcpy-server 控制通道
+    // 6. scrcpy-server 控制通道
     let server = adb::start_control_server(&serial, &server_path, &version, 0x1a2b3c4d, 28383);
     let Ok(server) = server else {
         check("启动 control server", false, &format!("{:?}", server.err()));
@@ -101,7 +113,7 @@ fn selftest() {
     check("TCP 连接控制通道", client.is_some(), "");
     let Some(client) = client else { std::process::exit(1) };
 
-    // 6. 协议注入(hover 移动,不触碰屏幕内容)
+    // 7. 协议注入(hover 移动,不触碰屏幕内容)
     let mouse = u64::MAX;
     client.send(control::ControlCmd::Touch { action: 7, pointer_id: mouse, x: 640, y: 1386 });
     client.send(control::ControlCmd::Touch { action: 7, pointer_id: mouse, x: 700, y: 1400 });

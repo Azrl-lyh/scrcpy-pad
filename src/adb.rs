@@ -1,9 +1,36 @@
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
+
+/// 进程内选定的 adb 可执行文件(通常为绝对路径;未设置时回退 PATH 中的 "adb")
+static ADB_BIN: Mutex<Option<String>> = Mutex::new(None);
+
+/// 设置 adb 可执行文件路径;传 None 表示恢复为使用 PATH 中的 "adb"
+pub fn set_adb_bin(path: Option<&Path>) {
+    *ADB_BIN.lock().unwrap() = path.map(|p| p.display().to_string());
+}
+
+/// 当前生效的 adb 可执行文件(绝对路径或 "adb")
+pub fn adb_bin_now() -> Option<String> {
+    ADB_BIN.lock().unwrap().clone()
+}
+
+fn adb_bin() -> String {
+    ADB_BIN
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| "adb".to_string())
+}
+
+/// 各平台 adb 可执行文件名(Windows 必须带 .exe 才能在 PATH 中命中)
+pub fn adb_exe_name() -> &'static str {
+    if cfg!(windows) { "adb.exe" } else { "adb" }
+}
 
 fn adb_cmd(serial: Option<&str>) -> Command {
-    let mut c = Command::new("adb");
+    let mut c = Command::new(adb_bin());
     if let Some(s) = serial {
         if !s.is_empty() {
             c.args(["-s", s]);
@@ -14,7 +41,7 @@ fn adb_cmd(serial: Option<&str>) -> Command {
 
 /// 列出已连接设备序列号
 pub fn list_devices() -> Vec<String> {
-    let out = Command::new("adb").arg("devices").output();
+    let out = Command::new(adb_bin()).arg("devices").output();
     let Ok(out) = out else { return Vec::new() };
     let stdout = String::from_utf8_lossy(&out.stdout);
     stdout
@@ -28,6 +55,16 @@ pub fn list_devices() -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// 运行 adb --version 解析版本(失败返回 None,可据此判断 adb 是否可用)
+pub fn adb_version_at(exe: &str) -> Option<String> {
+    let out = Command::new(exe).arg("version").output().ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .find(|l| l.contains("version"))
+        .map(|l| l.trim().to_string())
 }
 
 /// 设备物理分辨率 (w, h)
@@ -112,6 +149,50 @@ pub fn find_scrcpy() -> Option<PathBuf> {
             v.push(PathBuf::from(&home).join(".local/bin/scrcpy"));
         }
         v
+    };
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// 各平台 scrcpy 可执行文件名(Windows 必须带 .exe 才能在 PATH 中命中)
+pub fn scrcpy_exe_name() -> &'static str {
+    if cfg!(windows) { "scrcpy.exe" } else { "scrcpy" }
+}
+
+/// 给定目录,查找该目录下的 adb.exe/adb(官方 scrcpy Windows 发行包将 adb.exe 与 scrcpy.exe 同目录)
+pub fn find_adb_in_dir(dir: &Path) -> Option<PathBuf> {
+    let p = dir.join(adb_exe_name());
+    p.is_file().then_some(p)
+}
+
+/// 自动寻找 adb:手动指定的 scrcpy 同目录优先,其次 PATH,最后平台常见安装位置
+/// (Android SDK platform-tools)。scrcpy_exe 传 None 时跳过"同目录"阶段。
+pub fn find_adb(scrcpy_exe: Option<&Path>) -> Option<PathBuf> {
+    // 1. scrcpy 同目录(Windows 官方发行包布局:scrcpy.exe / scrcpy-server / adb.exe 三者同目录)
+    if let Some(exe) = scrcpy_exe {
+        if let Some(dir) = exe.parent() {
+            if let Some(p) = find_adb_in_dir(dir) {
+                return Some(p);
+            }
+        }
+    }
+    // 2. PATH
+    if let Some(p) = find_in_path(adb_exe_name()) {
+        return Some(p);
+    }
+    // 3. 平台常见安装位置
+    let candidates: Vec<PathBuf> = if cfg!(windows) {
+        let mut v = Vec::new();
+        if let Some(lo) = std::env::var_os("LOCALAPPDATA") {
+            v.push(PathBuf::from(&lo).join(r"Android\Sdk\platform-tools\adb.exe"));
+        }
+        if let Some(home) = std::env::var_os("USERPROFILE") {
+            v.push(
+                PathBuf::from(&home).join(r"AppData\Local\Android\Sdk\platform-tools\adb.exe"),
+            );
+        }
+        v
+    } else {
+        Vec::new()
     };
     candidates.into_iter().find(|p| p.is_file())
 }

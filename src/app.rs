@@ -56,6 +56,7 @@ impl OverlayFilter {
 enum DialogPurpose {
     ScrcpyExe,
     ServerJar,
+    AdbExe,
     SaveLog,
     SaveProfileAs,
 }
@@ -97,6 +98,10 @@ pub struct PadApp {
     /// scrcpy 可执行文件路径(空 = 使用 PATH 中的 scrcpy)
     scrcpy_path: String,
     server_path: String,
+    /// adb 可执行文件路径(空 = 自动寻找:优先 scrcpy 同目录,再 PATH)
+    adb_path: String,
+    /// 已应用的 (scrcpy, server, adb) 三元组;用于文本改动后自动联动补齐
+    suite_synced: (String, String, String),
     /// 由[测试]/[自动寻找]检测出的版本,只读显示
     server_version: String,
     test_msg: Option<(bool, String)>,
@@ -120,6 +125,10 @@ pub struct PadApp {
     dialog_purpose: DialogPurpose,
     loginfo_rx: Option<Receiver<adb::DeviceInfo>>,
     pending_log: Option<String>,
+
+    // 撤销/重做栈(键位配置快照)
+    undo_stack: Vec<Profile>,
+    redo_stack: Vec<Profile>,
 }
 
 /// egui 默认字体不含 CJK,从系统加载中文字体作为回退
@@ -232,17 +241,39 @@ impl PadApp {
             }
         };
 
+        // 启动时定位 adb:优先 scrcpy 同目录(官方 Windows 发行包含同目录 adb.exe),
+        // 其次 PATH;拿到后才列设备,否则 Windows 上 scrcpy 正常但设备列表却为空
+        let startup_adb = {
+            let exe = if scrcpy_path.trim().is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(scrcpy_path.trim()))
+            };
+            adb::find_adb(exe.as_deref())
+        };
+        if let Some(a) = &startup_adb {
+            adb::set_adb_bin(Some(a));
+        }
+        let adb_init = startup_adb
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let devices = adb::list_devices();
+
         let mut app = Self {
             shared,
             grab_flag,
             _capture: capture,
             capture_err,
             gui_rx,
-            devices: adb::list_devices(),
+            devices,
             selected: 0,
             scrcpy_args: "--stay-awake".into(),
             scrcpy_path,
             server_path,
+            adb_path: adb_init,
+            // 置空使其在首帧自动做一次全套联动补齐
+            suite_synced: (String::new(), String::new(), String::new()),
             server_version: version,
             test_msg: None,
             server: None,
@@ -261,9 +292,17 @@ impl PadApp {
             dialog_purpose: DialogPurpose::ScrcpyExe,
             loginfo_rx: None,
             pending_log: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         };
         app.log("就绪。顺序: 连接手机 -> [连接控制] -> [启动 scrcpy] -> 按总开关键开启映射");
         app.log(found_msg);
+        match &startup_adb {
+            Some(p) => app.log(format!("adb: {}", p.display())),
+            None => app.log(
+                "未找到 adb(设备列表将为空): 请将 adb.exe 所在目录加入 PATH,或在左栏手动指定",
+            ),
+        }
         let _ = cc;
         app
     }
@@ -305,6 +344,8 @@ impl PadApp {
     }
 
     fn connect_control(&mut self) {
+        // 连接前先做一次联动,确保 adb 已定位(push/forward 都依赖它)
+        self.resync();
         let serial = self.serial();
         if serial.is_empty() {
             self.log("错误: 未选择设备");
@@ -376,6 +417,7 @@ impl PadApp {
     }
 
     fn assign_key(&mut self, slot: KeySlot, code: u16) {
+        self.push_undo();
         {
             let mut g = self.shared.lock().unwrap();
             match slot {
@@ -412,6 +454,7 @@ impl PadApp {
     }
 
     fn assign_coord(&mut self, slot: CoordSlot, x: i32, y: i32) {
+        self.push_undo();
         {
             let mut g = self.shared.lock().unwrap();
             match slot {
@@ -475,12 +518,212 @@ impl PadApp {
         };
         ui.add(egui::Button::new(label).min_size(egui::vec2(110.0, 0.0)))
     }
+
+    // ===================== 撤销 / 重做 =====================
+
+    /// 把当前配置压入撤销栈(所有键位修改入口调用),并清空重做栈
+    fn push_undo(&mut self) {
+        let profile = self.shared.lock().unwrap().profile.clone();
+        self.undo_stack.push(profile);
+        self.redo_stack.clear();
+        if self.undo_stack.len() > 50 {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    fn undo(&mut self) {
+        if let Some(prev) = self.undo_stack.pop() {
+            let current = self.shared.lock().unwrap().profile.clone();
+            self.redo_stack.push(current);
+            self.shared.lock().unwrap().profile = prev;
+            self.log("已撤销");
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(next) = self.redo_stack.pop() {
+            let current = self.shared.lock().unwrap().profile.clone();
+            self.undo_stack.push(current);
+            self.shared.lock().unwrap().profile = next;
+            self.log("已重做");
+        }
+    }
+
+    /// 保存当前键位配置到默认位置
+    fn save_profile(&mut self) {
+        let json = {
+            let g = self.shared.lock().unwrap();
+            serde_json::to_string_pretty(&g.profile)
+        };
+        match json {
+            Ok(json) => {
+                if let Some(parent) = self.profile_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match std::fs::write(&self.profile_path, json) {
+                    Ok(_) => self.log(format!("已保存到 {}", self.profile_path.display())),
+                    Err(e) => self.log(format!("保存失败: {e}")),
+                }
+            }
+            Err(e) => self.log(format!("序列化失败: {e}")),
+        }
+    }
+
+    /// 用当前生效的 adb 重新拉取设备列表
+    fn refresh_devices(&mut self) {
+        self.devices = adb::list_devices();
+        if self.selected >= self.devices.len() {
+            self.selected = 0;
+        }
+        self.log(format!("设备已刷新,共 {} 台", self.devices.len()));
+    }
+
+    // ===================== scrcpy / server / adb 联动 =====================
+
+    /// 解析当前实际使用的 adb:手动指定的 adb 路径 > scrcpy 同目录 > PATH
+    fn effective_adb(&self) -> Option<PathBuf> {
+        let manual = self.adb_path.trim();
+        if !manual.is_empty() {
+            let p = PathBuf::from(manual);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        let exe = if self.scrcpy_path.trim().is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(self.scrcpy_path.trim()))
+        };
+        adb::find_adb(exe.as_deref())
+    }
+
+    /// 手动改动路径的按钮(浏览/自动寻找/输入失焦)调用:强制下一帧做一次完整联动
+    fn resync(&mut self) {
+        self.suite_synced = (String::new(), String::new(), String::new());
+        self.sync_suite();
+    }
+
+    /// 联动补齐:scrcpy.exe / scrcpy-server / adb.exe 三者任填一个,其余为空时
+    /// 自动从同目录(官方 Windows 发行包三者在同一目录)推导补齐;
+    /// 生效的 adb 变化时自动刷新设备列表。每帧调用,仅在三元组文本变化时执行。
+    fn sync_suite(&mut self) {
+        let trio = (
+            self.scrcpy_path.clone(),
+            self.server_path.clone(),
+            self.adb_path.clone(),
+        );
+        if trio == self.suite_synced {
+            return;
+        }
+        self.suite_synced = trio;
+
+        // 1) 由 scrcpy.exe 推导同目录/相邻的 scrcpy-server 与 adb
+        let scrcpy_txt = self.scrcpy_path.trim().to_string();
+        if !scrcpy_txt.is_empty() {
+            let exe = PathBuf::from(&scrcpy_txt);
+            if self.server_path.trim().is_empty() {
+                if let Some(s) = adb::find_server(Some(&exe)) {
+                    self.server_path = s.display().to_string();
+                    self.log(format!("server 已自动补齐: {}", self.server_path));
+                }
+            }
+            if self.adb_path.trim().is_empty() {
+                if let Some(a) = adb::find_adb(Some(&exe)) {
+                    self.adb_path = a.display().to_string();
+                    self.log(format!("adb 已自动补齐: {}", self.adb_path));
+                }
+            }
+        }
+        // 2) 由 scrcpy-server 所在目录推导 scrcpy.exe 与 adb
+        let server_txt = self.server_path.trim().to_string();
+        if !server_txt.is_empty() {
+            let sp = PathBuf::from(&server_txt);
+            if let Some(dir) = sp.parent() {
+                if self.scrcpy_path.trim().is_empty() {
+                    let exe = dir.join(adb::scrcpy_exe_name());
+                    if exe.is_file() {
+                        self.scrcpy_path = exe.display().to_string();
+                        self.log(format!("scrcpy 已自动补齐: {}", self.scrcpy_path));
+                    }
+                }
+                if self.adb_path.trim().is_empty() {
+                    if let Some(a) = adb::find_adb_in_dir(dir) {
+                        self.adb_path = a.display().to_string();
+                        self.log(format!("adb 已自动补齐: {}", self.adb_path));
+                    }
+                }
+            }
+        }
+        // 3) 由 adb 所在目录推导 scrcpy.exe 与 scrcpy-server
+        let adb_txt = self.adb_path.trim().to_string();
+        if !adb_txt.is_empty() {
+            let ap = PathBuf::from(&adb_txt);
+            if let Some(dir) = ap.parent() {
+                if self.scrcpy_path.trim().is_empty() {
+                    let exe = dir.join(adb::scrcpy_exe_name());
+                    if exe.is_file() {
+                        self.scrcpy_path = exe.display().to_string();
+                        self.log(format!("scrcpy 已自动补齐: {}", self.scrcpy_path));
+                    }
+                }
+                if self.server_path.trim().is_empty() {
+                    let srv = dir.join("scrcpy-server");
+                    if srv.is_file() {
+                        self.server_path = srv.display().to_string();
+                        self.log(format!("server 已自动补齐: {}", self.server_path));
+                    }
+                }
+            }
+        }
+        // 4) 生效 adb 变化 -> 应用并刷新设备
+        let effective = self.effective_adb();
+        if effective.as_ref().map(|p| p.display().to_string()) != adb::adb_bin_now() {
+            adb::set_adb_bin(effective.as_deref());
+            match &effective {
+                Some(p) => self.log(format!("adb: {}", p.display())),
+                None => self.log("未找到 adb(设备列表将为空): 请将 adb.exe 所在目录加入 PATH,或手动指定"),
+            }
+            self.refresh_devices();
+        }
+    }
 }
 
 impl eframe::App for PadApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
+
+        // 每帧联动:路径文本变化时自动补齐 scrcpy/server/adb 并刷新设备
+        self.sync_suite();
+
+        // ---- 全局快捷键: 撤销/重做/保存/另存为/刷新设备 ----
+        // 键位捕获或取点进行中、正在输入文本时不拦截,保证 Ctrl+Z 等可作为待绑定键
+        if self.waiting_key.is_none() && self.picking.is_none() && !ctx.egui_wants_keyboard_input() {
+            let (k_undo, k_redo, k_save, k_save_as, k_refresh) = ctx.input(|i| {
+                let ctrl = i.modifiers.ctrl;
+                let shift = i.modifiers.shift;
+                (
+                    ctrl && !shift && i.key_pressed(egui::Key::Z),
+                    ctrl && !shift && i.key_pressed(egui::Key::Y),
+                    ctrl && !shift && i.key_pressed(egui::Key::S),
+                    ctrl && shift && i.key_pressed(egui::Key::S),
+                    !ctrl && !shift && i.key_pressed(egui::Key::F5),
+                )
+            });
+            if k_undo {
+                self.undo();
+            } else if k_redo {
+                self.redo();
+            } else if k_save {
+                self.save_profile();
+            } else if k_save_as {
+                self.dialog = Some(crate::filedialog::save_file("scrcpy-pad-profile.json"));
+                self.dialog_purpose = DialogPurpose::SaveProfileAs;
+            } else if k_refresh {
+                self.resync();
+                self.refresh_devices();
+            }
+        }
 
         // ---- 异步任务回收 ----
         if let Some(rx) = &self.connect_rx {
@@ -521,12 +764,19 @@ impl eframe::App for PadApp {
                     (DialogPurpose::ScrcpyExe, Some(p)) => {
                         self.scrcpy_path = p.display().to_string();
                         self.log(format!("已选择 scrcpy: {}", self.scrcpy_path));
+                        self.resync();
                         self.test_scrcpy();
                     }
                     (DialogPurpose::ServerJar, Some(p)) => {
                         self.server_path = p.display().to_string();
                         self.log(format!("已选择 server: {}", self.server_path));
+                        self.resync();
                         self.test_scrcpy();
+                    }
+                    (DialogPurpose::AdbExe, Some(p)) => {
+                        self.adb_path = p.display().to_string();
+                        self.log(format!("已选择 adb: {}", self.adb_path));
+                        self.resync();
                     }
                     (DialogPurpose::SaveLog, Some(p)) => {
                         let content = self.pending_log.take().unwrap_or_default();
@@ -599,6 +849,15 @@ impl eframe::App for PadApp {
         // ================= 顶栏 =================
         egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal(|ui| {
+                // 撤销/重做(与 Ctrl+Z / Ctrl+Y 等价)
+                if ui.button("⟲ 撤销").clicked() {
+                    self.undo();
+                }
+                if ui.button("⟳ 重做").clicked() {
+                    self.redo();
+                }
+                ui.separator();
+
                 ui.label("设备:");
                 let cur = self.serial();
                 egui::ComboBox::from_id_salt("dev")
@@ -609,14 +868,16 @@ impl eframe::App for PadApp {
                         }
                     });
                 if ui.button("刷新").clicked() {
-                    self.devices = adb::list_devices();
-                    self.selected = 0;
+                    self.resync();
+                    self.refresh_devices();
                 }
 
                 ui.separator();
                 ui.label("scrcpy参数:");
                 ui.add(egui::TextEdit::singleline(&mut self.scrcpy_args).desired_width(160.0));
                 if ui.button("启动 scrcpy").clicked() {
+                    // 启动前联动一次:确保 server/adb 路径已就绪(如已手动粘贴 scrcpy 路径)
+                    self.resync();
                     match adb::launch_scrcpy(&self.scrcpy_path, &self.serial(), &self.scrcpy_args)
                     {
                         Ok(_) => self.log("scrcpy 已启动"),
@@ -681,7 +942,13 @@ impl eframe::App for PadApp {
                          期间方向键的其它绑定自动让位\n\
                          \n\
                          动作:点按/长按/滑动/系统键\n\
-                         长短按可用[转长按]按钮互切",
+                         长短按可用[转长按]按钮互切\n\
+                         \n\
+                         快捷键(键位捕获/取点/打字时不生效):\n\
+                         Ctrl+Z 撤销 ⟳重做用 Ctrl+Y\n\
+                         Ctrl+S 保存配置\n\
+                         Ctrl+Shift+S 另存为\n\
+                         F5 刷新设备",
                     );
                 });
             ui.separator();
@@ -694,24 +961,7 @@ impl eframe::App for PadApp {
             ui.heading("配置");
             ui.horizontal(|ui| {
                 if ui.button("保存配置").clicked() {
-                    let json = {
-                        let g = self.shared.lock().unwrap();
-                        serde_json::to_string_pretty(&g.profile)
-                    };
-                    match json {
-                        Ok(json) => {
-                            if let Some(parent) = self.profile_path.parent() {
-                                let _ = std::fs::create_dir_all(parent);
-                            }
-                            match std::fs::write(&self.profile_path, json) {
-                                Ok(_) => {
-                                    self.log(format!("已保存到 {}", self.profile_path.display()))
-                                }
-                                Err(e) => self.log(format!("保存失败: {e}")),
-                            }
-                        }
-                        Err(e) => self.log(format!("序列化失败: {e}")),
-                    }
+                    self.save_profile();
                 }
                 if ui.button("另存为...").clicked() {
                     self.dialog = Some(crate::filedialog::save_file("scrcpy-pad-profile.json"));
@@ -720,8 +970,9 @@ impl eframe::App for PadApp {
                 if ui.button("重新加载").clicked() {
                     match load_profile() {
                         Some(p) => {
+                            self.push_undo();
                             self.shared.lock().unwrap().profile = p;
-                            self.log("配置已重新加载");
+                            self.log("配置已重新加载(可撤销)");
                         }
                         None => self.log("加载失败或配置文件不存在"),
                     }
@@ -761,29 +1012,36 @@ impl eframe::App for PadApp {
             );
 
             ui.separator();
-            ui.heading("scrcpy");
-            ui.label("程序路径(留空=PATH):");
-            ui.text_edit_singleline(&mut self.scrcpy_path);
+            ui.heading("scrcpy 管理");
+            ui.small(
+                "官方 Windows 包里 scrcpy.exe、scrcpy-server、adb.exe 三者同目录:\n填好任意一个,其余留空会自动补齐。",
+            );
             ui.horizontal(|ui| {
-                if ui.button("浏览...").clicked() {
-                    self.dialog = Some(crate::filedialog::pick_file());
-                    self.dialog_purpose = DialogPurpose::ScrcpyExe;
-                }
-                if ui.button("自动寻找").clicked() {
+                if ui.button("自动寻找全部").clicked() {
                     match adb::find_scrcpy() {
                         Some(p) => {
                             self.scrcpy_path = p.display().to_string();
-                            if let Some(s) = adb::find_server(Some(&p)) {
-                                self.server_path = s.display().to_string();
-                            }
                             self.log(format!("已找到 scrcpy: {}", self.scrcpy_path));
+                            self.resync();
                             self.test_scrcpy();
                         }
-                        None => self.log("未找到 scrcpy,请手动指定路径"),
+                        None => self.log("未找到 scrcpy,请手动指定其所在目录"),
                     }
                 }
-                if ui.button("测试").clicked() {
+                if ui.button("测试并刷新").clicked() {
+                    self.resync();
                     self.test_scrcpy();
+                    // 验证 adb 是否真的可运行(打印版本行),便于诊断
+                    if let Some(exe) = self.effective_adb() {
+                        let exe_s = exe.display().to_string();
+                        match adb::adb_version_at(&exe_s) {
+                            Some(v) => self.log(format!("adb 版本: {v}")),
+                            None => self.log(format!("adb 可执行失败,无法读取版本: {exe_s}")),
+                        }
+                    } else {
+                        self.log("未找到 adb(可点击上方 [浏览]/[自动] 手动指定)");
+                    }
+                    self.refresh_devices();
                 }
             });
             if let Some((ok, msg)) = &self.test_msg {
@@ -792,16 +1050,52 @@ impl eframe::App for PadApp {
                     msg,
                 );
             }
-            ui.label("scrcpy-server 路径:");
-            ui.text_edit_singleline(&mut self.server_path);
-            if ui.button("浏览...").clicked() {
-                self.dialog = Some(crate::filedialog::pick_file());
-                self.dialog_purpose = DialogPurpose::ServerJar;
-            }
-            ui.label(format!(
-                "检测版本: {}",
-                if self.server_version.is_empty() { "未检测" } else { &self.server_version }
-            ));
+
+            ui.horizontal(|ui| {
+                ui.label("scrcpy.exe ");
+                ui.text_edit_singleline(&mut self.scrcpy_path);
+                if ui.small_button("浏览").clicked() {
+                    self.dialog = Some(crate::filedialog::pick_file());
+                    self.dialog_purpose = DialogPurpose::ScrcpyExe;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("scrcpy-server");
+                ui.text_edit_singleline(&mut self.server_path);
+                if ui.small_button("浏览").clicked() {
+                    self.dialog = Some(crate::filedialog::pick_file());
+                    self.dialog_purpose = DialogPurpose::ServerJar;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("adb.exe    ");
+                ui.text_edit_singleline(&mut self.adb_path);
+                if ui.small_button("浏览").clicked() {
+                    self.dialog = Some(crate::filedialog::pick_file());
+                    self.dialog_purpose = DialogPurpose::AdbExe;
+                }
+                if ui.small_button("自动").clicked() {
+                    match self.effective_adb() {
+                        Some(p) => {
+                            self.adb_path = p.display().to_string();
+                            self.log(format!("adb: {}", self.adb_path));
+                            self.resync();
+                        }
+                        None => self.log("未找到 adb,请手动指定路径或加入 PATH"),
+                    }
+                }
+            });
+            let adb_eff = self
+                .effective_adb()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "未找到(将回退 PATH 的 adb)".to_string());
+            let ver_txt = if self.server_version.is_empty() {
+                "未检测".to_string()
+            } else {
+                self.server_version.clone()
+            };
+            ui.small(format!("当前 adb: {adb_eff}"));
+            ui.small(format!("server 版本: {ver_txt}"));
 
             ui.separator();
             ui.heading("日志");
@@ -927,6 +1221,7 @@ impl PadApp {
                         .button(if is_tap { "转长按" } else { "转点按" })
                         .clicked()
                     {
+                        self.push_undo();
                         let mut g = self.shared.lock().unwrap();
                         if let Some(b) = g.profile.binds.get_mut(i) {
                             b.action = match &b.action {
@@ -943,7 +1238,9 @@ impl PadApp {
             });
         }
         if let Some(i) = to_delete {
+            self.push_undo();
             self.shared.lock().unwrap().profile.binds.remove(i);
+            self.log("已删除绑定");
         }
 
         // ---- 新增绑定 ----
@@ -991,6 +1288,7 @@ impl PadApp {
             }
             if ui.button("添加").clicked() {
                 if let Some(key) = self.draft.key {
+                    self.push_undo();
                     let action = match self.draft.kind {
                         0 => Action::Tap {
                             x: self.draft.x,
@@ -1062,6 +1360,7 @@ impl PadApp {
                         })
                         .clicked()
                     {
+                        self.push_undo();
                         let mut g = self.shared.lock().unwrap();
                         if let Some(t) = g.profile.wheels[i].temp.as_mut() {
                             t.mode = match t.mode {
@@ -1071,6 +1370,7 @@ impl PadApp {
                         }
                     }
                     if ui.button("设为永久").clicked() {
+                        self.push_undo();
                         {
                             let mut g = self.shared.lock().unwrap();
                             g.profile.wheels[i].temp = None;
@@ -1117,9 +1417,12 @@ impl PadApp {
             });
         }
         if let Some(i) = to_delete {
+            self.push_undo();
             self.shared.lock().unwrap().profile.wheels.remove(i);
+            self.log("已删除轮盘");
         }
         if ui.button("添加轮盘").clicked() {
+            self.push_undo();
             self.shared.lock().unwrap().profile.wheels.push(Wheel {
                 up: 17,
                 down: 31,
