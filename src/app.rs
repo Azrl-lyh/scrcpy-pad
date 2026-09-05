@@ -184,6 +184,106 @@ fn install_cjk_font(ctx: &egui::Context) {
     }
 }
 
+/// egui 收到的按键 -> evdev 键码(与全局捕获同一码空间)。
+/// 仅供键位绑定等待期使用:主窗口聚焦时 egui 必报按键事件,
+/// 不依赖 Windows 全局钩子(受 scrcpy 抢焦点影响不可靠)。
+fn egui_key_code(k: egui::Key) -> Option<u16> {
+    use egui::Key as K;
+    Some(match k {
+        K::A => 30,
+        K::B => 48,
+        K::C => 46,
+        K::D => 32,
+        K::E => 18,
+        K::F => 33,
+        K::G => 34,
+        K::H => 35,
+        K::I => 23,
+        K::J => 36,
+        K::K => 37,
+        K::L => 38,
+        K::M => 50,
+        K::N => 49,
+        K::O => 24,
+        K::P => 25,
+        K::Q => 16,
+        K::R => 19,
+        K::S => 31,
+        K::T => 20,
+        K::U => 22,
+        K::V => 47,
+        K::W => 17,
+        K::X => 45,
+        K::Y => 21,
+        K::Z => 44,
+        K::Num1 => 2,
+        K::Num2 => 3,
+        K::Num3 => 4,
+        K::Num4 => 5,
+        K::Num5 => 6,
+        K::Num6 => 7,
+        K::Num7 => 8,
+        K::Num8 => 9,
+        K::Num9 => 10,
+        K::Num0 => 11,
+        K::F1 => 59,
+        K::F2 => 60,
+        K::F3 => 61,
+        K::F4 => 62,
+        K::F5 => 63,
+        K::F6 => 64,
+        K::F7 => 65,
+        K::F8 => 66,
+        K::F9 => 67,
+        K::F10 => 68,
+        K::F11 => 87,
+        K::F12 => 88,
+        k if (K::F13 as u16..=K::F24 as u16).contains(&(k as u16)) => {
+            183 + k as u16 - K::F13 as u16
+        }
+        K::Escape => 1,
+        K::Tab => 15,
+        K::Backspace => 14,
+        K::Enter => 28,
+        K::Space => 57,
+        K::Insert => 110,
+        K::Delete => 111,
+        K::Home => 102,
+        K::End => 107,
+        K::PageUp => 104,
+        K::PageDown => 109,
+        K::ArrowUp => 103,
+        K::ArrowDown => 108,
+        K::ArrowLeft => 105,
+        K::ArrowRight => 106,
+        K::ShiftLeft => 42,
+        K::ShiftRight => 54,
+        K::ControlLeft => 29,
+        K::ControlRight => 97,
+        K::AltLeft => 56,
+        K::AltRight => 100,
+        K::SuperLeft => 125,
+        K::SuperRight => 126,
+        K::IntlBackslash => 86,
+        K::BrowserBack => 158,
+        // 符号键: 统一落到标准键盘的物理键位;只有在 physical_key 缺失时
+        // 才会以逻辑键名走到这里(全局捕获始终按物理键位上报)
+        K::Semicolon | K::Colon => 39,
+        K::Quote => 40,
+        K::Comma => 51,
+        K::Minus => 12,
+        K::Period => 52,
+        K::Slash | K::Questionmark => 53,
+        K::Backslash | K::Pipe => 43,
+        K::Equals | K::Plus => 13,
+        K::OpenBracket | K::OpenCurlyBracket => 26,
+        K::CloseBracket | K::CloseCurlyBracket => 27,
+        K::Backtick => 41,
+        K::Exclamationmark => 2,
+        _ => return None,
+    })
+}
+
 impl PadApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_font(&cc.egui_ctx);
@@ -722,6 +822,35 @@ impl eframe::App for PadApp {
             } else if k_refresh {
                 self.resync();
                 self.refresh_devices();
+            }
+        }
+
+        // ---- 键位绑定(本窗口键盘回退)----
+        // 等待绑定时焦点必在本窗口,egui 必然收到按键事件;
+        // 由此不依赖全局捕获(Windows 钩子受 scrcpy 抢焦点影响,导致
+        // 必须把 scrcpy 窗口置前才能绑定)。与 gui_rx 双路竞争,
+        // waiting_key 只消费一次,天然去重。
+        if self.waiting_key.is_some() {
+            let key = ctx.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::Key {
+                        key,
+                        physical_key,
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    } => {
+                        // 全局捕获按物理键位(evdev 码)上报,优先 physical_key 保持一致
+                        let k = (*physical_key).unwrap_or(*key);
+                        egui_key_code(k)
+                    }
+                    _ => None,
+                })
+            });
+            if let Some(code) = key {
+                if let Some(slot) = self.waiting_key.take() {
+                    self.assign_key(slot, code);
+                }
             }
         }
 
