@@ -6,6 +6,8 @@
 //!   Wheel - 方向键组合 -> 虚拟摇杆(圆心按下 + 向方向移动 + 松开回中抬起)
 //!          永久轮盘始终生效;临时轮盘仅在启用期间生效(Hold=按住启用键,
 //!          Toggle=按一下开/再按关),启用期间方向键归摇杆、同键位的其它绑定失效。
+//! 并发:普通键位(点按/长按/滑动)各自独立跟踪按下/抬起(见 Fingers),最多
+//!       MAX_CONCURRENT_KEYS 个键可同时按下,互不干扰,便于战斗中放组合技。
 
 use crate::capture::CaptureKey;
 use crate::control::ControlClient;
@@ -14,6 +16,64 @@ use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// 普通键位(点按/长按/滑动)可同时按下的数量上限。
+/// 模拟器多点触控一般支持 5 指,超出上限的新按下会被忽略,已按下键不受影响。
+const MAX_CONCURRENT_KEYS: usize = 5;
+
+/// 普通键位并发跟踪器:每个绑定索引独立记录"是否已按下",
+/// 保证任意键的按下/抬起严格成对、只作用于自己的 pid,互不干扰。
+///  - 同键未抬起时忽略重复按下(全局钩子自动重复/抖动),避免向 scrcpy
+///    反复注入同一 pid 的 DOWN,把 server 的多点指针池搅乱;
+///  - 没有按下记录的抬起一律忽略,绝不误抬其它键;
+///  - 同时按下的键数不超过 MAX_CONCURRENT_KEYS(超出忽略新按下)。
+#[derive(Default)]
+struct Fingers {
+    /// 绑定索引 -> 是否已按下
+    down: Vec<bool>,
+    /// 当前按下中的键数
+    count: usize,
+}
+
+impl Fingers {
+    /// 绑定列表长度变化时补长(只增不减,删除绑定产生的残留由 free_all 兜底)
+    fn align(&mut self, n: usize) {
+        if self.down.len() < n {
+            self.down.resize(n, false);
+        }
+    }
+
+    fn is_down(&self, idx: usize) -> bool {
+        self.down.get(idx).copied().unwrap_or(false)
+    }
+
+    /// 登记一次按下;已按下或并发已达上限时返回 false(调用方不注入 DOWN)
+    fn try_down(&mut self, idx: usize) -> bool {
+        if self.is_down(idx) || self.count >= MAX_CONCURRENT_KEYS {
+            return false;
+        }
+        self.down[idx] = true;
+        self.count += 1;
+        true
+    }
+
+    /// 登记一次抬起;仅当确有按下记录时返回 true(调用方据此注入 UP)
+    fn release(&mut self, idx: usize) -> bool {
+        if self.is_down(idx) {
+            self.down[idx] = false;
+            self.count = self.count.saturating_sub(1);
+            return true;
+        }
+        false
+    }
+
+    fn free_all(&mut self) {
+        for v in &mut self.down {
+            *v = false;
+        }
+        self.count = 0;
+    }
+}
 
 pub struct Shared {
     pub profile: Profile,
@@ -44,7 +104,7 @@ pub fn run(
     gui_tx: Sender<CaptureKey>,
 ) {
     let mut scheduled: Vec<(Instant, SchedAct)> = Vec::new();
-    let mut active_holds: HashSet<usize> = HashSet::new();
+    let mut fingers = Fingers::default();
     let mut active_android_keys: HashSet<u16> = HashSet::new();
     let mut wheels: Vec<WheelState> = Vec::new();
     let mut wheel_count = usize::MAX; // 触发重建
@@ -61,7 +121,13 @@ pub fn run(
                     let guard = shared.lock().unwrap();
                     if let Some(c) = guard.control.as_ref() {
                         match act {
-                            SchedAct::Up { pid, x, y } => c.touch_up(pid, x, y),
+                            SchedAct::Up { pid, x, y } => {
+                                c.touch_up(pid, x, y);
+                                // 定时抬起(点按 40ms / 滑动终点):该键本次按下结束,清除按下状态
+                                if pid >= 1000 {
+                                    fingers.release((pid - 1000) as usize);
+                                }
+                            }
                             SchedAct::Move { pid, x, y } => c.touch_move(pid, x, y),
                         }
                     }
@@ -93,11 +159,13 @@ pub fn run(
             g.enabled = !g.enabled;
             let now_enabled = g.enabled;
             if !now_enabled {
-                // 关闭时释放所有触点,并停用全部临时轮盘
+                // 关闭时释放所有按下中的触点与系统键,并停用全部临时轮盘
                 if let Some(c) = g.control.as_ref() {
-                    for idx in active_holds.drain() {
-                        let (x, y) = bind_point(&g.profile, idx);
-                        c.touch_up(bind_pid(idx), x, y);
+                    for idx in 0..g.profile.binds.len() {
+                        if fingers.release(idx) {
+                            let (x, y) = bind_point(&g.profile, idx);
+                            c.touch_up(bind_pid(idx), x, y);
+                        }
                     }
                     for kc in active_android_keys.drain() {
                         c.key(false, kc as u32);
@@ -109,17 +177,15 @@ pub fn run(
                             c.touch_up(wheel_pid(j), w.cx, w.cy);
                             ws.down = false;
                         }
-                        ws.pressed = [false; 4];
-                        ws.active = false;
                     }
                 } else {
-                    active_holds.clear();
                     active_android_keys.clear();
-                    for ws in wheels.iter_mut() {
-                        ws.down = false;
-                        ws.pressed = [false; 4];
-                        ws.active = false;
-                    }
+                }
+                fingers.free_all();
+                for ws in wheels.iter_mut() {
+                    ws.down = false;
+                    ws.pressed = [false; 4];
+                    ws.active = false;
                 }
             }
             continue;
@@ -143,6 +209,8 @@ pub fn run(
             wheels = vec![WheelState::default(); profile.wheels.len()];
             wheel_count = profile.wheels.len();
         }
+        // 普通绑定并发跟踪对齐
+        fingers.align(profile.binds.len());
 
         // ---- 临时轮盘启用键 ----
         let mut consumed = false;
@@ -159,7 +227,7 @@ pub fn run(
                         release_conflicting_binds(
                             ctl,
                             profile,
-                            &mut active_holds,
+                            &mut fingers,
                             &mut active_android_keys,
                             w,
                         );
@@ -176,7 +244,7 @@ pub fn run(
                             release_conflicting_binds(
                                 ctl,
                                 profile,
-                                &mut active_holds,
+                                &mut fingers,
                                 &mut active_android_keys,
                                 w,
                             );
@@ -218,58 +286,79 @@ pub fn run(
             continue;
         }
 
-        // ---- 普通绑定 ----
+        // ---- 普通绑定(每键独立按/抬状态,最多 MAX_CONCURRENT_KEYS 并发) ----
         for (idx, bind) in profile.binds.iter().enumerate() {
             if bind.key != ev.code {
                 continue;
             }
             let pid = bind_pid(idx);
             match &bind.action {
-                Action::Tap { x, y } if ev.pressed => {
-                    ctl.touch_down(pid, *x, *y);
-                    scheduled.push((
-                        Instant::now() + Duration::from_millis(40),
-                        SchedAct::Up { pid, x: *x, y: *y },
-                    ));
+                Action::Tap { x, y } => {
+                    // 点按:按下注入 DOWN,约 40ms 后定时抬起。
+                    // 若上一击尚未自动抬起又再次按下(极快连点/组合技排序),
+                    // 先立即结束旧触点再开新一轮,保证每次点按都完整触发、不丢键。
+                    if ev.pressed {
+                        if fingers.is_down(idx) {
+                            cancel_up_for(pid, &mut scheduled);
+                            ctl.touch_up(pid, *x, *y);
+                            fingers.release(idx);
+                        }
+                        if fingers.try_down(idx) {
+                            ctl.touch_down(pid, *x, *y);
+                            scheduled.push((
+                                Instant::now() + Duration::from_millis(40),
+                                SchedAct::Up { pid, x: *x, y: *y },
+                            ));
+                        }
+                    }
+                    // 松开不在此处理,统一由定时抬起收尾
                 }
                 Action::Hold { x, y } => {
                     if ev.pressed {
-                        ctl.touch_down(pid, *x, *y);
-                        active_holds.insert(idx);
-                    } else if active_holds.remove(&idx) {
+                        if fingers.try_down(idx) {
+                            ctl.touch_down(pid, *x, *y);
+                        }
+                    } else if fingers.release(idx) {
                         ctl.touch_up(pid, *x, *y);
                     }
                 }
                 Action::Swipe {
                     points,
                     duration_ms,
-                } if ev.pressed && points.len() >= 2 => {
-                    let (x0, y0) = points[0];
-                    ctl.touch_down(pid, x0, y0);
-                    let n = points.len();
-                    let start = Instant::now();
-                    for (k, &(x, y)) in points.iter().enumerate().skip(1) {
-                        let t = start
-                            + Duration::from_millis(
-                                (*duration_ms as u64) * k as u64 / (n as u64 - 1),
-                            );
-                        scheduled.push((t, SchedAct::Move { pid, x, y }));
+                } => {
+                    // 按下触发滑动;中途松手不打断,滑到终点由定时抬起清理按下状态
+                    if ev.pressed && points.len() >= 2 {
+                        if fingers.try_down(idx) {
+                            let (x0, y0) = points[0];
+                            ctl.touch_down(pid, x0, y0);
+                            let n = points.len();
+                            let start = Instant::now();
+                            for (k, &(x, y)) in points.iter().enumerate().skip(1) {
+                                let t = start
+                                    + Duration::from_millis(
+                                        (*duration_ms as u64) * k as u64 / (n as u64 - 1),
+                                    );
+                                scheduled.push((t, SchedAct::Move { pid, x, y }));
+                            }
+                            let (xe, ye) = points[n - 1];
+                            scheduled.push((
+                                start + Duration::from_millis(*duration_ms as u64 + 20),
+                                SchedAct::Up { pid, x: xe, y: ye },
+                            ));
+                        }
                     }
-                    let (xe, ye) = points[n - 1];
-                    scheduled.push((
-                        start + Duration::from_millis(*duration_ms as u64 + 20),
-                        SchedAct::Up { pid, x: xe, y: ye },
-                    ));
                 }
                 Action::AndroidKey { keycode } => {
+                    let kc = *keycode as u16;
                     if ev.pressed {
-                        ctl.key(true, *keycode);
-                        active_android_keys.insert(*keycode as u16);
-                    } else if active_android_keys.remove(&(*keycode as u16)) {
+                        // 同键未抬起(钩子自动重复/抖动)时不重复按下
+                        if active_android_keys.insert(kc) {
+                            ctl.key(true, *keycode);
+                        }
+                    } else if active_android_keys.remove(&kc) {
                         ctl.key(false, *keycode);
                     }
                 }
-                _ => {}
             }
         }
     }
@@ -279,6 +368,13 @@ fn bind_pid(idx: usize) -> u64 {
     1000 + idx as u64
 }
 
+/// 取消指定 pid 尚未执行的定时抬起(点按连发抢占旧点击用),
+/// 避免旧排程把新一撃提前抬起。
+fn cancel_up_for(pid: u64, scheduled: &mut Vec<(Instant, SchedAct)>) {
+    let target = pid;
+    scheduled.retain(|(_, act)| !matches!(act, SchedAct::Up { pid: p, .. } if *p == target));
+}
+
 fn wheel_pid(idx: usize) -> u64 {
     2000 + idx as u64
 }
@@ -286,6 +382,7 @@ fn wheel_pid(idx: usize) -> u64 {
 fn bind_point(profile: &Profile, idx: usize) -> (i32, i32) {
     match profile.binds.get(idx).map(|b| &b.action) {
         Some(Action::Hold { x, y }) | Some(Action::Tap { x, y }) => (*x, *y),
+        Some(Action::Swipe { points, .. }) => points.first().copied().unwrap_or((0, 0)),
         _ => (0, 0),
     }
 }
@@ -302,31 +399,33 @@ fn deactivate_wheel(ctl: &ControlClient, j: usize, w: &Wheel, st: &mut WheelStat
     }
 }
 
-/// 临时轮盘启用的瞬间,释放所有与该轮盘方向键冲突的普通绑定触点
+/// 临时轮盘启用的瞬间,释放所有与该轮盘方向键冲突的普通绑定
+/// (仍按住的点按/长按/滑动触点与系统键),避免方向输入被抢占或触点卡死。
 fn release_conflicting_binds(
     ctl: &ControlClient,
     profile: &Profile,
-    active_holds: &mut HashSet<usize>,
+    fingers: &mut Fingers,
     active_android_keys: &mut HashSet<u16>,
     w: &Wheel,
 ) {
     let dirs = [w.up, w.down, w.left, w.right];
-    let idxs: Vec<usize> = profile
-        .binds
-        .iter()
-        .enumerate()
-        .filter(|(_, b)| dirs.contains(&b.key))
-        .map(|(i, _)| i)
-        .collect();
-    for i in idxs {
-        if active_holds.remove(&i) {
-            let (x, y) = bind_point(profile, i);
-            ctl.touch_up(bind_pid(i), x, y);
+    for (i, bind) in profile.binds.iter().enumerate() {
+        if !dirs.contains(&bind.key) {
+            continue;
         }
-    }
-    for kc in dirs {
-        if active_android_keys.remove(&kc) {
-            ctl.key(false, kc as u32);
+        match &bind.action {
+            Action::AndroidKey { keycode } => {
+                let kc = *keycode as u16;
+                if active_android_keys.remove(&kc) {
+                    ctl.key(false, *keycode);
+                }
+            }
+            _ => {
+                if fingers.release(i) {
+                    let (x, y) = bind_point(profile, i);
+                    ctl.touch_up(bind_pid(i), x, y);
+                }
+            }
         }
     }
 }
