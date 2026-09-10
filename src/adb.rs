@@ -219,15 +219,6 @@ pub fn find_server(scrcpy_path: Option<&Path>) -> Option<PathBuf> {
     None
 }
 
-/// 各平台默认的 scrcpy-server 位置(静态回退,优先用 find_server 自动发现)
-pub fn default_server_path() -> &'static str {
-    if cfg!(windows) {
-        "scrcpy-server"
-    } else {
-        "/usr/share/scrcpy/scrcpy-server"
-    }
-}
-
 /// 运行 scrcpy --version 解析版本号(如 "4.1")。
 /// exe 为空时视为 PATH 中的 "scrcpy"。
 pub fn scrcpy_version_at(exe: &str) -> Option<String> {

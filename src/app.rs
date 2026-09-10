@@ -490,9 +490,11 @@ impl PadApp {
         // 自动寻找 scrcpy 与 server
         let (scrcpy_path, server_path, version, found_msg) = {
             let exe = adb::find_scrcpy();
+            // server 找不到就留空:后续用户选定 scrcpy.exe 后,由 sync_suite 按其同目录
+            // 自动补齐(官方发行包三者同目录),避免预先填入的相对路径阻塞自动发现
             let server = adb::find_server(exe.as_deref())
                 .map(|p| p.display().to_string())
-                .unwrap_or_else(|| adb::default_server_path().to_string());
+                .unwrap_or_default();
             match exe {
                 Some(p) => {
                     let ps = p.display().to_string();
@@ -1188,11 +1190,16 @@ impl eframe::App for PadApp {
                             Ok(prof) => {
                                 self.profile_path = p.clone();
                                 self.apply_profile_switch(prof);
+                                // 先取数、释放锁,再 log:避免 format! 参数里两次 lock 死锁
+                                let (nb, nw) = {
+                                    let g = self.shared.lock().unwrap();
+                                    (g.profile.binds.len(), g.profile.wheels.len())
+                                };
                                 self.log(format!(
                                     "已选用配置: {} ({} 按键 / {} 轮盘)",
                                     p.display(),
-                                    self.shared.lock().unwrap().profile.binds.len(),
-                                    self.shared.lock().unwrap().profile.wheels.len()
+                                    nb,
+                                    nw
                                 ));
                             }
                             Err(e) => self.log(format!("选用失败: {e}")),

@@ -1,8 +1,6 @@
 @echo off
 chcp 65001 > nul
 cd /d %~dp0
-set RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup
-set RUSTUP_UPDATE_ROOT=https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup
 if not exist target\release\scrcpy-pad.exe (
 	echo  '找不到目标文件，执行首次生成任务…'
 	cargo build --release
