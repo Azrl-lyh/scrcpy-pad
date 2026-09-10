@@ -293,8 +293,12 @@ pub fn run(
             }
             let pid = bind_pid(idx);
             match &bind.action {
-                Action::Tap { x, y } => {
-                    // 点按:按下注入 DOWN,约 40ms 后定时抬起。
+                Action::Tap {
+                    x,
+                    y,
+                    duration_ms,
+                } => {
+                    // 点按:按下注入 DOWN,持续 duration_ms(默认 40ms)后定时抬起。
                     // 若上一击尚未自动抬起又再次按下(极快连点/组合技排序),
                     // 先立即结束旧触点再开新一轮,保证每次点按都完整触发、不丢键。
                     if ev.pressed {
@@ -306,7 +310,8 @@ pub fn run(
                         if fingers.try_down(idx) {
                             ctl.touch_down(pid, *x, *y);
                             scheduled.push((
-                                Instant::now() + Duration::from_millis(40),
+                                Instant::now()
+                                    + Duration::from_millis((*duration_ms as u64).max(5)),
                                 SchedAct::Up { pid, x: *x, y: *y },
                             ));
                         }
@@ -381,7 +386,7 @@ fn wheel_pid(idx: usize) -> u64 {
 
 fn bind_point(profile: &Profile, idx: usize) -> (i32, i32) {
     match profile.binds.get(idx).map(|b| &b.action) {
-        Some(Action::Hold { x, y }) | Some(Action::Tap { x, y }) => (*x, *y),
+        Some(Action::Hold { x, y }) | Some(Action::Tap { x, y, .. }) => (*x, *y),
         Some(Action::Swipe { points, .. }) => points.first().copied().unwrap_or((0, 0)),
         _ => (0, 0),
     }

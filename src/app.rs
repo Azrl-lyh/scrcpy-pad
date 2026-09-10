@@ -15,6 +15,169 @@ const LOCAL_PORT: u16 = 28383;
 const REPO_URL: &str = "https://github.com/Azrl-lyh/scrcpy-pad";
 const AUTHOR: &str = "Azrl-lyh";
 
+/// scrcpy 启动参数的初始(无预设)值
+const BASE_SCRCPY_ARGS: &str = "--stay-awake";
+
+/// 启动参数预设下拉选项
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartPreset {
+    /// 无:回到初始默认(--stay-awake)
+    None,
+    /// 分辨率预设:先重置为默认,再叠加
+    Uhd2k,
+    Uhd4k,
+    Fhd1080,
+    Hd720,
+    /// 音频类:直接追加/移除,不做重置
+    NoAudio,
+    WithAudio,
+}
+
+impl StartPreset {
+    fn label(self) -> &'static str {
+        match self {
+            StartPreset::None => "无(--stay-awake)",
+            StartPreset::Uhd2k => "2k 高清(最长边 2560)",
+            StartPreset::Uhd4k => "4k 高清(最长边 3840)",
+            StartPreset::Fhd1080 => "1k 标清(最长边 1080)",
+            StartPreset::Hd720 => "720p(最长边 720)",
+            StartPreset::NoAudio => "不使用音频输出(--no-audio)",
+            StartPreset::WithAudio => "指定使用音频输出(移除 --no-audio)",
+        }
+    }
+}
+
+/// 参数助手窗口打开期间的内容;每次打开按默认参数重建,关闭即丢弃临时修改
+struct ArgHelp {
+    entries: Vec<ArgEntry>,
+    selected: usize,
+    /// 正在被临时编辑的参数下标(双击进入,焦点移走不丢失,关窗丢弃)
+    editing: Option<usize>,
+}
+
+/// 一条常用 scrcpy 参数说明
+struct ArgEntry {
+    /// 参数文本(可被临时编辑,仅本窗口会话内生效)
+    flag: String,
+    /// 参数中文名
+    name: &'static str,
+    /// 作用的中文解释
+    desc: &'static str,
+    /// 使用示例
+    usage: &'static str,
+}
+
+impl ArgHelp {
+    fn defaults() -> Self {
+        let raw: &[(&str, &str, &str, &str)] = &[
+            (
+                "--max-size=1920",
+                "画面清晰度上限",
+                "限制镜像视频的最长边像素,另一条边按设备比例缩放。\n值越大越清晰、越耗带宽;低于设备原始分辨率还能明显降低延迟。\n默认 0(不限制,即设备原始分辨率)。",
+                "--max-size=1920\n\n手机是 1080x2400 时加 --max-size=1080 就是 1k;\n模拟器/真机 4k 屏可用 --max-size=3840。",
+            ),
+            (
+                "--max-fps=60",
+                "帧率上限",
+                "限制屏幕采集帧率。数值越低越省资源,但画面/操作更“肉”。\n部分游戏建议降到 30~60 以获得更稳的延迟。",
+                "--max-fps=60",
+            ),
+            (
+                "--video-bit-rate=16M",
+                "视频码率",
+                "编码码率,直接决定画面细节保留程度。\n网络/串流卡顿时可调低(如 4M),画面发糊时调高(如 20M)。\n默认 8M。",
+                "--video-bit-rate=12M",
+            ),
+            (
+                "--video-codec=h265",
+                "视频编码器",
+                "可选 h264 / h265 / av1 / vp8 / vp9。\n同码率下 h265 比 h264 更清晰(设备需支持);\nav1 画质最好但仅 Android 11+ 且更吃 CPU。默认 h264。",
+                "--video-codec=h265",
+            ),
+            (
+                "--no-audio",
+                "关闭音频转发",
+                "完全关闭音频转发(设备端照常出声)。\n打游戏不需要听声音时能省带宽、更稳。",
+                "--no-audio",
+            ),
+            (
+                "--audio-codec=aac",
+                "音频编码器",
+                "音频编码可选 opus / aac / flac / raw。\n默认 opus;兼容性问题时可换 aac。",
+                "--audio-codec=aac",
+            ),
+            (
+                "--turn-screen-off",
+                "启动即息屏",
+                "启动后立刻关闭设备屏幕(快捷键等效 -S)。\n串流打游戏时能省电并防止误触,画面不受影响。",
+                "--turn-screen-off",
+            ),
+            (
+                "-w",
+                "保持唤醒",
+                "连接期间设备不休眠(stay-awake)。本程序已默认加入,无需重复。",
+                "-w 或 --stay-awake",
+            ),
+            (
+                "-f",
+                "全屏显示",
+                "scrcpy 窗口以全屏模式打开。",
+                "-f 或 --fullscreen",
+            ),
+            (
+                "--always-on-top",
+                "窗口置顶",
+                "让 scrcpy 画面窗口始终显示在最上层,不被其它窗口遮挡。",
+                "--always-on-top",
+            ),
+            (
+                "-t",
+                "显示触摸提示",
+                "开启系统“显示触摸”提示(仅显示物理触摸,非本程序注入)。",
+                "-t 或 --show-touches",
+            ),
+            (
+                "--window-title=scrcpy-pad",
+                "自定义窗口标题",
+                "给 scrcpy 窗口设置自定义标题,便于区分多开实例。",
+                "--window-title=打游戏",
+            ),
+            (
+                "--window-width=480",
+                "初始窗口宽度",
+                "设置 scrcpy 窗口初始宽度(高度按比例自动)。\n值设为 0 表示自动。",
+                "--window-width=480",
+            ),
+            (
+                "--crop=1920:1080:0:0",
+                "画面裁剪",
+                "只显示设备屏幕的一部分(宽:高:x:y),\n适合隐藏通知栏/黑边,裁剪是在设备端完成的。",
+                "--crop=2400:1080:0:1320",
+            ),
+            (
+                "--orientation=90",
+                "画面旋转",
+                "把画面旋转 0/90/180/270 度;也可用 flip 前缀镜像。\n横屏游戏旋转 90 度后,坐标与截图会按旋转后画面算。",
+                "--orientation=90",
+            ),
+        ];
+        let entries = raw
+            .iter()
+            .map(|(flag, name, desc, usage)| ArgEntry {
+                flag: flag.to_string(),
+                name,
+                desc,
+                usage,
+            })
+            .collect();
+        Self {
+            entries,
+            selected: 0,
+            editing: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum KeySlot {
     NewBind,
@@ -59,6 +222,10 @@ enum DialogPurpose {
     AdbExe,
     SaveLog,
     SaveProfileAs,
+    /// 选用已有键位 json 作为当前配置
+    ChooseProfile,
+    /// 新建键位 json(路径可不存在,选择后写入全新默认配置)
+    NewProfile,
 }
 
 struct DraftBind {
@@ -68,6 +235,8 @@ struct DraftBind {
     y: i32,
     points_text: String,
     duration_ms: u32,
+    /// 点按型新键的触点时长(ms)
+    tap_duration_ms: u32,
     keycode: u32,
 }
 
@@ -80,6 +249,7 @@ impl Default for DraftBind {
             y: 1200,
             points_text: "540,1800 540,600".into(),
             duration_ms: 300,
+            tap_duration_ms: crate::keymap::DEFAULT_TAP_DURATION_MS,
             keycode: 4,
         }
     }
@@ -121,6 +291,8 @@ pub struct PadApp {
     grab_enabled: bool,
 
     about_open: bool,
+    /// scrcpy 参数助手窗口状态(None=未打开;每次打开重建默认参数)
+    args_helper: Option<ArgHelp>,
     dialog: Option<crate::filedialog::FileDialogHandle>,
     dialog_purpose: DialogPurpose,
     loginfo_rx: Option<Receiver<adb::DeviceInfo>>,
@@ -368,7 +540,7 @@ impl PadApp {
             gui_rx,
             devices,
             selected: 0,
-            scrcpy_args: "--stay-awake".into(),
+            scrcpy_args: BASE_SCRCPY_ARGS.into(),
             scrcpy_path,
             server_path,
             adb_path: adb_init,
@@ -388,6 +560,7 @@ impl PadApp {
             profile_path,
             grab_enabled: false,
             about_open: false,
+            args_helper: None,
             dialog: None,
             dialog_purpose: DialogPurpose::ScrcpyExe,
             loginfo_rx: None,
@@ -564,7 +737,7 @@ impl PadApp {
                 }
                 CoordSlot::Bind(i) => {
                     if let Some(b) = g.profile.binds.get_mut(i) {
-                        if let Action::Tap { x: ax, y: ay } | Action::Hold { x: ax, y: ay } =
+                        if let Action::Tap { x: ax, y: ay, .. } | Action::Hold { x: ax, y: ay } =
                             &mut b.action
                         {
                             *ax = x;
@@ -666,6 +839,86 @@ impl PadApp {
                 }
             }
             Err(e) => self.log(format!("序列化失败: {e}")),
+        }
+    }
+
+    /// 从当前指向的配置文件重新加载(重定向后也从新路径加载)
+    fn reload_profile_from_current(&mut self) {
+        match read_profile_at(&self.profile_path) {
+            Ok(p) => {
+                self.push_undo();
+                self.shared.lock().unwrap().profile = p;
+                self.log(format!("配置已重新加载(可撤销): {}", self.profile_path.display()));
+            }
+            Err(e) => self.log(format!("重新加载失败: {e}")),
+        }
+    }
+
+    /// 切换当前配置文件后整体替换配置内容;
+    /// 撤销/重做栈指向旧文件数据,与当前上下文无关,一并清空避免误操作
+    fn apply_profile_switch(&mut self, p: Profile) {
+        self.shared.lock().unwrap().profile = p;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+    }
+
+    /// 检测【当前】配置文件是否符合格式要求(不弹文件选择框)
+    fn check_current_profile(&mut self) {
+        match read_profile_at(&self.profile_path) {
+            Ok(p) => self.log(format!(
+                "检测通过: {} 是合法配置 ({} 按键 / {} 轮盘)",
+                self.profile_path.display(),
+                p.binds.len(),
+                p.wheels.len()
+            )),
+            Err(e) => self.log(format!(
+                "检测不通过: {} —— {e}",
+                self.profile_path.display()
+            )),
+        }
+    }
+
+    /// 分辨率预设:先把参数整体重置为初始“无”状态,再叠加对应 --max-size
+    fn set_res_preset(&mut self, max_size: u32) {
+        self.scrcpy_args = format!("{BASE_SCRCPY_ARGS} --max-size={max_size}");
+        self.log(format!("启动参数已设为分辨率预设(最长边 {max_size})"));
+    }
+
+    /// 顶栏“启动预设”下拉的执行动作
+    fn apply_start_preset(&mut self, p: StartPreset) {
+        match p {
+            StartPreset::None => {
+                self.scrcpy_args = BASE_SCRCPY_ARGS.to_string();
+                self.log(format!("启动参数已重置: {BASE_SCRCPY_ARGS}"));
+            }
+            StartPreset::Uhd2k => self.set_res_preset(2560),
+            StartPreset::Uhd4k => self.set_res_preset(3840),
+            StartPreset::Fhd1080 => self.set_res_preset(1080),
+            StartPreset::Hd720 => self.set_res_preset(720),
+            StartPreset::NoAudio => {
+                if self.scrcpy_args.split_whitespace().any(|a| a == "--no-audio") {
+                    self.log("参数已含 --no-audio,无需重复");
+                } else {
+                    let base = self.scrcpy_args.trim();
+                    self.scrcpy_args =
+                        format!("{base} --no-audio").split_whitespace().collect::<Vec<_>>().join(" ");
+                    self.log("已追加 --no-audio(不使用音频输出)");
+                }
+            }
+            StartPreset::WithAudio => {
+                let had = self.scrcpy_args.split_whitespace().any(|a| a == "--no-audio");
+                self.scrcpy_args = self
+                    .scrcpy_args
+                    .split_whitespace()
+                    .filter(|a| *a != "--no-audio")
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if had {
+                    self.log("已移除 --no-audio(scrcpy 默认转发音频输出)");
+                } else {
+                    self.log("本就未含 --no-audio:scrcpy 默认开启音频输出,无需额外参数");
+                }
+            }
         }
     }
 
@@ -930,6 +1183,29 @@ impl eframe::App for PadApp {
                             Err(e) => self.log(format!("序列化失败: {e}")),
                         }
                     }
+                    (DialogPurpose::ChooseProfile, Some(p)) => {
+                        match read_profile_at(&p) {
+                            Ok(prof) => {
+                                self.profile_path = p.clone();
+                                self.apply_profile_switch(prof);
+                                self.log(format!(
+                                    "已选用配置: {} ({} 按键 / {} 轮盘)",
+                                    p.display(),
+                                    self.shared.lock().unwrap().profile.binds.len(),
+                                    self.shared.lock().unwrap().profile.wheels.len()
+                                ));
+                            }
+                            Err(e) => self.log(format!("选用失败: {e}")),
+                        }
+                    }
+                    (DialogPurpose::NewProfile, Some(p)) => match write_default_profile(&p) {
+                        Ok(_) => {
+                            self.profile_path = p.clone();
+                            self.apply_profile_switch(Profile::default());
+                            self.log(format!("已新建空配置并切换: {}", p.display()));
+                        }
+                        Err(e) => self.log(format!("新建失败: {e}")),
+                    },
                 }
             }
         }
@@ -977,7 +1253,17 @@ impl eframe::App for PadApp {
 
         // ================= 顶栏 =================
         egui::Panel::top("top").show(ui, |ui| {
-            ui.horizontal(|ui| {
+            // 仅顶栏生效的细滚动条:非浮动、不随悬停加粗,避免盖住内容
+            let top_scroll_style = {
+                let mut thin = ui.style().as_ref().clone();
+                thin.spacing.scroll.floating = false;
+                thin.spacing.scroll.bar_width = 4.0;
+                thin.spacing.scroll.handle_min_length = 10.0;
+                thin
+            };
+            ui.set_style(top_scroll_style);
+            egui::ScrollArea::horizontal().show(ui, |ui| {
+                ui.horizontal(|ui| {
                 // 撤销/重做(与 Ctrl+Z / Ctrl+Y 等价)
                 if ui.button("⟲ 撤销").clicked() {
                     self.undo();
@@ -1003,7 +1289,28 @@ impl eframe::App for PadApp {
 
                 ui.separator();
                 ui.label("scrcpy参数:");
+                if ui.small_button("...").on_hover_text("打开常用参数助手").clicked() {
+                    self.args_helper = Some(ArgHelp::defaults());
+                }
                 ui.add(egui::TextEdit::singleline(&mut self.scrcpy_args).desired_width(160.0));
+                // 启动预设:分辨率预设先重置为默认再叠加;音频类直接在现有参数上增删
+                egui::ComboBox::from_id_salt("startpreset")
+                    .selected_text("启动预设")
+                    .show_ui(ui, |ui| {
+                        for p in [
+                            StartPreset::None,
+                            StartPreset::Uhd2k,
+                            StartPreset::Uhd4k,
+                            StartPreset::Fhd1080,
+                            StartPreset::Hd720,
+                            StartPreset::NoAudio,
+                            StartPreset::WithAudio,
+                        ] {
+                            if ui.selectable_label(false, p.label()).clicked() {
+                                self.apply_start_preset(p);
+                            }
+                        }
+                    });
                 if ui.button("启动 scrcpy").clicked() {
                     // 启动前联动一次:确保 server/adb 路径已就绪(如已手动粘贴 scrcpy 路径)
                     self.resync();
@@ -1051,6 +1358,7 @@ impl eframe::App for PadApp {
                 if ui.button("关于").clicked() {
                     self.about_open = true;
                 }
+                });
             });
         });
 
@@ -1097,16 +1405,32 @@ impl eframe::App for PadApp {
                     self.dialog_purpose = DialogPurpose::SaveProfileAs;
                 }
                 if ui.button("重新加载").clicked() {
-                    match load_profile() {
-                        Some(p) => {
-                            self.push_undo();
-                            self.shared.lock().unwrap().profile = p;
-                            self.log("配置已重新加载(可撤销)");
-                        }
-                        None => self.log("加载失败或配置文件不存在"),
-                    }
+                    self.reload_profile_from_current();
                 }
             });
+            // 键位文件重定向:指定任意目录/文件名为当前键位(可无文件则新建)
+            ui.horizontal(|ui| {
+                if ui.button("选用配置...").clicked() {
+                    self.dialog = Some(crate::filedialog::pick_file());
+                    self.dialog_purpose = DialogPurpose::ChooseProfile;
+                }
+                if ui.button("新建配置...").clicked() {
+                    self.dialog = Some(crate::filedialog::save_file("scrcpy-pad-profile.json"));
+                    self.dialog_purpose = DialogPurpose::NewProfile;
+                }
+                if ui.button("检测当前 json").clicked() {
+                    self.check_current_profile();
+                }
+            });
+            ui.small(format!(
+                "当前配置文件: {}{}",
+                self.profile_path.display(),
+                if self.profile_path == profile_path() {
+                    " (默认)"
+                } else {
+                    ""
+                }
+            ));
             if ui.button("保存日志...").clicked() {
                 let serial = self.serial();
                 if serial.is_empty() {
@@ -1239,7 +1563,8 @@ impl eframe::App for PadApp {
 
         // ================= 中央区 =================
         egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            // 横纵双向滚动:键位条目较长时可用滚轮/横向滚动查看,不再被窗口裁掉
+            egui::ScrollArea::both().show(ui, |ui| {
                 self.ui_binds(ui);
                 ui.separator();
                 self.ui_wheels(ui);
@@ -1262,6 +1587,9 @@ impl eframe::App for PadApp {
                     ui.label("MIT License © 2026 Azrl");
                 });
         }
+
+        // ================= 参数助手窗口 =================
+        self.ui_args_helper(ctx);
 
         ctx.request_repaint_after(Duration::from_millis(120));
     }
@@ -1292,7 +1620,19 @@ impl PadApp {
                     let mut g = self.shared.lock().unwrap();
                     if let Some(b) = g.profile.binds.get_mut(i) {
                         match &mut b.action {
-                            Action::Tap { x, y } | Action::Hold { x, y } => {
+                            Action::Tap {
+                                x,
+                                y,
+                                duration_ms,
+                            } => {
+                                ui.label("x:");
+                                ui.add(egui::DragValue::new(x).range(0..=8192));
+                                ui.label("y:");
+                                ui.add(egui::DragValue::new(y).range(0..=8192));
+                                ui.label("时长ms:");
+                                ui.add(egui::DragValue::new(duration_ms).range(5..=5000));
+                            }
+                            Action::Hold { x, y } => {
                                 ui.label("x:");
                                 ui.add(egui::DragValue::new(x).range(0..=8192));
                                 ui.label("y:");
@@ -1354,8 +1694,14 @@ impl PadApp {
                         let mut g = self.shared.lock().unwrap();
                         if let Some(b) = g.profile.binds.get_mut(i) {
                             b.action = match &b.action {
-                                Action::Tap { x, y } => Action::Hold { x: *x, y: *y },
-                                Action::Hold { x, y } => Action::Tap { x: *x, y: *y },
+                                // 点按 -> 长按:去掉响应时长(长按无需时长)
+                                Action::Tap { x, y, .. } => Action::Hold { x: *x, y: *y },
+                                // 长按 -> 点按:补默认响应时长(可在行内重新调整)
+                                Action::Hold { x, y } => Action::Tap {
+                                    x: *x,
+                                    y: *y,
+                                    duration_ms: crate::keymap::DEFAULT_TAP_DURATION_MS,
+                                },
                                 _ => unreachable!(),
                             };
                         }
@@ -1393,6 +1739,12 @@ impl PadApp {
                     ui.add(egui::DragValue::new(&mut self.draft.x).range(0..=8192));
                     ui.label("y:");
                     ui.add(egui::DragValue::new(&mut self.draft.y).range(0..=8192));
+                    if self.draft.kind == 0 {
+                        ui.label("时长ms:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.draft.tap_duration_ms).range(5..=5000),
+                        );
+                    }
                     let waiting_p = self.picking == Some(CoordSlot::NewBind);
                     if ui
                         .button(if waiting_p { "点击截图..." } else { "取点" })
@@ -1422,6 +1774,7 @@ impl PadApp {
                         0 => Action::Tap {
                             x: self.draft.x,
                             y: self.draft.y,
+                            duration_ms: self.draft.tap_duration_ms,
                         },
                         1 => Action::Hold {
                             x: self.draft.x,
@@ -1435,14 +1788,24 @@ impl PadApp {
                             keycode: self.draft.keycode,
                         },
                     };
-                    self.shared
-                        .lock()
-                        .unwrap()
-                        .profile
-                        .binds
-                        .push(KeyBind { key, action });
+                    let is_point = matches!(action, Action::Tap { .. } | Action::Hold { .. });
+                    let new_idx = {
+                        let mut g = self.shared.lock().unwrap();
+                        let new_idx = g.profile.binds.len();
+                        g.profile.binds.push(KeyBind { key, action });
+                        new_idx
+                    };
                     self.draft.key = None;
                     self.log("已添加绑定");
+                    if is_point {
+                        if self.shot.is_some() {
+                            // 添加点按/长按后直接进入取点,无需再手动点[取点]
+                            self.picking = Some(CoordSlot::Bind(new_idx));
+                            self.log("请在截图上点击目标位置");
+                        } else {
+                            self.log("提示: 尚无截图,先[截取手机屏幕]后可自动取点");
+                        }
+                    }
                 } else {
                     self.log("请先捕获按键");
                 }
@@ -1579,7 +1942,7 @@ impl PadApp {
         if matches!(self.overlay_filter, OverlayFilter::All | OverlayFilter::Keys) {
             for b in &g.profile.binds {
                 match &b.action {
-                    Action::Tap { x, y } | Action::Hold { x, y } => {
+                    Action::Tap { x, y, .. } | Action::Hold { x, y } => {
                         let p = to_screen(*x, *y);
                         let (ring, fill) = if matches!(b.action, Action::Tap { .. }) {
                             (Color32::GREEN, Color32::from_rgba_unmultiplied(0, 200, 0, 60))
@@ -1697,6 +2060,117 @@ impl PadApp {
         }
     }
 
+    /// 参数助手浮窗:每次打开重建默认参数;关闭即丢弃窗口内临时修改
+    fn ui_args_helper(&mut self, ctx: &egui::Context) {
+        if self.args_helper.is_none() {
+            return;
+        }
+        let mut open = true;
+        let mut helper = self.args_helper.take().unwrap();
+        egui::Window::new("scrcpy 常用参数助手")
+            .open(&mut open)
+            .default_width(500.0)
+            .show(ctx, |ui| {
+                self.arg_help_panel(ui, &mut helper);
+            });
+        if open {
+            // 窗口仍开着:放回状态,保留当前选中与临时修改
+            self.args_helper = Some(helper);
+        }
+        // 关闭则丢弃(None)
+    }
+
+    fn arg_help_panel(&mut self, ui: &mut egui::Ui, h: &mut ArgHelp) {
+        ui.label(
+            "单击选中参数;双击某条进入临时编辑(可改数值等)。\n临时修改在窗口关闭前一直保留,关闭后不保存;焦点移到别处不会丢失。",
+        );
+        let scrcpy_gh = "https://github.com/Genymobile/scrcpy";
+        let count = h.entries.len();
+        egui::ScrollArea::vertical()
+            .max_height(230.0)
+            .show(ui, |ui| {
+                for i in 0..count {
+                    ui.horizontal(|ui| {
+                        let name = h.entries[i].name;
+                        let sel_resp = ui.selectable_label(h.selected == i, name);
+                        if sel_resp.double_clicked() {
+                            h.selected = i;
+                            h.editing = Some(i);
+                        } else if sel_resp.clicked() {
+                            h.selected = i;
+                        }
+                        if h.editing == Some(i) {
+                            // 临时编辑态:直接改本行参数文本;点 ✓ 或双击别的参数结束编辑
+                            ui.add(
+                                egui::TextEdit::singleline(&mut h.entries[i].flag)
+                                    .desired_width(240.0),
+                            );
+                            if ui.small_button("✓").clicked() {
+                                h.editing = None;
+                            }
+                        } else {
+                            let r = ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(h.entries[i].flag.as_str()).monospace(),
+                                )
+                                .sense(egui::Sense::click()),
+                            );
+                            if r.double_clicked() {
+                                h.selected = i;
+                                h.editing = Some(i);
+                            } else if r.clicked() {
+                                h.selected = i;
+                            }
+                        }
+                    });
+                }
+            });
+        ui.separator();
+        if count > 0 {
+            let sel = h.selected.min(count - 1);
+            let e = &h.entries[sel];
+            ui.horizontal(|ui| {
+                ui.strong(e.name);
+                ui.monospace(&e.flag);
+            });
+            ui.label(e.desc);
+            ui.add_space(4.0);
+            ui.label("使用示例:");
+            ui.monospace(e.usage);
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("加入 scrcpy 参数").clicked() {
+                    let flag = h.entries[sel].flag.trim().to_string();
+                    if flag.is_empty() {
+                        self.log("该参数文本为空,无法加入");
+                    } else {
+                        let base = self.scrcpy_args.trim();
+                        self.scrcpy_args = if base.is_empty() {
+                            flag.clone()
+                        } else {
+                            format!("{base} {flag}")
+                        };
+                        self.log(format!("已加入参数: {flag}"));
+                    }
+                }
+                if ui.button("撤去该参数").clicked() {
+                    let flag = h.entries[sel].flag.trim();
+                    if !flag.is_empty() {
+                        self.scrcpy_args = self
+                            .scrcpy_args
+                            .split_whitespace()
+                            .filter(|a| *a != flag)
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        self.log(format!("已从参数框移除: {flag}"));
+                    }
+                }
+            });
+            ui.add_space(4.0);
+            ui.hyperlink_to("scrcpy 官方文档/源码 (GitHub)", scrcpy_gh);
+        }
+    }
+
     fn ui_picker(&mut self, ui: &mut egui::Ui) {
         ui.heading("截图取点");
         ui.horizontal(|ui| {
@@ -1783,6 +2257,22 @@ fn load_profile() -> Option<Profile> {
     let path = profile_path();
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+/// 读取并严格校验任意路径下的键位 json;返回详细中文错误便于排查
+fn read_profile_at(path: &std::path::Path) -> Result<Profile, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("读取失败: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("不是合法的键位 json: {e}"))
+}
+
+/// 向指定路径写入全新默认配置(父目录不存在则自动创建)
+fn write_default_profile(path: &std::path::Path) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(&Profile::default())
+        .map_err(|e| format!("序列化失败: {e}"))?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(path, json).map_err(|e| format!("写入失败: {e}"))
 }
 
 /// epoch 秒 -> "2026-09-05 14:25:30"(本地时区,民用历算法)

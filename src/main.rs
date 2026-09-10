@@ -12,10 +12,14 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1180.0, 760.0])
+        .with_min_inner_size([900.0, 600.0]);
+    if let Some(icon) = app_icon() {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 760.0])
-            .with_min_inner_size([900.0, 600.0]),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -23,6 +27,47 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(app::PadApp::new(cc)))),
     )
+}
+
+/// 从图标目录加载程序图标(icons/scrcpy-pad.png 等候选位置),
+/// 找不到或无图标时返回 None,由系统使用默认图标。
+fn app_icon() -> Option<egui::IconData> {
+    use std::path::PathBuf;
+    let mut cands: Vec<PathBuf> = Vec::new();
+    if let Ok(dir) = std::env::current_dir() {
+        cands.push(dir.join("icons").join("scrcpy-pad.png"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            cands.push(dir.join("icons").join("scrcpy-pad.png"));
+            cands.push(dir.join("scrcpy-pad.png"));
+        }
+    }
+    for p in cands {
+        let Ok(bytes) = std::fs::read(&p) else {
+            continue;
+        };
+        let Ok(img) = image::load_from_memory(&bytes) else {
+            continue;
+        };
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        // 过大时缩到 256 以内,避免个别平台不接受超大图标
+        let rgba = if w > 256 || h > 256 {
+            let img2 = image::DynamicImage::ImageRgba8(rgba);
+            img2.resize(256, 256, image::imageops::FilterType::Triangle)
+                .to_rgba8()
+        } else {
+            rgba
+        };
+        let (w, h) = rgba.dimensions();
+        return Some(egui::IconData {
+            rgba: rgba.into_raw(),
+            width: w,
+            height: h,
+        });
+    }
+    None
 }
 
 /// 无界面自检:验证键盘捕获权限 / adb / scrcpy 定位 / 控制通道 / 协议注入(仅发无害 hover)

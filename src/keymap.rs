@@ -1,10 +1,22 @@
 use serde::{Deserialize, Serialize};
 
+/// 点按的默认触点持续时间(ms)
+pub const DEFAULT_TAP_DURATION_MS: u32 = 40;
+
+fn default_tap_duration_ms() -> u32 {
+    DEFAULT_TAP_DURATION_MS
+}
+
 /// 单个按键绑定的动作
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Action {
-    /// 点按:按下时快速点击一次 (x, y)
-    Tap { x: i32, y: i32 },
+    /// 点按:按下时触点落下,持续 duration_ms 后抬起(兼容旧配置,缺省 40ms)
+    Tap {
+        x: i32,
+        y: i32,
+        #[serde(default = "default_tap_duration_ms")]
+        duration_ms: u32,
+    },
     /// 长按:按下键盘的瞬间触点落下,抬起键盘的瞬间触点抬起(全程实时跟随)
     Hold { x: i32, y: i32 },
     /// 滑动:按下时沿轨迹滑动一次
@@ -28,7 +40,11 @@ impl Action {
 
     pub fn describe(&self) -> String {
         match self {
-            Action::Tap { x, y } => format!("点按 ({x}, {y})"),
+            Action::Tap {
+                x,
+                y,
+                duration_ms,
+            } => format!("点按 ({x}, {y}) / {}ms", duration_ms),
             Action::Hold { x, y } => format!("长按 ({x}, {y})"),
             Action::Swipe { points, duration_ms } => {
                 format!("滑动 {} 个点 / {}ms", points.len(), duration_ms)
