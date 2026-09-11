@@ -11,7 +11,7 @@
 
 use crate::capture::CaptureKey;
 use crate::control::ControlClient;
-use crate::keymap::{Action, Profile, TempMode, Wheel};
+use crate::keymap::{Action, Profile, TempMode, Wheel, easing_apply, swipe_points};
 use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -297,11 +297,22 @@ pub fn run(
                     x,
                     y,
                     duration_ms,
+                    ..
                 } => {
-                    // 点按:按下注入 DOWN,持续 duration_ms(默认 40ms)后定时抬起。
-                    // 若上一击尚未自动抬起又再次按下(极快连点/组合技排序),
-                    // 先立即结束旧触点再开新一轮,保证每次点按都完整触发、不丢键。
-                    if ev.pressed {
+                    if *duration_ms == 0 {
+                        // 按住切换:按下不松手,直到再次按下同一键才抬起
+                        if ev.pressed {
+                            if fingers.is_down(idx) {
+                                ctl.touch_up(pid, *x, *y);
+                                fingers.release(idx);
+                            } else if fingers.try_down(idx) {
+                                ctl.touch_down(pid, *x, *y);
+                            }
+                        }
+                    } else if ev.pressed {
+                        // 点按:按下注入 DOWN,持续 duration_ms(默认 40ms)后定时抬起。
+                        // 若上一击尚未自动抬起又再次按下(极快连点/组合技排序),
+                        // 先立即结束旧触点再开新一轮,保证每次点按都完整触发、不丢键。
                         if fingers.is_down(idx) {
                             cancel_up_for(pid, &mut scheduled);
                             ctl.touch_up(pid, *x, *y);
@@ -318,7 +329,7 @@ pub fn run(
                     }
                     // 松开不在此处理,统一由定时抬起收尾
                 }
-                Action::Hold { x, y } => {
+                Action::Hold { x, y, .. } => {
                     if ev.pressed {
                         if fingers.try_down(idx) {
                             ctl.touch_down(pid, *x, *y);
@@ -327,29 +338,35 @@ pub fn run(
                         ctl.touch_up(pid, *x, *y);
                     }
                 }
-                Action::Swipe {
-                    points,
-                    duration_ms,
-                } => {
+                Action::Swipe(s) => {
                     // 按下触发滑动;中途松手不打断,滑到终点由定时抬起清理按下状态
-                    if ev.pressed && points.len() >= 2 {
+                    if ev.pressed {
                         if fingers.try_down(idx) {
-                            let (x0, y0) = points[0];
-                            ctl.touch_down(pid, x0, y0);
-                            let n = points.len();
-                            let start = Instant::now();
-                            for (k, &(x, y)) in points.iter().enumerate().skip(1) {
-                                let t = start
-                                    + Duration::from_millis(
-                                        (*duration_ms as u64) * k as u64 / (n as u64 - 1),
-                                    );
-                                scheduled.push((t, SchedAct::Move { pid, x, y }));
+                            let points = swipe_points(s.path, s.start, s.end, 64);
+                            if points.len() >= 2 {
+                                let (x0, y0) = points[0];
+                                ctl.touch_down(pid, x0, y0);
+                                let n = points.len();
+                                let start = Instant::now();
+                                let steps = (n - 1) as u64;
+                                for k in 1..n {
+                                    let t = k as f32 / steps as f32;
+                                    // 曲线把时间映射为沿路径的进度,再做弧长插值
+                                    let prog = easing_apply(s.easing, t);
+                                    let (x, y) = point_at_progress(&points, prog);
+                                    let time = start
+                                        + Duration::from_millis(
+                                            (s.duration_ms as u64) * k as u64 / steps,
+                                        );
+                                    scheduled.push((time, SchedAct::Move { pid, x, y }));
+                                }
+                                let (xe, ye) = points[n - 1];
+                                scheduled.push((
+                                    start
+                                        + Duration::from_millis(s.duration_ms as u64 + 20),
+                                    SchedAct::Up { pid, x: xe, y: ye },
+                                ));
                             }
-                            let (xe, ye) = points[n - 1];
-                            scheduled.push((
-                                start + Duration::from_millis(*duration_ms as u64 + 20),
-                                SchedAct::Up { pid, x: xe, y: ye },
-                            ));
                         }
                     }
                 }
@@ -386,10 +403,49 @@ fn wheel_pid(idx: usize) -> u64 {
 
 fn bind_point(profile: &Profile, idx: usize) -> (i32, i32) {
     match profile.binds.get(idx).map(|b| &b.action) {
-        Some(Action::Hold { x, y }) | Some(Action::Tap { x, y, .. }) => (*x, *y),
-        Some(Action::Swipe { points, .. }) => points.first().copied().unwrap_or((0, 0)),
+        Some(Action::Hold { x, y, .. }) | Some(Action::Tap { x, y, .. }) => (*x, *y),
+        Some(Action::Swipe(s)) => s.start,
         _ => (0, 0),
     }
+}
+
+/// 在折线上按弧长进度(0..1)插值取点,使曲线缓动沿路径均匀分布。
+fn point_at_progress(points: &[(i32, i32)], progress: f32) -> (i32, i32) {
+    if points.is_empty() {
+        return (0, 0);
+    }
+    if points.len() == 1 {
+        return points[0];
+    }
+    let prog = progress.clamp(0.0, 1.0);
+    let mut cum: Vec<f32> = Vec::with_capacity(points.len());
+    cum.push(0.0);
+    let mut total = 0.0f32;
+    for w in points.windows(2) {
+        let dx = (w[1].0 - w[0].0) as f32;
+        let dy = (w[1].1 - w[0].1) as f32;
+        total += (dx * dx + dy * dy).sqrt();
+        cum.push(total);
+    }
+    if total <= 1e-6 {
+        return points[0];
+    }
+    let target = prog * total;
+    for i in 0..points.len() - 1 {
+        if target <= cum[i + 1] {
+            let seg = cum[i + 1] - cum[i];
+            let frac = if seg <= 1e-6 {
+                0.0
+            } else {
+                (target - cum[i]) / seg
+            }
+            .clamp(0.0, 1.0);
+            let x = points[i].0 as f32 + (points[i + 1].0 - points[i].0) as f32 * frac;
+            let y = points[i].1 as f32 + (points[i + 1].1 - points[i].1) as f32 * frac;
+            return (x.round() as i32, y.round() as i32);
+        }
+    }
+    points[points.len() - 1]
 }
 
 /// 停用一个轮盘:释放触点、清方向状态(临时轮盘专用,但通用无害)

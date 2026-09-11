@@ -2,7 +2,7 @@ use crate::adb::{self, ControlServer};
 use crate::capture::{Capture, CaptureKey};
 use crate::control::ControlClient;
 use crate::engine::{Shared, SharedState};
-use crate::keymap::{Action, KeyBind, Profile, TempMode, TempWheel, Wheel, key_name};
+use crate::keymap::{Action, Easing, KeyBind, Profile, Swipe, SwipePath, TempMode, TempWheel, Wheel, key_name};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -192,6 +192,18 @@ enum CoordSlot {
     NewBind,
     Bind(usize),
     WheelCenter(usize),
+    /// 已有滑动的起点
+    SwipeStart(usize),
+    /// 已有滑动的终点
+    SwipeEnd(usize),
+    /// 新增滑动的起点
+    NewSwipeStart,
+    /// 新增滑动的终点
+    NewSwipeEnd,
+    /// 圆形轨迹的出发点(取点后转成相对圆心的角度)
+    CircleAngle(usize),
+    /// 新增滑动圆形轨迹的出发点
+    NewCircleAngle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -201,6 +213,13 @@ enum OverlayFilter {
     Wheels,
     PermWheels,
     TempWheels,
+}
+
+/// 滑动曲线参数编辑的目标(已有键位或新增草稿)
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum EasingEditTarget {
+    Bind(usize),
+    New,
 }
 
 impl OverlayFilter {
@@ -233,10 +252,16 @@ struct DraftBind {
     kind: usize, // 0点按 1长按 2滑动 3系统键
     x: i32,
     y: i32,
-    points_text: String,
-    duration_ms: u32,
-    /// 点按型新键的触点时长(ms)
+    /// 点按/长按的响应范围(截图像素半径)
+    radius: f32,
+    /// 点按型新键的触点时长(ms);0=按住切换
     tap_duration_ms: u32,
+    // 滑动
+    swipe_start: (i32, i32),
+    swipe_end: (i32, i32),
+    swipe_duration_ms: u32,
+    swipe_easing: Easing,
+    swipe_path: SwipePath,
     keycode: u32,
 }
 
@@ -247,9 +272,13 @@ impl Default for DraftBind {
             kind: 0,
             x: 540,
             y: 1200,
-            points_text: "540,1800 540,600".into(),
-            duration_ms: 300,
+            radius: crate::keymap::DEFAULT_RADIUS,
             tap_duration_ms: crate::keymap::DEFAULT_TAP_DURATION_MS,
+            swipe_start: (540, 1800),
+            swipe_end: (540, 600),
+            swipe_duration_ms: 300,
+            swipe_easing: Easing::Linear,
+            swipe_path: SwipePath::Line,
             keycode: 4,
         }
     }
@@ -281,6 +310,12 @@ pub struct PadApp {
 
     waiting_key: Option<KeySlot>,
     picking: Option<CoordSlot>,
+    /// 正在修改响应范围的键位索引(None=未修改);进入后该键位圆圈显示为黄色
+    resizing: Option<usize>,
+    /// 正在编辑滑动曲线参数的键位(弹窗)
+    easing_edit: Option<EasingEditTarget>,
+    /// 新增键位草稿是否进行中(决定预览圆圈/轨迹是否显示,并允许取消)
+    draft_active: bool,
     shot: Option<(egui::TextureHandle, u32, u32)>,
     shot_rx: Option<Receiver<Result<egui::ColorImage, String>>>,
     overlay_filter: OverlayFilter,
@@ -554,6 +589,9 @@ impl PadApp {
             connect_rx: None,
             waiting_key: None,
             picking: None,
+            resizing: None,
+            easing_edit: None,
+            draft_active: false,
             shot: None,
             shot_rx: None,
             overlay_filter: OverlayFilter::All,
@@ -739,7 +777,7 @@ impl PadApp {
                 }
                 CoordSlot::Bind(i) => {
                     if let Some(b) = g.profile.binds.get_mut(i) {
-                        if let Action::Tap { x: ax, y: ay, .. } | Action::Hold { x: ax, y: ay } =
+                        if let Action::Tap { x: ax, y: ay, .. } | Action::Hold { x: ax, y: ay, .. } =
                             &mut b.action
                         {
                             *ax = x;
@@ -752,6 +790,38 @@ impl PadApp {
                         w.cx = x;
                         w.cy = y;
                     }
+                }
+                CoordSlot::SwipeStart(i) => {
+                    if let Some(b) = g.profile.binds.get_mut(i) {
+                        if let Action::Swipe(s) = &mut b.action {
+                            s.start = (x, y);
+                        }
+                    }
+                }
+                CoordSlot::SwipeEnd(i) => {
+                    if let Some(b) = g.profile.binds.get_mut(i) {
+                        if let Action::Swipe(s) = &mut b.action {
+                            s.end = (x, y);
+                        }
+                    }
+                }
+                CoordSlot::NewSwipeStart => self.draft.swipe_start = (x, y),
+                CoordSlot::NewSwipeEnd => self.draft.swipe_end = (x, y),
+                CoordSlot::CircleAngle(i) => {
+                    if let Some(b) = g.profile.binds.get_mut(i) {
+                        if let Action::Swipe(s) = &mut b.action {
+                            set_circle_angle(&mut s.path, s.start, s.end, x, y);
+                        }
+                    }
+                }
+                CoordSlot::NewCircleAngle => {
+                    set_circle_angle(
+                        &mut self.draft.swipe_path,
+                        self.draft.swipe_start,
+                        self.draft.swipe_end,
+                        x,
+                        y,
+                    );
                 }
             }
         }
@@ -862,6 +932,16 @@ impl PadApp {
         self.shared.lock().unwrap().profile = p;
         self.undo_stack.clear();
         self.redo_stack.clear();
+    }
+
+    /// 取消新增草稿:清除取点等待、等待按键与草稿圆圈/轨迹
+    fn cancel_draft(&mut self) {
+        self.picking = None;
+        if self.waiting_key == Some(KeySlot::NewBind) {
+            self.waiting_key = None;
+        }
+        self.draft.key = None;
+        self.draft_active = false;
     }
 
     /// 检测【当前】配置文件是否符合格式要求(不弹文件选择框)
@@ -1105,6 +1185,42 @@ impl eframe::App for PadApp {
             if let Some(code) = key {
                 if let Some(slot) = self.waiting_key.take() {
                     self.assign_key(slot, code);
+                }
+            }
+        }
+
+        // ---- 响应范围缩放(Ctrl++ / Ctrl+-) ----
+        if let Some(i) = self.resizing {
+            let (zoom_in, zoom_out) = ctx.input(|input| {
+                let ctrl = input.modifiers.ctrl;
+                (
+                    ctrl
+                        && (input.key_pressed(egui::Key::Plus)
+                            || input.key_pressed(egui::Key::Equals)),
+                    ctrl && input.key_pressed(egui::Key::Minus),
+                )
+            });
+            if zoom_in || zoom_out {
+                let factor = if zoom_in {
+                    crate::keymap::RADIUS_ZOOM_FACTOR
+                } else {
+                    1.0 / crate::keymap::RADIUS_ZOOM_FACTOR
+                };
+                let mut g = self.shared.lock().unwrap();
+                if let Some(b) = g.profile.binds.get_mut(i) {
+                    match &mut b.action {
+                        Action::Tap { radius, .. } | Action::Hold { radius, .. } => {
+                            // 乘性缩放(每步按固定比例),符合自然的缩放手感;
+                            // 除浮点精度外不设上下限,仅防止缩到 0
+                            let mut r = (*radius * factor).max(0.01);
+                            // 精度重置:缩小损失精度后,放大回默认附近则复位默认
+                            if (r - crate::keymap::DEFAULT_RADIUS).abs() < 0.5 {
+                                r = crate::keymap::DEFAULT_RADIUS;
+                            }
+                            *radius = r;
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -1386,7 +1502,18 @@ impl eframe::App for PadApp {
                          期间方向键的其它绑定自动让位\n\
                          \n\
                          动作:点按/长按/滑动/系统键\n\
+                         点按时长=0 表示按住不松手,\n\
+                         再按一次同一键才抬起\n\
                          长短按可用[转长按]按钮互切\n\
+                         \n\
+                         响应范围:点[修改响应范围]后\n\
+                         该圆圈变黄,Ctrl++ / Ctrl+- 缩放,\n\
+                         也可直接拖动圆圈;点[完成]退出\n\
+                         \n\
+                         滑动:取起点/取终点分别设置,\n\
+                         可选曲线(加速/减速/钟形/贝塞尔)\n\
+                         与轨迹(条形/方形/圆形);\n\
+                         曲线参数在[设置...]中调整并预览\n\
                          \n\
                          快捷键(键位捕获/取点/打字时不生效):\n\
                          Ctrl+Z 撤销 ⟳重做用 Ctrl+Y\n\
@@ -1598,6 +1725,9 @@ impl eframe::App for PadApp {
         // ================= 参数助手窗口 =================
         self.ui_args_helper(ctx);
 
+        // ================= 滑动曲线参数编辑窗口 =================
+        self.ui_easing_editor(ctx);
+
         ctx.request_repaint_after(Duration::from_millis(120));
     }
 }
@@ -1610,20 +1740,47 @@ impl PadApp {
 
         for i in 0..bind_count {
             ui.horizontal(|ui| {
-                let (key, desc, kind) = {
+                let (key, kind, is_swipe, is_point) = {
                     let g = self.shared.lock().unwrap();
                     let b = &g.profile.binds[i];
-                    (b.key, b.action.describe(), b.action.kind_name())
+                    (
+                        b.key,
+                        b.action.kind_name(),
+                        matches!(b.action, Action::Swipe(_)),
+                        matches!(b.action, Action::Tap { .. } | Action::Hold { .. }),
+                    )
                 };
                 ui.label(format!("[{kind}]"));
                 let waiting = self.waiting_key == Some(KeySlot::Bind(i));
                 if Self::key_button(ui, waiting, Some(key)).clicked() {
                     self.waiting_key = Some(KeySlot::Bind(i));
                 }
-                ui.label(desc);
 
-                // 坐标/参数微调
-                {
+                if is_swipe {
+                    // 滑动:控件已展示起终点/时长/曲线/轨迹,不再重复 desc
+                    let mut pick = self.picking;
+                    let mut easing_edit = self.easing_edit;
+                    let mut g = self.shared.lock().unwrap();
+                    if let Some(b) = g.profile.binds.get_mut(i) {
+                        if let Action::Swipe(s) = &mut b.action {
+                            swipe_controls(
+                                ui,
+                                s,
+                                &mut pick,
+                                &mut easing_edit,
+                                CoordSlot::SwipeStart(i),
+                                CoordSlot::SwipeEnd(i),
+                                CoordSlot::CircleAngle(i),
+                                EasingEditTarget::Bind(i),
+                            );
+                        }
+                    }
+                    drop(g);
+                    self.picking = pick;
+                    self.easing_edit = easing_edit;
+                } else if is_point {
+                    // 点按/长按:坐标、时长、响应范围、取点、长短按切换
+                    let (mut do_resize, mut do_convert, mut do_pick) = (false, false, false);
                     let mut g = self.shared.lock().unwrap();
                     if let Some(b) = g.profile.binds.get_mut(i) {
                         match &mut b.action {
@@ -1631,61 +1788,39 @@ impl PadApp {
                                 x,
                                 y,
                                 duration_ms,
+                                radius,
                             } => {
                                 ui.label("x:");
                                 ui.add(egui::DragValue::new(x).range(0..=8192));
                                 ui.label("y:");
                                 ui.add(egui::DragValue::new(y).range(0..=8192));
                                 ui.label("时长ms:");
-                                ui.add(egui::DragValue::new(duration_ms).range(5..=5000));
+                                ui.add(egui::DragValue::new(duration_ms).range(0..=5000))
+                                    .on_hover_text("0=按下不松手,直到再按一次");
+                                ui.label("范围:");
+                                ui.add(egui::DragValue::new(radius).range(0.01..=100000.0));
                             }
-                            Action::Hold { x, y } => {
+                            Action::Hold { x, y, radius } => {
                                 ui.label("x:");
                                 ui.add(egui::DragValue::new(x).range(0..=8192));
                                 ui.label("y:");
                                 ui.add(egui::DragValue::new(y).range(0..=8192));
+                                ui.label("范围:");
+                                ui.add(egui::DragValue::new(radius).range(0.01..=100000.0));
                             }
-                            Action::Swipe { points, duration_ms } => {
-                                let mut txt = points
-                                    .iter()
-                                    .map(|(x, y)| format!("{x},{y}"))
-                                    .collect::<Vec<_>>()
-                                    .join(" ");
-                                if ui
-                                    .add(
-                                        egui::TextEdit::singleline(&mut txt).desired_width(200.0),
-                                    )
-                                    .changed()
-                                {
-                                    *points = parse_points(&txt);
-                                }
-                                ui.label("时长ms:");
-                                ui.add(egui::DragValue::new(duration_ms).range(10..=5000));
-                            }
-                            Action::AndroidKey { keycode } => {
-                                ui.label("keycode:");
-                                ui.add(egui::DragValue::new(keycode).range(0..=999));
-                            }
+                            _ => {}
                         }
                     }
-                }
-                // 取点按钮(Tap/Hold 才有意义)
-                let is_point = {
-                    let g = self.shared.lock().unwrap();
-                    matches!(
-                        g.profile.binds.get(i).map(|b| &b.action),
-                        Some(Action::Tap { .. }) | Some(Action::Hold { .. })
-                    )
-                };
-                if is_point {
+                    drop(g);
+                    // 取点
                     let waiting_p = self.picking == Some(CoordSlot::Bind(i));
                     if ui
                         .button(if waiting_p { "点击截图..." } else { "取点" })
                         .clicked()
                     {
-                        self.picking = Some(CoordSlot::Bind(i));
+                        do_pick = true;
                     }
-                    // 长短按一键切换(坐标保留)
+                    // 长短按一键切换(坐标/范围保留)
                     let is_tap = {
                         let g = self.shared.lock().unwrap();
                         matches!(
@@ -1697,23 +1832,60 @@ impl PadApp {
                         .button(if is_tap { "转长按" } else { "转点按" })
                         .clicked()
                     {
+                        do_convert = true;
+                    }
+                    if ui.button("修改响应范围").clicked() {
+                        do_resize = true;
+                    }
+                    if do_pick {
+                        self.picking = Some(CoordSlot::Bind(i));
+                    }
+                    if do_convert {
                         self.push_undo();
                         let mut g = self.shared.lock().unwrap();
                         if let Some(b) = g.profile.binds.get_mut(i) {
                             b.action = match &b.action {
-                                // 点按 -> 长按:去掉响应时长(长按无需时长)
-                                Action::Tap { x, y, .. } => Action::Hold { x: *x, y: *y },
-                                // 长按 -> 点按:补默认响应时长(可在行内重新调整)
-                                Action::Hold { x, y } => Action::Tap {
+                                Action::Tap {
+                                    x,
+                                    y,
+                                    radius,
+                                    ..
+                                } => Action::Hold {
+                                    x: *x,
+                                    y: *y,
+                                    radius: *radius,
+                                },
+                                Action::Hold { x, y, radius } => Action::Tap {
                                     x: *x,
                                     y: *y,
                                     duration_ms: crate::keymap::DEFAULT_TAP_DURATION_MS,
+                                    radius: *radius,
                                 },
                                 _ => unreachable!(),
                             };
                         }
                     }
+                    if do_resize {
+                        self.push_undo();
+                        self.resizing = Some(i);
+                        self.log("响应范围修改中: 用 Ctrl++ / Ctrl+- 或拖动圆圈调整");
+                    }
+                } else {
+                    // 系统键
+                    let desc = {
+                        let g = self.shared.lock().unwrap();
+                        g.profile.binds[i].action.describe()
+                    };
+                    ui.label(desc);
+                    let mut g = self.shared.lock().unwrap();
+                    if let Some(b) = g.profile.binds.get_mut(i) {
+                        if let Action::AndroidKey { keycode } = &mut b.action {
+                            ui.label("keycode:");
+                            ui.add(egui::DragValue::new(keycode).range(0..=999));
+                        }
+                    }
                 }
+
                 if ui.button("删除").clicked() {
                     to_delete = Some(i);
                 }
@@ -1732,7 +1904,9 @@ impl PadApp {
             let waiting = self.waiting_key == Some(KeySlot::NewBind);
             if Self::key_button(ui, waiting, self.draft.key).clicked() {
                 self.waiting_key = Some(KeySlot::NewBind);
+                self.draft_active = true;
             }
+            let kind_before = self.draft.kind;
             egui::ComboBox::from_id_salt("newkind")
                 .selected_text(["点按", "长按", "滑动", "系统键"][self.draft.kind])
                 .show_ui(ui, |ui| {
@@ -1740,6 +1914,10 @@ impl PadApp {
                         ui.selectable_value(&mut self.draft.kind, i, *n);
                     }
                 });
+            if self.draft.kind != kind_before {
+                // 切换新增类型即视为开始配置,显示对应预览
+                self.draft_active = true;
+            }
             match self.draft.kind {
                 0 | 1 => {
                     ui.label("x:");
@@ -1749,25 +1927,53 @@ impl PadApp {
                     if self.draft.kind == 0 {
                         ui.label("时长ms:");
                         ui.add(
-                            egui::DragValue::new(&mut self.draft.tap_duration_ms).range(5..=5000),
-                        );
+                            egui::DragValue::new(&mut self.draft.tap_duration_ms).range(0..=5000),
+                        )
+                        .on_hover_text("0=按下不松手,直到再按一次");
                     }
+                    ui.label("范围:");
+                    ui.add(egui::DragValue::new(&mut self.draft.radius).range(0.01..=100000.0));
                     let waiting_p = self.picking == Some(CoordSlot::NewBind);
                     if ui
                         .button(if waiting_p { "点击截图..." } else { "取点" })
                         .clicked()
                     {
                         self.picking = Some(CoordSlot::NewBind);
+                        self.draft_active = true;
                     }
                 }
                 2 => {
-                    ui.label("轨迹 x,y 空格分隔:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.draft.points_text)
-                            .desired_width(200.0),
+                    let mut pick = self.picking;
+                    let pick_before = pick;
+                    let mut easing_edit = self.easing_edit;
+                    let mut tmp = Swipe {
+                        start: self.draft.swipe_start,
+                        end: self.draft.swipe_end,
+                        duration_ms: self.draft.swipe_duration_ms,
+                        easing: self.draft.swipe_easing,
+                        path: self.draft.swipe_path,
+                    };
+                    swipe_controls(
+                        ui,
+                        &mut tmp,
+                        &mut pick,
+                        &mut easing_edit,
+                        CoordSlot::NewSwipeStart,
+                        CoordSlot::NewSwipeEnd,
+                        CoordSlot::NewCircleAngle,
+                        EasingEditTarget::New,
                     );
-                    ui.label("时长ms:");
-                    ui.add(egui::DragValue::new(&mut self.draft.duration_ms).range(10..=5000));
+                    self.draft.swipe_start = tmp.start;
+                    self.draft.swipe_end = tmp.end;
+                    self.draft.swipe_duration_ms = tmp.duration_ms;
+                    self.draft.swipe_easing = tmp.easing;
+                    self.draft.swipe_path = tmp.path;
+                    self.picking = pick;
+                    self.easing_edit = easing_edit;
+                    if pick != pick_before {
+                        // 点取起点/终点/出发点即视为开始配置,显示轨迹预览
+                        self.draft_active = true;
+                    }
                 }
                 _ => {
                     ui.label("keycode(返回=4 主页=3):");
@@ -1782,15 +1988,20 @@ impl PadApp {
                             x: self.draft.x,
                             y: self.draft.y,
                             duration_ms: self.draft.tap_duration_ms,
+                            radius: self.draft.radius,
                         },
                         1 => Action::Hold {
                             x: self.draft.x,
                             y: self.draft.y,
+                            radius: self.draft.radius,
                         },
-                        2 => Action::Swipe {
-                            points: parse_points(&self.draft.points_text),
-                            duration_ms: self.draft.duration_ms,
-                        },
+                        2 => Action::Swipe(Swipe {
+                            start: self.draft.swipe_start,
+                            end: self.draft.swipe_end,
+                            duration_ms: self.draft.swipe_duration_ms,
+                            easing: self.draft.swipe_easing,
+                            path: self.draft.swipe_path,
+                        }),
                         _ => Action::AndroidKey {
                             keycode: self.draft.keycode,
                         },
@@ -1803,10 +2014,11 @@ impl PadApp {
                         new_idx
                     };
                     self.draft.key = None;
+                    // 已添加到正式键位列表,草稿预览结束
+                    self.draft_active = false;
                     self.log("已添加绑定");
                     if is_point {
                         if self.shot.is_some() {
-                            // 添加点按/长按后直接进入取点,无需再手动点[取点]
                             self.picking = Some(CoordSlot::Bind(new_idx));
                             self.log("请在截图上点击目标位置");
                         } else {
@@ -1947,17 +2159,27 @@ impl PadApp {
 
         // 键位(含草稿标记)仅在"全部/仅键位"时显示
         if matches!(self.overlay_filter, OverlayFilter::All | OverlayFilter::Keys) {
-            for b in &g.profile.binds {
+            for (i, b) in g.profile.binds.iter().enumerate() {
                 match &b.action {
-                    Action::Tap { x, y, .. } | Action::Hold { x, y } => {
+                    Action::Tap {
+                        x,
+                        y,
+                        radius,
+                        ..
+                    }
+                    | Action::Hold { x, y, radius } => {
                         let p = to_screen(*x, *y);
-                        let (ring, fill) = if matches!(b.action, Action::Tap { .. }) {
+                        let r = *radius * scale;
+                        // 修改响应范围中的键位显示黄色;否则点按绿、长按橙
+                        let (ring, fill) = if self.resizing == Some(i) {
+                            (Color32::YELLOW, Color32::from_rgba_unmultiplied(255, 230, 0, 70))
+                        } else if matches!(b.action, Action::Tap { .. }) {
                             (Color32::GREEN, Color32::from_rgba_unmultiplied(0, 200, 0, 60))
                         } else {
                             (Color32::ORANGE, Color32::from_rgba_unmultiplied(255, 165, 0, 60))
                         };
-                        painter.circle_filled(p, 16.0, fill);
-                        painter.circle_stroke(p, 16.0, Stroke::new(2.0, ring));
+                        painter.circle_filled(p, r, fill);
+                        painter.circle_stroke(p, r, Stroke::new(2.0, ring));
                         painter.text(
                             p,
                             Align2::CENTER_CENTER,
@@ -1966,39 +2188,44 @@ impl PadApp {
                             Color32::WHITE,
                         );
                     }
-                    Action::Swipe { points, .. } => {
-                        if points.len() >= 2 {
-                            let pts: Vec<egui::Pos2> =
-                                points.iter().map(|&(x, y)| to_screen(x, y)).collect();
-                            painter.add(egui::Shape::line(
-                                pts,
-                                Stroke::new(2.0, Color32::LIGHT_BLUE),
-                            ));
-                            let p0 = to_screen(points[0].0, points[0].1);
-                            painter
-                                .circle_stroke(p0, 12.0, Stroke::new(2.0, Color32::LIGHT_BLUE));
-                            painter.text(
-                                p0,
-                                Align2::CENTER_CENTER,
-                                short_name(b.key),
-                                FontId::proportional(11.0),
-                                Color32::WHITE,
-                            );
-                        }
+                    Action::Swipe(s) => {
+                        draw_swipe_track(painter, s, &to_screen, scale, &short_name(b.key));
                     }
                     Action::AndroidKey { .. } => {}
                 }
             }
-            // 草稿(新增绑定)位置高亮
-            let dp = to_screen(self.draft.x, self.draft.y);
-            painter.circle_stroke(dp, 16.0, Stroke::new(2.0, Color32::YELLOW));
-            painter.text(
-                dp + vec2(0.0, 26.0),
-                Align2::CENTER_CENTER,
-                "新增",
-                FontId::proportional(11.0),
-                Color32::YELLOW,
-            );
+            // 草稿(新增绑定)高亮:0 不显示,1 显示点/圈,2 显示滑动轨迹。
+            // 仅在新增草稿进行中或等待设置按键时显示,取消后即消失。
+            let draft_kind = if self.draft_active || self.waiting_key == Some(KeySlot::NewBind) {
+                if self.draft.kind == 2 { 2 } else { 1 }
+            } else {
+                0
+            };
+            match draft_kind {
+                2 => {
+                    let ds = Swipe {
+                        start: self.draft.swipe_start,
+                        end: self.draft.swipe_end,
+                        duration_ms: self.draft.swipe_duration_ms,
+                        easing: self.draft.swipe_easing,
+                        path: self.draft.swipe_path,
+                    };
+                    draw_swipe_track(painter, &ds, &to_screen, scale, "新增");
+                }
+                1 => {
+                    let dp = to_screen(self.draft.x, self.draft.y);
+                    let r = self.draft.radius * scale;
+                    painter.circle_stroke(dp, r, Stroke::new(2.0, Color32::YELLOW));
+                    painter.text(
+                        dp + vec2(0.0, r + 10.0),
+                        Align2::CENTER_CENTER,
+                        "新增",
+                        FontId::proportional(11.0),
+                        Color32::YELLOW,
+                    );
+                }
+                _ => {}
+            }
         }
 
         // 轮盘按过滤条件显示;临时轮盘用虚线圆环区分
@@ -2085,6 +2312,89 @@ impl PadApp {
             self.args_helper = Some(helper);
         }
         // 关闭则丢弃(None)
+    }
+
+    /// 滑动曲线参数编辑浮窗(含速率函数预览图)
+    fn ui_easing_editor(&mut self, ctx: &egui::Context) {
+        let Some(target) = self.easing_edit else {
+            return;
+        };
+        // 读取当前曲线
+        let mut easing = match target {
+            EasingEditTarget::Bind(i) => {
+                let g = self.shared.lock().unwrap();
+                match g.profile.binds.get(i).map(|b| &b.action) {
+                    Some(Action::Swipe(s)) => s.easing,
+                    _ => {
+                        self.easing_edit = None;
+                        return;
+                    }
+                }
+            }
+            EasingEditTarget::New => self.draft.swipe_easing,
+        };
+
+        let mut open = true;
+        let mut modified = false;
+        egui::Window::new("滑动曲线设置")
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("速率曲线预览(横轴时间,纵轴进度):");
+                draw_easing_preview(ui, easing);
+                ui.separator();
+                match &mut easing {
+                    Easing::Linear => {
+                        ui.label("匀速曲线无参数");
+                    }
+                    Easing::EaseIn { power }
+                    | Easing::EaseOut { power }
+                    | Easing::Smooth { power } => {
+                        ui.label("幂次:");
+                        if ui
+                            .add(egui::DragValue::new(power).range(0.1..=10.0))
+                            .changed()
+                        {
+                            modified = true;
+                        }
+                    }
+                    Easing::Bezier { x1, y1, x2, y2 } => {
+                        ui.label("x1:");
+                        if ui.add(egui::DragValue::new(x1).range(0.0..=1.0)).changed() {
+                            modified = true;
+                        }
+                        ui.label("y1:");
+                        if ui.add(egui::DragValue::new(y1).range(-2.0..=2.0)).changed() {
+                            modified = true;
+                        }
+                        ui.label("x2:");
+                        if ui.add(egui::DragValue::new(x2).range(0.0..=1.0)).changed() {
+                            modified = true;
+                        }
+                        ui.label("y2:");
+                        if ui.add(egui::DragValue::new(y2).range(-2.0..=2.0)).changed() {
+                            modified = true;
+                        }
+                    }
+                }
+            });
+
+        if !open {
+            self.easing_edit = None;
+            return;
+        }
+        if modified {
+            match target {
+                EasingEditTarget::Bind(i) => {
+                    let mut g = self.shared.lock().unwrap();
+                    if let Some(b) = g.profile.binds.get_mut(i) {
+                        if let Action::Swipe(s) = &mut b.action {
+                            s.easing = easing;
+                        }
+                    }
+                }
+                EasingEditTarget::New => self.draft.swipe_easing = easing,
+            }
+        }
     }
 
     fn arg_help_panel(&mut self, ui: &mut egui::Ui, h: &mut ArgHelp) {
@@ -2206,9 +2516,41 @@ impl PadApp {
                     }
                 });
             if self.picking.is_some() {
-                ui.colored_label(egui::Color32::YELLOW, "取点中: 请点击截图上的目标位置");
+                let draft_pick = self.picking.map(is_draft_slot).unwrap_or(false);
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    if draft_pick {
+                        "取点中(新增): 请点击截图上的目标位置"
+                    } else {
+                        "取点中: 请点击截图上的目标位置"
+                    },
+                );
                 if ui.button("取消取点").clicked() {
-                    self.picking = None;
+                    if draft_pick {
+                        // 新增草稿尚未添加,取消时连同圆圈一起清除
+                        self.cancel_draft();
+                    } else {
+                        self.picking = None;
+                    }
+                }
+            } else if self.waiting_key == Some(KeySlot::NewBind) || self.draft_active {
+                // 新增取点后按键尚未设置,或草稿仍在进行:均可取消并消除圆圈/轨迹
+                if self.waiting_key == Some(KeySlot::NewBind) {
+                    ui.colored_label(egui::Color32::YELLOW, "已取点: 请按下要绑定的按键");
+                } else {
+                    ui.label("新增未完成(尚未[添加])");
+                }
+                if ui.button("取消取点").clicked() {
+                    self.cancel_draft();
+                    self.log("已取消新增");
+                }
+            } else if self.resizing.is_some() {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "响应范围修改中: Ctrl++ / Ctrl+- 缩放,或拖动圆圈",
+                );
+                if ui.button("完成").clicked() {
+                    self.resizing = None;
                 }
             } else {
                 ui.label("先点某条映射的[取点],再点击截图上的位置");
@@ -2220,7 +2562,13 @@ impl PadApp {
             let avail = ui.available_width();
             let scale = (avail / w as f32).min(1.0).min(500.0 / h as f32);
             let size = egui::vec2(w as f32 * scale, h as f32 * scale);
-            let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+            // 取点或修改响应范围时需要拖拽响应
+            let sense = if self.resizing.is_some() {
+                egui::Sense::drag()
+            } else {
+                egui::Sense::click()
+            };
+            let (rect, resp) = ui.allocate_exact_size(size, sense);
             ui.painter().image(
                 tex_id,
                 rect,
@@ -2228,12 +2576,46 @@ impl PadApp {
                 egui::Color32::WHITE,
             );
             self.draw_overlay(ui, rect, scale);
+
+            // 拖动聚焦圆圈缩放响应范围
+            if let Some(i) = self.resizing {
+                if resp.dragged() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let (cx, cy) = {
+                            let g = self.shared.lock().unwrap();
+                            match g.profile.binds.get(i).map(|b| &b.action) {
+                                Some(Action::Tap { x, y, .. })
+                                | Some(Action::Hold { x, y, .. }) => (*x, *y),
+                                _ => (0, 0),
+                            }
+                        };
+                        let dx = pos.x - (rect.min.x + cx as f32 * scale);
+                        let dy = pos.y - (rect.min.y + cy as f32 * scale);
+                        let new_r = ((dx * dx + dy * dy).sqrt() / scale).max(0.01);
+                        let mut g = self.shared.lock().unwrap();
+                        if let Some(b) = g.profile.binds.get_mut(i) {
+                            match &mut b.action {
+                                Action::Tap { radius, .. } | Action::Hold { radius, .. } => {
+                                    *radius = new_r;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+
             if resp.clicked() {
                 if let Some(pos) = resp.interact_pointer_pos() {
                     let px = ((pos.x - rect.min.x) / scale) as i32;
                     let py = ((pos.y - rect.min.y) / scale) as i32;
                     if let Some(slot) = self.picking.take() {
                         self.assign_coord(slot, px, py);
+                        // 新增取点后若尚未设键位,立即进入等待按键
+                        if slot == CoordSlot::NewBind && self.draft.key.is_none() {
+                            self.waiting_key = Some(KeySlot::NewBind);
+                            self.log("已取点,请按下要绑定的按键");
+                        }
                     } else {
                         self.log(format!("截图坐标: ({px}, {py})"));
                     }
@@ -2241,17 +2623,6 @@ impl PadApp {
             }
         }
     }
-}
-
-fn parse_points(s: &str) -> Vec<(i32, i32)> {
-    s.split_whitespace()
-        .filter_map(|tok| {
-            let mut it = tok.split(',');
-            let x: i32 = it.next()?.parse().ok()?;
-            let y: i32 = it.next()?.parse().ok()?;
-            Some((x, y))
-        })
-        .collect()
 }
 
 fn profile_path() -> PathBuf {
@@ -2316,4 +2687,273 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// 由圆形轨迹的圆心/半径与取点坐标计算出发点角度,写入 path.start_angle
+fn set_circle_angle(path: &mut SwipePath, start: (i32, i32), end: (i32, i32), x: i32, y: i32) {
+    let SwipePath::Circle {
+        as_diameter,
+        start_angle,
+    } = path
+    else {
+        return;
+    };
+    let (cx, cy) = if *as_diameter {
+        (
+            (start.0 + end.0) as f32 / 2.0,
+            (start.1 + end.1) as f32 / 2.0,
+        )
+    } else {
+        (start.0 as f32, start.1 as f32)
+    };
+    let a = (y as f32 - cy).atan2(x as f32 - cx);
+    *start_angle = a;
+}
+
+/// 由滑动轨迹类型计算圆心与半径(仅圆形有意义;非圆形返回 None)
+fn circle_geometry(path: &SwipePath, start: (i32, i32), end: (i32, i32)) -> Option<(f32, f32, f32)> {
+    let SwipePath::Circle { as_diameter, .. } = path else {
+        return None;
+    };
+    if *as_diameter {
+        let cx = (start.0 + end.0) as f32 / 2.0;
+        let cy = (start.1 + end.1) as f32 / 2.0;
+        let r = ((end.0 - start.0) as f32).hypot((end.1 - start.1) as f32) / 2.0;
+        Some((cx, cy, r))
+    } else {
+        let cx = start.0 as f32;
+        let cy = start.1 as f32;
+        let r = ((end.0 - start.0) as f32).hypot((end.1 - start.1) as f32);
+        Some((cx, cy, r))
+    }
+}
+
+impl EasingEditTarget {
+    fn id(self) -> usize {
+        match self {
+            EasingEditTarget::Bind(i) => i,
+            EasingEditTarget::New => usize::MAX,
+        }
+    }
+}
+
+/// 该取点槽位是否属于"新增草稿"(取消时需一并清除草稿圆圈/轨迹)
+fn is_draft_slot(slot: CoordSlot) -> bool {
+    matches!(
+        slot,
+        CoordSlot::NewBind
+            | CoordSlot::NewSwipeStart
+            | CoordSlot::NewSwipeEnd
+            | CoordSlot::NewCircleAngle
+    )
+}
+
+/// 渲染滑动键的编辑控件:取起点/取终点、时长、曲线、轨迹、圆形专用按钮、曲线设置。
+/// 返回是否有任何修改(供调用方决定是否记录撤销)。
+fn swipe_controls(
+    ui: &mut egui::Ui,
+    s: &mut Swipe,
+    pick: &mut Option<CoordSlot>,
+    easing_edit: &mut Option<EasingEditTarget>,
+    slot_start: CoordSlot,
+    slot_end: CoordSlot,
+    slot_angle: CoordSlot,
+    target: EasingEditTarget,
+) -> bool {
+    let mut changed = false;
+
+    // 取起点 / 取终点
+    let w_start = *pick == Some(slot_start);
+    if ui
+        .button(if w_start { "点击取起点..." } else { "取起点" })
+        .clicked()
+    {
+        *pick = Some(slot_start);
+    }
+    let w_end = *pick == Some(slot_end);
+    if ui
+        .button(if w_end { "点击取终点..." } else { "取终点" })
+        .clicked()
+    {
+        *pick = Some(slot_end);
+    }
+
+    ui.label("时长ms:");
+    if ui
+        .add(egui::DragValue::new(&mut s.duration_ms).range(10..=5000))
+        .changed()
+    {
+        changed = true;
+    }
+
+    // 曲线选择
+    ui.label("曲线:");
+    let cur_ease = s.easing;
+    egui::ComboBox::from_id_salt(("swipe_easing", target.id()))
+        .selected_text(cur_ease.label())
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(cur_ease == Easing::Linear, "默认(匀速)").clicked() {
+                s.easing = Easing::Linear;
+                changed = true;
+            }
+            if ui
+                .selectable_label(matches!(cur_ease, Easing::EaseIn { .. }), "加速曲线")
+                .clicked()
+            {
+                s.easing = Easing::EaseIn { power: 2.0 };
+                changed = true;
+            }
+            if ui
+                .selectable_label(matches!(cur_ease, Easing::EaseOut { .. }), "减速曲线")
+                .clicked()
+            {
+                s.easing = Easing::EaseOut { power: 2.0 };
+                changed = true;
+            }
+            if ui
+                .selectable_label(matches!(cur_ease, Easing::Smooth { .. }), "钟形曲线")
+                .clicked()
+            {
+                s.easing = Easing::Smooth { power: 3.0 };
+                changed = true;
+            }
+            if ui
+                .selectable_label(matches!(cur_ease, Easing::Bezier { .. }), "贝塞尔曲线")
+                .clicked()
+            {
+                s.easing = Easing::Bezier {
+                    x1: 0.42,
+                    y1: 0.0,
+                    x2: 0.58,
+                    y2: 1.0,
+                };
+                changed = true;
+            }
+        });
+
+    // 轨迹选择
+    ui.label("轨迹:");
+    let cur_path = s.path;
+    egui::ComboBox::from_id_salt(("swipe_path", target.id()))
+        .selected_text(cur_path.label())
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(matches!(cur_path, SwipePath::Line), "默认(条形)").clicked() {
+                s.path = SwipePath::Line;
+                changed = true;
+            }
+            if ui.selectable_label(matches!(cur_path, SwipePath::Rect), "方形").clicked() {
+                s.path = SwipePath::Rect;
+                changed = true;
+            }
+            if ui
+                .selectable_label(matches!(cur_path, SwipePath::Circle { .. }), "圆形")
+                .clicked()
+            {
+                s.path = SwipePath::Circle {
+                    as_diameter: true,
+                    start_angle: 0.0,
+                };
+                changed = true;
+            }
+        });
+
+    // 圆形专用按钮
+    if let SwipePath::Circle { as_diameter, .. } = &mut s.path {
+        if ui
+            .button(if *as_diameter { "视为直径" } else { "视为圆心" })
+            .clicked()
+        {
+            *as_diameter = !*as_diameter;
+            changed = true;
+        }
+        let w_angle = *pick == Some(slot_angle);
+        if ui
+            .button(if w_angle { "点击设出发点..." } else { "设置出发点" })
+            .clicked()
+        {
+            *pick = Some(slot_angle);
+        }
+    }
+
+    // 曲线设置(仅非匀速曲线有参数)
+    if !matches!(s.easing, Easing::Linear) {
+        if ui.button("设置...").clicked() {
+            *easing_edit = Some(target);
+        }
+    }
+
+    changed
+}
+
+/// 在截图上绘制滑动轨迹:边界实色、内部半透明,尽量不遮挡截图内容。
+fn draw_swipe_track<F: Fn(i32, i32) -> egui::Pos2>(
+    painter: &egui::Painter,
+    s: &Swipe,
+    to_screen: &F,
+    scale: f32,
+    label: &str,
+) {
+    use egui::{Align2, Color32, FontId, Stroke};
+    let pts: Vec<egui::Pos2> = crate::keymap::swipe_points(s.path, s.start, s.end, 64)
+        .iter()
+        .map(|&(x, y)| to_screen(x, y))
+        .collect();
+    if pts.len() < 2 {
+        return;
+    }
+    let edge = Stroke::new(2.0, Color32::LIGHT_BLUE);
+    let fill = Color32::from_rgba_unmultiplied(100, 180, 255, 40);
+    match s.path {
+        SwipePath::Line => {
+            painter.add(egui::Shape::line(pts.clone(), Stroke::new(10.0, fill)));
+            painter.add(egui::Shape::line(pts.clone(), edge));
+        }
+        SwipePath::Rect => {
+            let a = to_screen(s.start.0, s.start.1);
+            let b = to_screen(s.end.0, s.end.1);
+            let rect = egui::Rect::from_two_pos(a, b);
+            painter.rect_filled(rect, 0.0, fill);
+            painter.rect_stroke(rect, 0.0, edge, egui::StrokeKind::Inside);
+        }
+        SwipePath::Circle { .. } => {
+            if let Some((cx, cy, r)) = circle_geometry(&s.path, s.start, s.end) {
+                let c = to_screen(cx as i32, cy as i32);
+                let r_screen = r * scale;
+                painter.circle_filled(c, r_screen, fill);
+                painter.circle_stroke(c, r_screen, edge);
+            }
+        }
+    }
+    let p0 = pts[0];
+    painter.circle_stroke(p0, 12.0, edge);
+    painter.text(
+        p0,
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(11.0),
+        Color32::WHITE,
+    );
+}
+
+/// 绘制速率函数(缓动曲线)预览图
+fn draw_easing_preview(ui: &mut egui::Ui, e: Easing) {
+    let size = egui::vec2(220.0, 100.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, egui::Color32::from_gray(30));
+    let n = 64;
+    let pts: Vec<egui::Pos2> = (0..=n)
+        .map(|i| {
+            let t = i as f32 / n as f32;
+            let y = crate::keymap::easing_apply(e, t);
+            egui::pos2(
+                rect.min.x + t * rect.width(),
+                rect.max.y - y * rect.height(),
+            )
+        })
+        .collect();
+    painter.add(egui::Shape::line(
+        pts,
+        egui::Stroke::new(2.0, egui::Color32::LIGHT_BLUE),
+    ));
 }
