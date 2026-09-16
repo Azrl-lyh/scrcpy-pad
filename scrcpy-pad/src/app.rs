@@ -15,6 +15,9 @@ const LOCAL_PORT: u16 = 28383;
 const REPO_URL: &str = "https://github.com/Azrl-lyh/scrcpy-pad";
 const AUTHOR: &str = "Azrl-lyh";
 
+/// MIT 许可证全文:编译期嵌入二进制,关于页可直接查看
+const LICENSE_TEXT: &str = include_str!("../LICENSE");
+
 /// scrcpy 启动参数的初始(无预设)值
 const BASE_SCRCPY_ARGS: &str = "--stay-awake";
 
@@ -326,6 +329,8 @@ pub struct PadApp {
     grab_enabled: bool,
 
     about_open: bool,
+    /// 许可证窗口是否打开
+    license_open: bool,
     /// scrcpy 参数助手窗口状态(None=未打开;每次打开重建默认参数)
     args_helper: Option<ArgHelp>,
     dialog: Option<crate::filedialog::FileDialogHandle>,
@@ -600,6 +605,7 @@ impl PadApp {
             profile_path,
             grab_enabled: false,
             about_open: false,
+            license_open: false,
             args_helper: None,
             dialog: None,
             dialog_purpose: DialogPurpose::ScrcpyExe,
@@ -1708,6 +1714,7 @@ impl eframe::App for PadApp {
         });
 
         // ================= 关于窗口 =================
+        let mut open_license = false;
         if self.about_open {
             egui::Window::new("关于")
                 .open(&mut self.about_open)
@@ -1718,7 +1725,32 @@ impl eframe::App for PadApp {
                     ui.hyperlink(REPO_URL);
                     ui.separator();
                     ui.label("基于 scrcpy 控制协议的键鼠映射游戏控制台");
+                    ui.label("本程序以 MIT 许可证发布并遵循该协议:可自由使用、修改与再分发,");
+                    ui.label("但须保留版权声明与许可声明。");
                     ui.label("MIT License © 2026 Azrl");
+                    ui.separator();
+                    if ui.button("许可证").clicked() {
+                        open_license = true;
+                    }
+                });
+        }
+        if open_license {
+            self.license_open = true;
+        }
+
+        // ================= 许可证窗口 =================
+        if self.license_open {
+            egui::Window::new("MIT 许可证")
+                .open(&mut self.license_open)
+                .default_width(560.0)
+                .show(ctx, |ui| {
+                    ui.label("以下为本程序使用的 MIT 许可证全文:");
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .max_height(420.0)
+                        .show(ui, |ui| {
+                            ui.monospace(LICENSE_TEXT);
+                        });
                 });
         }
 

@@ -112,7 +112,8 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// 自动寻找 scrcpy 可执行文件:PATH 优先,其次各平台常见安装位置
+/// 自动寻找 scrcpy 可执行文件:PATH 优先,其次各平台常见安装位置,
+/// 最后回退到"程序旁边的便携 scrcpy 目录"。
 pub fn find_scrcpy() -> Option<PathBuf> {
     let path_names: &[&str] = if cfg!(windows) {
         &["scrcpy.exe"]
@@ -150,7 +151,103 @@ pub fn find_scrcpy() -> Option<PathBuf> {
         }
         v
     };
-    candidates.into_iter().find(|p| p.is_file())
+    if let Some(p) = candidates.into_iter().find(|p| p.is_file()) {
+        return Some(p);
+    }
+
+    // 系统里没装 scrcpy 时,再看程序旁边的便携目录
+    find_scrcpy_portable()
+}
+
+/// 在"程序目录附近"寻找便携部署的 scrcpy。
+///
+/// 扫描程序所在目录及其父目录下、名字以 "scrcpy" 开头的文件夹
+/// (对应"把官方 scrcpy 发行包解压到主程序旁边"的用法),
+/// 并在其中(至多 3 层子目录)查找 scrcpy 可执行文件。
+/// 找到后,同目录的 scrcpy-server 与 adb 会由既有联动逻辑自动补齐。
+pub fn find_scrcpy_portable() -> Option<PathBuf> {
+    for base in program_base_dirs() {
+        if let Some(exe) = find_scrcpy_portable_under(&base) {
+            return Some(exe);
+        }
+    }
+    None
+}
+
+/// 在给定基准目录附近寻找便携 scrcpy:
+/// 先看基准目录内部,再看其父目录(即"同级"位置)下的 scrcpy* 子目录。
+fn find_scrcpy_portable_under(base: &Path) -> Option<PathBuf> {
+    let exe_name = scrcpy_exe_name();
+    // 候选扫描根:程序目录本身;以及程序目录的父目录(即"同级"位置)
+    let mut roots = vec![base.to_path_buf()];
+    if let Some(parent) = base.parent() {
+        roots.push(parent.to_path_buf());
+    }
+    for root in roots {
+        let Ok(rd) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        let mut dirs: Vec<PathBuf> = rd
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.path())
+            .filter(|p| is_scrcpy_dir_name(p))
+            .collect();
+        dirs.sort();
+        for dir in dirs {
+            if let Some(exe) = find_file_recursive(&dir, exe_name, 3) {
+                return Some(exe);
+            }
+        }
+    }
+    None
+}
+
+/// 目录名是否以 "scrcpy" 开头(不区分大小写)
+fn is_scrcpy_dir_name(p: &Path) -> bool {
+    p.file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase().starts_with("scrcpy"))
+        .unwrap_or(false)
+}
+
+/// 程序所在目录:优先可执行文件所在目录,其次当前工作目录
+fn program_base_dirs() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            v.push(dir.to_path_buf());
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        if !v.contains(&cwd) {
+            v.push(cwd);
+        }
+    }
+    v
+}
+
+/// 在目录树中按文件名查找(深度受限,避免无谓的大范围遍历)
+fn find_file_recursive(dir: &Path, name: &str, depth: usize) -> Option<PathBuf> {
+    let direct = dir.join(name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    if depth == 0 {
+        return None;
+    }
+    let rd = std::fs::read_dir(dir).ok()?;
+    let mut subs: Vec<PathBuf> = rd
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.path())
+        .collect();
+    subs.sort();
+    for sub in subs {
+        if let Some(found) = find_file_recursive(&sub, name, depth - 1) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// 各平台 scrcpy 可执行文件名(Windows 必须带 .exe 才能在 PATH 中命中)
@@ -356,4 +453,48 @@ pub fn launch_scrcpy(exe: &str, serial: &str, extra_args: &str) -> Result<Child>
         .stderr(Stdio::null())
         .spawn()
         .context("启动 scrcpy 失败")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 便携 scrcpy 目录的两种摆放都应能被发现:
+    /// 1) 与程序目录同级;2) 位于程序目录内部的 scrcpy* 子目录(允许嵌套)
+    #[test]
+    fn find_scrcpy_portable_in_sibling_and_nested_dirs() {
+        let root = std::env::temp_dir().join(format!("scrcpy-pad-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let prog = root.join("prog");
+        let sibling = root.join("scrcpy-linux-x86_64-vX");
+        std::fs::create_dir_all(&prog).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let sibling_exe = sibling.join(scrcpy_exe_name());
+        std::fs::write(&sibling_exe, b"x").unwrap();
+        assert_eq!(find_scrcpy_portable_under(&prog), Some(sibling_exe));
+
+        // 同级目录被移除后,应回退到程序目录内部的嵌套 scrcpy 目录
+        std::fs::remove_dir_all(&sibling).unwrap();
+        let nested = prog.join("scrcpy-win64").join("bin");
+        std::fs::create_dir_all(&nested).unwrap();
+        let nested_exe = nested.join(scrcpy_exe_name());
+        std::fs::write(&nested_exe, b"x").unwrap();
+        assert_eq!(find_scrcpy_portable_under(&prog), Some(nested_exe));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 非 scrcpy 命名的目录不应被误认
+    #[test]
+    fn ignore_dirs_not_starting_with_scrcpy() {
+        let root = std::env::temp_dir().join(format!("scrcpy-pad-test-neg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let prog = root.join("prog");
+        let other = root.join("some-tool");
+        std::fs::create_dir_all(&prog).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join(scrcpy_exe_name()), b"x").unwrap();
+        assert_eq!(find_scrcpy_portable_under(&prog), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
