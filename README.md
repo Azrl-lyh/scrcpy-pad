@@ -5,26 +5,26 @@
 
 ## 安装注意
 
-有关scrcpy，本仓库附带提供在windows或linux下可用的版本的压缩包，如果不想花时间找别处下载或对新版本不作要求，只需要下载本仓库里提供的压缩包，并将他解压到主程序（即scrcpy-pad-windows.exe，或scrcpy-pad-linux)同目录下即可。
-注意，所谓“同目录下”，指的是scrcpy-pad程序，和以scrcpy-xxxx为名的文件夹放在同一目录下。
-如果scrcpy找不到scrcpy，你也可以手动选择，在程序中选择“寻找scrcpy”等按钮，按照提示从相应目录选择即可。直到scrcpy，scrcpy-server和adb都被寻找到即可。
-本站scrcpy下载包就在仓库内，名为：
-windows版本：scrcpy-win64-v3.3.3.zip
-linux版本：scrcpy-linux-x86_64-v3.3.3.tar.gz
-作者不保证频繁更新之。
+有关scrcpy，本仓库附带提供在windows或linux下可用的版本的压缩包，如果不想花时间找别处下载或对新版本不作要求，只需要下载本仓库里提供的压缩包，并将他解压到主程序（即scrcpy-pad-windows.exe，或scrcpy-pad-linux)同目录下即可。  
+注意，所谓“同目录下”，指的是scrcpy-pad程序，和以scrcpy-xxxx为名的文件夹放在同一目录下。  
+如果scrcpy找不到scrcpy，你也可以手动选择，在程序中选择“寻找scrcpy”等按钮，按照提示从相应目录选择即可。直到scrcpy，scrcpy-server和adb都被寻找到即可。  
+本站scrcpy下载包就在仓库内，名为：  
+windows版本：scrcpy-win64-v3.3.3.zip  
+linux版本：scrcpy-linux-x86_64-v3.3.3.tar.gz  
+作者不保证频繁更新之。  
 
 如果你是windows用户，你只需要下载本仓库中的scrcpy-pad-windows.exe，和scrcpy（windows版本），解压scrcpy到程序同目录下后双击运行即可。  
 如果你是linux用户，你需要下载本仓库的scrcpy-pad-linux（没有.exe)和scrcpy（linux版本），之后运行以下命令修改权限：
 ``` 
 sudo usemod -aG input $USER
 ```
-运行后输入管理员密码，注销重新登录即可。
+运行后输入管理员密码，注销重新登录即可。  
 
 之后就可以成功运行了。
 
 ## 从源代码安装（可选阅读）
 如果你只是想用这个程序，不需要阅读这些内容。  
-[github](https://github.com) 在国内可以正常访问，但是容易遭受DNS污染，从而加载网页、下载文件缓慢，甚至出现无法访问的情况。
+[github](https://github.com) 在国内可以正常访问，但是容易遭受DNS污染，从而加载网页、下载文件缓慢，甚至出现无法访问的情况。  
 如何解决上不去： **第一，你可以尝试更换浏览器DNS为claudefare，或其他DNS**。具体教程网上一大把，不想找的直接在浏览器设置页面搜索基于HTTPS的DNS，点击高级设置，设置成cloudfare（1.1.1.1）就行了。~~只要国内没有红红火火，这个办法绝对奏效。~~ 除了claudefare，其他的选项你也可以试一试。记得下载完成后切换回默认即可。**第二，steam++（watt toolkit）和clash。** steam++里加速的页面勾选github就能用了。clash的话打开代理就可以了。可能会有证书问题，出现了就找AI解决。  
 如何解决下载缓慢的问题：~~我的程序按kb算的，再慢其实也能下载下来~~。 不过有一种办法很好。**使用github镜像站。** 这个网上也有很多教程，跟着看有无数种可行的做法。这里提一个网站叫[虾壳](https://xiake.pro/?src=www.jspoo.com) ，把github相关的下载连接粘贴进去，点击自动测速，会给你选出最快的中转站，你下载就很快了。  
 
