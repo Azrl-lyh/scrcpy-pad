@@ -296,6 +296,17 @@ pub fn scrcpy_exe_name() -> &'static str {
     if cfg!(windows) { "scrcpy.exe" } else { "scrcpy" }
 }
 
+/// 手动指定的可执行文件:非空且确实存在时返回它。
+/// 用于"用户(或上次记住的配置)明确给了路径"的场合 —— 此时优先于任何自动寻找。
+pub fn find_adb_explicit(path: &str) -> Option<PathBuf> {
+    let t = path.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(t);
+    p.is_file().then_some(p)
+}
+
 /// 给定目录,查找该目录下的 adb.exe/adb(官方 scrcpy Windows 发行包将 adb.exe 与 scrcpy.exe 同目录)
 pub fn find_adb_in_dir(dir: &Path) -> Option<PathBuf> {
     let p = dir.join(adb_exe_name());

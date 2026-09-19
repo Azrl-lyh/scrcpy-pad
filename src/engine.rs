@@ -28,6 +28,17 @@ const MAX_CONCURRENT_KEYS: usize = 8;
 /// 瞄准指针的固定 id(与普通绑定 1000+、轮盘 2000+ 区分开)
 const AIM_PID: u64 = 3000;
 
+/// 事件等待的"快档"毫秒数:映射已开启且通道在线时的轮询间隔。
+/// 4ms 足够让瞄准的静止归中与鼠标捕获状态保持跟手,
+/// 同时把引擎线程的空转次数控制在 250 次/秒以内。
+const IDLE_FAST_MS: u64 = 4;
+
+/// 事件等待的"慢档"毫秒数:没连接设备 / 未开启映射时的轮询间隔。
+/// 此时循环体不做任何事(没有事件就没有触点要维护),继续按快档空转
+/// 等于白烧 CPU 与锁 —— 设备没插着的时候尤其明显。
+/// 事件到达会立即唤醒等待,所以这个退避不影响任何响应延迟。
+const IDLE_SLOW_MS: u64 = 16;
+
 /// Ctrl / Alt 的 evdev 键码,用于识别"Ctrl+Alt 交还鼠标"这一组合
 const KEY_LEFTCTRL: u16 = 29;
 const KEY_RIGHTCTRL: u16 = 97;
@@ -298,6 +309,13 @@ pub struct Shared {
     pub control: Option<ControlClient>,
     /// 瞄准运行状态(界面诊断显示)
     pub aim_live: AimLive,
+    /// 顶栏[映射:开/关]按钮请求引擎执行一次"关闭映射"的收尾。
+    ///
+    /// 为什么需要它:关闭映射时必须抬起所有仍按着的触点(否则手机上会一直按着,
+    /// 也就是俗称的"卡键"),而这些触点状态全部由引擎线程独占。早期版本只有总开关键
+    /// 做这件事,顶栏按钮直接改 `enabled` —— 于是"用按钮关映射"会把长按触点
+    /// 永久留在屏幕上。现在两条路径共用 [`release_all`] 这一份实现。
+    pub toolbar_release: bool,
 }
 
 pub type SharedState = Arc<Mutex<Shared>>;
@@ -317,6 +335,74 @@ struct WheelState {
     active: bool,
 }
 
+/// 引擎线程独占的可变运行状态。
+///
+/// 抽成结构体是为了让"关闭映射收尾"能写成一份可复用实现([`release_all`]):
+/// 总开关键(全局钩子路径)与顶栏按钮(界面路径)都要用它,而它必须同时访问
+/// 触点表、轮盘状态、系统键集合与瞄准状态。
+///
+/// 注意:字段是**可变的借用**,借用范围只覆盖执行收尾的那一瞬间,
+/// 因此不会与调用点上对 `Shared` 的借用冲突。
+pub(crate) struct EngineState<'a> {
+    fingers: &'a mut Fingers,
+    wheels: &'a mut Vec<WheelState>,
+    active_android_keys: &'a mut HashSet<u16>,
+    aim: &'a mut AimState,
+}
+
+/// 关闭映射时的收尾:抬起所有按下中的触点、松开系统键、停用全部临时轮盘、
+/// 抬掉瞄准触点。由总开关键与顶栏按钮两条路径共用。
+///
+/// 参数取 `screen` 而不是从 `shared.control` 里读,是为了让调用点能在**不额外持锁**
+/// 的情况下先取好尺寸(否则 `control` 的不可变借用会与后面的 `&mut shared` 冲突)。
+///
+/// 无论控制通道在不在都要清本地状态,否则重新开打时状态会残留
+/// (例如临时轮盘仍被当成"已启用",或按住记录还留着)。
+pub(crate) fn release_all(
+    ctl: Option<&ControlClient>,
+    shared: &mut Shared,
+    screen: (u32, u32),
+    st: EngineState<'_>,
+) {
+    match ctl {
+        Some(c) => {
+            let m = shared.profile.mapper(screen);
+            // 瞄准触点一并抬起(否则松手后仍按在屏幕上)
+            aim_lift(c, st.aim);
+            for idx in 0..shared.profile.binds.len() {
+                if st.fingers.release(idx) {
+                    let (x, y) = bind_point(&shared.profile, &m, idx);
+                    c.touch_up(bind_pid(idx), x, y);
+                }
+            }
+            for kc in st.active_android_keys.drain() {
+                c.key(false, kc as u32);
+            }
+            for (j, ws) in st.wheels.iter_mut().enumerate() {
+                if ws.down {
+                    // 配置可能刚被编辑过,轮盘数量以取得到的那一个为准
+                    if let Some(w) = shared.profile.wheels.get(j) {
+                        let (cx, cy) = m.point(w.cx, w.cy);
+                        c.touch_move(wheel_pid(j), cx, cy);
+                        c.touch_up(wheel_pid(j), cx, cy);
+                    }
+                    ws.down = false;
+                }
+            }
+        }
+        None => {
+            st.active_android_keys.clear();
+            aim_release_local(st.aim);
+        }
+    }
+    st.fingers.free_all();
+    for ws in st.wheels.iter_mut() {
+        ws.down = false;
+        ws.pressed = [false; 4];
+        ws.active = false;
+    }
+}
+
 pub fn run(
     shared: SharedState,
     rx: Receiver<CaptureEvent>,
@@ -333,23 +419,37 @@ pub fn run(
     // 因为开打时焦点通常在 scrcpy 窗口,主程序收不到按键)
     let mut ctrl_down = false;
     let mut alt_down = false;
+    // 顶栏按钮请求的收尾是否已经执行过(用于识别请求的上升沿)
+    let mut toolbar_release_prev = false;
 
     loop {
-        // 处理到期的计划动作
-        let now = Instant::now();
-        let mut i = 0;
-        while i < scheduled.len() {
-            if scheduled[i].0 <= now {
-                let (_, act) = scheduled.swap_remove(i);
-                let ctl = { shared.lock().unwrap().control.as_ref().map(|_| ()) };
-                if ctl.is_some() {
-                    let guard = shared.lock().unwrap();
-                    if let Some(c) = guard.control.as_ref() {
+        // 处理到期的计划动作。
+        // 优化:先把到期动作挑出来,再整批用一次加锁执行;旧写法对每个到期动作都要
+        // 加两次锁(滑动一次会排入几十个 Move,等于几十轮加解锁)。
+        // ControlClient 不是 Clone(内含两个 socket 线程的所有权),仍需借出引用,
+        // 但持锁范围只覆盖真正要发命令的这几个动作。
+        {
+            let now = Instant::now();
+            let mut due: Vec<SchedAct> = Vec::new();
+            let mut i = 0;
+            while i < scheduled.len() {
+                if scheduled[i].0 <= now {
+                    let (_, act) = scheduled.swap_remove(i);
+                    due.push(act);
+                } else {
+                    i += 1;
+                }
+            }
+            if !due.is_empty() {
+                let g = shared.lock().unwrap();
+                if let Some(c) = g.control.as_ref() {
+                    for act in due {
                         match act {
                             SchedAct::Up { pid, x, y } => {
                                 c.touch_up(pid, x, y);
-                                // 定时抬起(点按 40ms / 滑动终点):该键本次按下结束,清除按下状态
-                                if pid >= 1000 {
+                                // 定时抬起(点按 40ms / 滑动终点):该键本次按下结束,清除按下状态。
+                                // 只处理绑定指针段(1000..2000),避免误动轮盘/瞄准的按下状态。
+                                if (1000..2000).contains(&pid) {
                                     fingers.release((pid - 1000) as usize);
                                 }
                             }
@@ -357,12 +457,46 @@ pub fn run(
                         }
                     }
                 }
-            } else {
-                i += 1;
             }
         }
 
-        // 瞄准定期维护 + 同步鼠标捕获状态
+        // 顶栏[映射:开/关]按钮请求的收尾(上升沿触发一次)。
+        // 与总开关键走同一份 release_all,保证"用按钮关映射"也不会在手机上留下按住的触点。
+        {
+            let mut g = shared.lock().unwrap();
+            if g.toolbar_release && !toolbar_release_prev {
+                g.enabled = false;
+                // 把控制通道临时取出,拿到 `Option<ControlClient>` 的所有权,
+                // 这样既能读出屏幕尺寸、又能同时可变借用 `g`(借用检查器不会再抱怨)。
+                // 取不出(未连接)就按"无通道"分支清本地状态。
+                let ctl = g.control.take();
+                let screen = ctl
+                    .as_ref()
+                    .map(|c| (c.screen_w, c.screen_h))
+                    .unwrap_or((0, 0));
+                release_all(
+                    ctl.as_ref(),
+                    &mut g,
+                    screen,
+                    EngineState {
+                        fingers: &mut fingers,
+                        wheels: &mut wheels,
+                        active_android_keys: &mut active_android_keys,
+                        aim: &mut aim,
+                    },
+                );
+                g.control = ctl;
+                // 重新开打时恢复鼠标捕获(丢掉上一局的"交还鼠标"状态)
+                aim.released = false;
+            }
+            toolbar_release_prev = g.toolbar_release;
+        }
+
+        // 瞄准定期维护 + 同步鼠标捕获状态。
+        // 这一步只做两件事:①维护 mouse_grab 标志(界面改不了原子量)
+        // ②瞄准的"静止归中"。因此当通道没连上、映射没开、瞄准触点也没落下时,
+        // 完全没必要按 4ms 跑 —— 这正是下面 idle 退避要利用的性质。
+        let fast;
         {
             let mut g = shared.lock().unwrap();
             let s: &mut Shared = &mut g;
@@ -373,6 +507,7 @@ pub fn run(
                 .as_ref()
                 .map(|c| c.is_connected())
                 .unwrap_or(false);
+            fast = (enabled && connected) || aim.down;
             // 仅当映射开启、控制通道在线、瞄准启用且未被 Ctrl+Alt 释放时才捕获光标,
             // 避免出现"光标被冻结但什么都做不了";
             // 绑了"按住才瞄准"时只在按住期间捕获,松手即把光标还给系统
@@ -402,14 +537,20 @@ pub fn run(
         }
 
         // 等待下一个事件。有未到期的计划动作时,精确等到最早那个到期为止,
-        // 使点按的定时抬起/滑动的每一步都能落在预定时刻(误差由 ~4ms 降到 ~1ms);
-        // 没有计划动作时仍按 4ms 轮询,保证瞄准维护与捕获状态及时刷新。
+        // 使点按的定时抬起/滑动的每一步都落在预定时刻(误差由 ~4ms 降到 ~1ms)。
+        // 没有计划动作时按状态选档:
+        //   快档(IDLE_FAST_MS):映射开着且通道在线,或瞄准触点还按在屏幕上
+        //                        —— 归中与捕获状态都必须及时;
+        //   慢档(IDLE_SLOW_MS):没连接/没开映射 —— 此时上面两步什么也不会做,
+        //                        按快档空转等于白烧 250 次/秒的 CPU 与加锁。
+        // 事件到达会立刻唤醒 recv_timeout,所以退避只影响"轮询精度",不影响响应延迟。
+        let idle_ms = if fast { IDLE_FAST_MS } else { IDLE_SLOW_MS };
         let wait = scheduled
             .iter()
             .map(|(t, _)| t.saturating_duration_since(Instant::now()))
             .min()
-            .map(|d| d.min(Duration::from_millis(4)))
-            .unwrap_or(Duration::from_millis(4));
+            .map(|d| d.min(Duration::from_millis(idle_ms)))
+            .unwrap_or(Duration::from_millis(idle_ms));
         let raw = match rx.recv_timeout(wait) {
             Ok(ev) => ev,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
@@ -426,10 +567,14 @@ pub fn run(
                 s.aim_live.last_dx = dx;
                 s.aim_live.last_dy = dy;
                 if s.enabled {
+                    // 只克隆瞄准配置(小结构),并临时借出(profile, control)两块互不相干的字段。
+                    // 早期版本此处克隆整个 Profile(含全部键位/轮盘),而鼠标位移是高频事件,
+                    // 每来一个位移就深拷贝一次配置纯属浪费。
                     let cfg = s.profile.aim.clone();
-                    if let Some(ctl) = s.control.as_ref() {
+                    let (profile, control) = (&s.profile, &s.control);
+                    if let Some(ctl) = control.as_ref() {
                         if ctl.is_connected() {
-                            let m = s.profile.mapper((ctl.screen_w, ctl.screen_h));
+                            let m = profile.mapper((ctl.screen_w, ctl.screen_h));
                             aim_on_motion(ctl, &m, &cfg, &mut aim, dx, dy);
                         }
                     }
@@ -485,41 +630,32 @@ pub fn run(
             let now_enabled = g.enabled;
             if !now_enabled {
                 // 关闭时释放所有按下中的触点与系统键,并停用全部临时轮盘
-                if let Some(c) = g.control.as_ref() {
-                    let m = g.profile.mapper((c.screen_w, c.screen_h));
-                    // 瞄准触点一并抬起(否则松手后仍按在屏幕上)
-                    aim_lift(c, &mut aim);
-                    for idx in 0..g.profile.binds.len() {
-                        if fingers.release(idx) {
-                            let (x, y) = bind_point(&g.profile, &m, idx);
-                            c.touch_up(bind_pid(idx), x, y);
-                        }
-                    }
-                    for kc in active_android_keys.drain() {
-                        c.key(false, kc as u32);
-                    }
-                    for (j, ws) in wheels.iter_mut().enumerate() {
-                        if ws.down {
-                            let w = &g.profile.wheels[j];
-                            let (cx, cy) = m.point(w.cx, w.cy);
-                            c.touch_move(wheel_pid(j), cx, cy);
-                            c.touch_up(wheel_pid(j), cx, cy);
-                            ws.down = false;
-                        }
-                    }
-                } else {
-                    active_android_keys.clear();
-                    aim_release_local(&mut aim);
-                }
-                fingers.free_all();
-                for ws in wheels.iter_mut() {
-                    ws.down = false;
-                    ws.pressed = [false; 4];
-                    ws.active = false;
-                }
+                // (与顶栏按钮共用同一份实现,两条路径行为必须完全一致)
+                let ctl = g.control.take();
+                let screen = ctl
+                    .as_ref()
+                    .map(|c| (c.screen_w, c.screen_h))
+                    .unwrap_or((0, 0));
+                release_all(
+                    ctl.as_ref(),
+                    &mut g,
+                    screen,
+                    EngineState {
+                        fingers: &mut fingers,
+                        wheels: &mut wheels,
+                        active_android_keys: &mut active_android_keys,
+                        aim: &mut aim,
+                    },
+                );
+                g.control = ctl;
             } else {
                 // 每次重新开打都恢复捕获,避免上一局的"交还鼠标"状态带过来
                 aim.released = false;
+            }
+            // 按钮若正好也请求了收尾,视作已一并处理,避免下一轮再收一次
+            if g.toolbar_release {
+                g.toolbar_release = false;
+                toolbar_release_prev = false;
             }
             continue;
         }
@@ -753,6 +889,11 @@ fn bind_point(profile: &Profile, m: &Mapper, idx: usize) -> (i32, i32) {
 }
 
 /// 在折线上按弧长进度(0..1)插值取点,使曲线缓动沿路径均匀分布。
+///
+/// 实现要点:先用一遍 O(n) 求和得到总弧长,再走一遍找到目标所在线段。
+/// 早期版本每次调用都现场构建累积长度表(一次堆分配),而滑动一次会安排几十个
+/// Move 动作、且会被 `swap_remove` 打乱顺序 —— 于是每步都要重建一张长度表,
+/// 属于 O(n²) 的无谓开销。
 fn point_at_progress(points: &[(i32, i32)], progress: f32) -> (i32, i32) {
     if points.is_empty() {
         return (0, 0);
@@ -760,33 +901,32 @@ fn point_at_progress(points: &[(i32, i32)], progress: f32) -> (i32, i32) {
     if points.len() == 1 {
         return points[0];
     }
-    let prog = progress.clamp(0.0, 1.0);
-    let mut cum: Vec<f32> = Vec::with_capacity(points.len());
-    cum.push(0.0);
-    let mut total = 0.0f32;
-    for w in points.windows(2) {
-        let dx = (w[1].0 - w[0].0) as f32;
-        let dy = (w[1].1 - w[0].1) as f32;
-        total += (dx * dx + dy * dy).sqrt();
-        cum.push(total);
-    }
+    let seg_len = |i: usize| -> f32 {
+        let (x0, y0) = points[i];
+        let (x1, y1) = points[i + 1];
+        ((x1 - x0) as f32).hypot((y1 - y0) as f32)
+    };
+    let total: f32 = (0..points.len() - 1).map(seg_len).sum();
     if total <= 1e-6 {
         return points[0];
     }
-    let target = prog * total;
+    let target = progress.clamp(0.0, 1.0) * total;
+    let mut acc = 0.0f32;
     for i in 0..points.len() - 1 {
-        if target <= cum[i + 1] {
-            let seg = cum[i + 1] - cum[i];
+        let seg = seg_len(i);
+        if target <= acc + seg || i == points.len() - 2 {
             let frac = if seg <= 1e-6 {
                 0.0
             } else {
-                (target - cum[i]) / seg
-            }
-            .clamp(0.0, 1.0);
-            let x = points[i].0 as f32 + (points[i + 1].0 - points[i].0) as f32 * frac;
-            let y = points[i].1 as f32 + (points[i + 1].1 - points[i].1) as f32 * frac;
+                ((target - acc) / seg).clamp(0.0, 1.0)
+            };
+            let (x0, y0) = points[i];
+            let (x1, y1) = points[i + 1];
+            let x = x0 as f32 + (x1 - x0) as f32 * frac;
+            let y = y0 as f32 + (y1 - y0) as f32 * frac;
             return (x.round() as i32, y.round() as i32);
         }
+        acc += seg;
     }
     points[points.len() - 1]
 }
@@ -839,7 +979,10 @@ fn release_conflicting_binds(
 fn update_wheel(ctl: &ControlClient, m: &Mapper, j: usize, w: &Wheel, st: &mut WheelState) {
     let pid = wheel_pid(j);
     let (wx, wy) = m.point(w.cx, w.cy);
-    let wr = m.len(w.radius);
+    // 触点推出距离 = 半径 × 影响范围(scope)。
+    // 半径仍是界面上那个圆环的大小,scope 单独放大/缩小"手指实际被推多远",
+    // 于是可以让视觉圈与游戏里真实摇杆的判定圈解耦。默认 scope=1.0,与旧版一致。
+    let wr = w.push_px(m);
     let dx = st.pressed[3] as i32 - st.pressed[2] as i32; // right - left
     let dy = st.pressed[1] as i32 - st.pressed[0] as i32; // down - up
 
@@ -991,5 +1134,64 @@ mod tests {
         assert!(aim_active(&aim, &st));
         st.released = true;
         assert!(!aim_active(&aim, &st));
+    }
+
+    /// 折线取点(滑动轨迹与缓动的基础):
+    /// 端点必须精确落在起/终点上,按弧长而非按段数插值,越界进度被夹住。
+    /// 这条同时锁住"去掉累积长度表"这次重构的等价性。
+    #[test]
+    fn point_at_progress_is_arclength_based() {
+        let pts = [(0, 0), (100, 0), (100, 300)];
+        // 端点
+        assert_eq!(point_at_progress(&pts, 0.0), (0, 0));
+        assert_eq!(point_at_progress(&pts, 1.0), (100, 300));
+        // 总长 400;进度 0.25 => 弧长 100 => 正好是折点
+        assert_eq!(point_at_progress(&pts, 0.25), (100, 0));
+        // 进度 0.5 => 弧长 200 => 第二段走了一半
+        assert_eq!(point_at_progress(&pts, 0.5), (100, 100));
+        // 越界与退化输入
+        assert_eq!(point_at_progress(&pts, -1.0), (0, 0));
+        assert_eq!(point_at_progress(&pts, 5.0), (100, 300));
+        assert_eq!(point_at_progress(&[], 0.5), (0, 0));
+        assert_eq!(point_at_progress(&[(7, 7)], 0.5), (7, 7));
+        // 所有点重合:总长为 0,必须回退到起点而不是除零
+        assert_eq!(point_at_progress(&[(5, 5), (5, 5)], 0.7), (5, 5));
+    }
+
+    /// 按键并发上限:同一绑定重复按下只算一次,总数不超过 MAX_CONCURRENT_KEYS,
+    /// 且抬起严格与按下配对(绝不能误抬别的键)
+    #[test]
+    fn fingers_enforces_concurrency_and_pairing() {
+        let mut f = Fingers::default();
+        f.align(4);
+        assert!(f.try_down(0), "首次按下应成功");
+        assert!(!f.try_down(0), "未抬起的重复按下必须被忽略(防钩子自动重复)");
+        assert!(f.release(0), "抬起应有记录");
+        assert!(!f.release(0), "无按下记录的抬起不得误抬其它键");
+
+        // 占满并发额度后新按下被拒绝;释放一个后又能按下
+        f.align(MAX_CONCURRENT_KEYS + 2);
+        for i in 0..MAX_CONCURRENT_KEYS {
+            assert!(f.try_down(i), "第 {i} 个键应在额度内");
+        }
+        assert!(
+            !f.try_down(MAX_CONCURRENT_KEYS),
+            "超出额度必须拒绝,否则设备端指针池会被撑爆"
+        );
+        assert!(f.release(3));
+        assert!(f.try_down(MAX_CONCURRENT_KEYS), "腾出额度后应可再按下");
+    }
+
+    /// 变长绑定列表:align 只补长,补长后旧状态保留、新槽位为未按下
+    #[test]
+    fn fingers_align_grows_only() {
+        let mut f = Fingers::default();
+        f.align(2);
+        assert!(f.try_down(1));
+        f.align(5);
+        assert!(f.is_down(1), "补长不得丢失已按下状态");
+        assert!(!f.is_down(4), "新槽位应为未按下");
+        f.free_all();
+        assert!(!f.is_down(1) && f.count == 0, "free_all 必须清空计数");
     }
 }

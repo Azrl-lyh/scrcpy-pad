@@ -5,6 +5,7 @@ mod control;
 mod engine;
 mod filedialog;
 mod keymap;
+mod settings;
 mod theme;
 
 fn main() -> eframe::Result<()> {

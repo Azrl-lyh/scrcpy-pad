@@ -243,7 +243,7 @@ fn platform_start(
     let tx = std::sync::Mutex::new(tx);
     let mouse_grab = mouse_grab.clone();
     std::thread::spawn(move || {
-        let center = cursor_center();
+        let mut center = cursor_center();
         let mut last: Option<(f64, f64)> = None;
         let mut hiding = false;
         let mut skip_next = false;
@@ -255,8 +255,10 @@ fn platform_start(
                 unsafe { set_cursor_visible(!want_grab) };
                 hiding = want_grab;
                 if want_grab {
-                    // 进入抓取:先把光标归中,后续位移以中心为基准持续累积;
+                    // 进入抓取:重新取一次屏幕中心(分辨率/显示器可能已经变了),
+                    // 再把光标归中,后续位移以中心为基准持续累积;
                     // 归中自身会再产生一次鼠标事件,跳过它
+                    center = cursor_center();
                     move_cursor(center.0, center.1);
                     last = Some((center.0 as f64, center.1 as f64));
                     skip_next = true;
@@ -324,9 +326,12 @@ fn platform_start(
                         && ((x - center.0 as f64).abs() > CURSOR_RECENTER_PX
                             || (y - center.1 as f64).abs() > CURSOR_RECENTER_PX)
                     {
+                        // 注意把回中自身触发的那次 MouseMove 也标记为跳过,
+                        // 否则它会以 (x,y)->中心 的形式被当成真实位移上报,
+                        // 表现为视角突然反向跳一下。
                         move_cursor(center.0, center.1);
                         last = Some((center.0 as f64, center.1 as f64));
-                        skip_next = true; // 忽略回中自身触发的那次事件
+                        skip_next = true;
                     }
                 }
                 _ => {}

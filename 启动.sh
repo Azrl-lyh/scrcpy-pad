@@ -5,7 +5,11 @@ cd "$(dirname "$0")"
 
 BIN="target/release/scrcpy-pad"
 
-# 1. 没有可执行文件就先编译
+# 1. 可执行文件位置:优先用已打包的发布目录(存在即视为发布版),
+#    否则用 cargo 的构建产物;两者都没有就先编译一次。
+if [ -x "release/linux-x86_64/scrcpy-pad" ] && [ ! -x "$BIN" ]; then
+    BIN="release/linux-x86_64/scrcpy-pad"
+fi
 if [ ! -x "$BIN" ]; then
     echo "未找到编译产物,开始编译(仅首次需要)..."
     export PATH="$HOME/.cargo/bin:$PATH"

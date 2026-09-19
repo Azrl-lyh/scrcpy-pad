@@ -6,6 +6,8 @@ use crate::keymap::{
     Action, Easing, KeyBind, Mapper, Profile, RecenterMode, Swipe, SwipePath, TempMode, TempWheel,
     Wheel, key_name,
 };
+use crate::settings;
+use crate::settings::{Settings, SettingsCache};
 use crate::theme::{self, BgFit, Density, Preset, Theme};
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -29,6 +31,9 @@ const BASE_SCRCPY_ARGS: &str = "--stay-awake";
 /// 键位本来就允许落在画面外(比如横屏的布局在竖屏下显示、截图尺寸与布局方向不同),
 /// 这里不做越界"纠正",免得程序擅自改动用户调好的坐标。
 const COORD_RANGE: std::ops::RangeInclusive<i32> = -8192..=8192;
+
+/// 撤销栈深度(步数)。整份配置快照,50 步足以覆盖一次调参过程。
+const UNDO_DEPTH: usize = 50;
 
 /// 启动参数预设下拉选项
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,6 +333,10 @@ pub struct PadApp {
     look_saved: Option<theme::Look>,
     /// 外观缓存写入失败已提示过(只提示一次,避免刷屏)
     look_cache_warned: bool,
+    /// 程序级设置(scrcpy 三件套路径等,settings.json)的延迟写盘缓存
+    settings_cache: SettingsCache,
+    /// 是否记住 scrcpy 路径(界面开关,紧随 settings.json 落盘)
+    remember_paths: bool,
     _capture: Option<Capture>,
     capture_err: Option<String>,
     gui_rx: Receiver<CaptureEvent>,
@@ -345,6 +354,10 @@ pub struct PadApp {
     /// 由[测试]/[自动寻找]检测出的版本,只读显示
     server_version: String,
     test_msg: Option<(bool, String)>,
+    /// 上次由用户手工改动路径时的 (scrcpy, server, adb) 值;
+    /// 与当前值不同就说明"用户改过路径",此时即便选择器未变也要重新应用路径与刷新设备。
+    /// (早期版本用 `suite_synced` 兼做这件事,导致"同一设备换路径要刷新两次"才生效)
+    applied_suite: Option<(String, String, String)>,
 
     server: Option<ControlServer>,
     connect_rx: Option<Receiver<Result<(ControlServer, ControlClient), String>>>,
@@ -381,7 +394,7 @@ pub struct PadApp {
     redo_stack: Vec<Profile>,
     /// 帧末统一入栈的撤销快照(持锁修改处无法即时压栈)
     pending_undo: Option<Profile>,
-    /// 本帧是否已有显式撤销点(用于避免与 pending_undo 重复记录)
+    /// 本帧是否已由某个入口显式压过撤销栈(仅用于调试观察,不参与判定)
     undo_frame_marked: bool,
 }
 
@@ -557,6 +570,7 @@ impl PadApp {
             enabled: false,
             control: None,
             aim_live: Default::default(),
+            toolbar_release: false,
         }));
 
         // 输入捕获层(evdev)
@@ -584,43 +598,81 @@ impl PadApp {
             std::thread::spawn(move || crate::engine::run(shared, cap_rx, gui_tx, mouse_grab));
         }
 
-        // 自动寻找 scrcpy 与 server
+        // 程序级设置(scrcpy 三件套路径等):与 profile.json / look.json 同目录的 settings.json。
+        // 有了它,scrcpy 目录即使不在程序同级,重启后也仍然记得,不必每次重新寻找。
+        let mut saved = settings::load().unwrap_or_default();
+        if !saved.remember_paths {
+            // 用户关掉了"记住路径":不采用其中的路径,但仍保留启动参数一类的偏好
+            saved.clear_paths();
+        }
+        let remembered = saved.clone();
+        // 记住的路径可能早已被移动/删除:先校验,死路径一律丢弃(留空才能走自动寻找)
+        if saved.sanitize() && saved.remember_paths {
+            eprintln!("[settings] 已丢弃不存在的旧路径: {}", settings::path().display());
+        }
+        let saved_args = saved.scrcpy_args.clone();
+        let settings_cache = SettingsCache::new(saved.clone());
+
+        // 自动寻找 scrcpy 与 server:先用上次记住的路径,再自动寻找
         let (scrcpy_path, server_path, version, found_msg) = {
-            let exe = adb::find_scrcpy();
+            let remembered_exe = (!saved.scrcpy_path.trim().is_empty())
+                .then(|| PathBuf::from(saved.scrcpy_path.trim()));
+            let remembered_ok = remembered_exe
+                .as_ref()
+                .map(|p| p.is_file())
+                .unwrap_or(false);
+            let exe = if remembered_ok {
+                remembered_exe.clone()
+            } else {
+                adb::find_scrcpy()
+            };
             // server 找不到就留空:后续用户选定 scrcpy.exe 后,由 sync_suite 按其同目录
             // 自动补齐(官方发行包三者同目录),避免预先填入的相对路径阻塞自动发现
-            let server = adb::find_server(exe.as_deref())
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
+            let server = if !saved.server_path.trim().is_empty() {
+                saved.server_path.trim().to_string()
+            } else {
+                adb::find_server(exe.as_deref())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            };
             match exe {
                 Some(p) => {
                     let ps = p.display().to_string();
                     let v = adb::scrcpy_version_at(&ps).unwrap_or_default();
-                    (
-                        ps.clone(),
-                        server,
-                        v,
-                        format!("已自动找到 scrcpy: {ps}"),
-                    )
+                    let msg = if remembered_ok {
+                        format!(
+                            "已使用上次记住的 scrcpy: {ps}(来自 {})",
+                            settings::path().display()
+                        )
+                    } else {
+                        format!("已自动找到 scrcpy: {ps}")
+                    };
+                    (ps, server, v, msg)
                 }
                 None => (
                     String::new(),
                     server,
                     String::new(),
-                    "未找到 scrcpy,请在左栏手动指定路径".to_string(),
+                    "未找到 scrcpy,请在左栏手动指定路径(指定一次后会被记住)".to_string(),
                 ),
             }
         };
 
-        // 启动时定位 adb:优先 scrcpy 同目录(官方 Windows 发行包含同目录 adb.exe),
-        // 其次 PATH;拿到后才列设备,否则 Windows 上 scrcpy 正常但设备列表却为空
+        // 启动时定位 adb:上次记住的手动路径 > scrcpy 同目录(官方 Windows 发行包含同目录
+        // adb.exe)> PATH;拿到后才列设备,否则 Windows 上 scrcpy 正常但设备列表却为空
         let startup_adb = {
-            let exe = if scrcpy_path.trim().is_empty() {
-                None
-            } else {
-                Some(PathBuf::from(scrcpy_path.trim()))
-            };
-            adb::find_adb(exe.as_deref())
+            let manual = adb::find_adb_explicit(saved.adb_path.trim());
+            match manual {
+                Some(p) => Some(p),
+                None => {
+                    let exe = if scrcpy_path.trim().is_empty() {
+                        None
+                    } else {
+                        Some(PathBuf::from(scrcpy_path.trim()))
+                    };
+                    adb::find_adb(exe.as_deref())
+                }
+            }
         };
         if let Some(a) = &startup_adb {
             adb::set_adb_bin(Some(a));
@@ -643,17 +695,24 @@ impl PadApp {
             bg_failed: None,
             look_saved: None,
             look_cache_warned: false,
+            settings_cache,
+            remember_paths: remembered.remember_paths,
             _capture: capture,
             capture_err,
             gui_rx,
             devices,
             selected: 0,
-            scrcpy_args: BASE_SCRCPY_ARGS.into(),
+            scrcpy_args: if saved_args.trim().is_empty() {
+                BASE_SCRCPY_ARGS.into()
+            } else {
+                saved_args.clone()
+            },
             scrcpy_path,
             server_path,
             adb_path: adb_init,
             // 置空使其在首帧自动做一次全套联动补齐
             suite_synced: (String::new(), String::new(), String::new()),
+            applied_suite: None,
             server_version: version,
             test_msg: None,
             server: None,
@@ -684,11 +743,28 @@ impl PadApp {
         };
         app.log("就绪。顺序: 连接手机 -> [连接控制] -> [启动 scrcpy] -> 按总开关键开启映射");
         app.log(found_msg);
+        if remembered.remember_paths && remembered.has_any_path() {
+            app.log(format!(
+                "已读取记住的路径({}),改动会自动保存;不想记住可在左栏取消勾选",
+                settings::path().display()
+            ));
+        }
         match &startup_adb {
             Some(p) => app.log(format!("adb: {}", p.display())),
             None => app.log(
                 "未找到 adb(设备列表将为空): 请将 adb.exe 所在目录加入 PATH,或在左栏手动指定",
             ),
+        }
+        // 记住的设备:若仍在线,直接选中它,省得每次重连都要在下拉里挑
+        if !remembered.selected_serial.trim().is_empty() {
+            if let Some(i) = app
+                .devices
+                .iter()
+                .position(|d| d == remembered.selected_serial.trim())
+            {
+                app.selected = i;
+                app.log(format!("已选中上次使用的设备: {}", remembered.selected_serial));
+            }
         }
         let _ = cc;
         app
@@ -960,11 +1036,13 @@ impl PadApp {
     /// 用给定快照记录撤销点。
     /// 供已经持有配置锁的调用点使用(再加锁会自锁),快照必须是"修改之前"的状态。
     fn push_undo_snapshot(&mut self, profile: Profile) {
-        self.undo_stack.push(profile);
-        self.redo_stack.clear();
-        if self.undo_stack.len() > 50 {
+        // 栈满时丢弃最旧的一步。用 remove(0) 是 O(n),但 n ≤ 50 且只在满栈时发生,
+        // 比起改用 VecDeque(会牵动 redo 逻辑)不值得。
+        if self.undo_stack.len() >= UNDO_DEPTH {
             self.undo_stack.remove(0);
         }
+        self.undo_stack.push(profile);
+        self.redo_stack.clear();
         self.undo_frame_marked = true;
     }
 
@@ -1246,6 +1324,76 @@ impl PadApp {
                 None => self.log("未找到 adb(设备列表将为空): 请将 adb.exe 所在目录加入 PATH,或手动指定"),
             }
             self.refresh_devices();
+        }
+
+        // 5) 用户手工改过路径(且与上次应用的组合不同)-> 重新应用并刷新设备。
+        //    只靠 `suite_synced` 判断是不够的:文本改回原值时它不会变化,
+        //    但用户明确期望"改完路径立刻生效"。
+        let applied = (
+            self.scrcpy_path.clone(),
+            self.server_path.clone(),
+            self.adb_path.clone(),
+        );
+        if self.applied_suite.as_ref() != Some(&applied) {
+            self.applied_suite = Some(applied);
+            self.refresh_devices();
+        }
+    }
+
+    // ===================== 程序级设置(记住路径) =====================
+
+    /// 把当前界面上的路径/参数打包成一份设置
+    fn settings_snapshot(&self) -> Settings {
+        Settings {
+            remember_paths: self.remember_paths,
+            scrcpy_path: self.scrcpy_path.trim().to_string(),
+            server_path: self.server_path.trim().to_string(),
+            adb_path: self.adb_path.trim().to_string(),
+            scrcpy_args: self.scrcpy_args.trim().to_string(),
+            selected_serial: self.serial(),
+            saved_at: 0,
+        }
+    }
+
+    /// 登记"路径需要记住"(帧末统一写盘,内容未变则跳过)
+    fn remember_now(&mut self) {
+        if !self.remember_paths {
+            return;
+        }
+        // 时间戳由 settings::save_if_dirty 在真正落盘时打,这里传 0 即可
+        self.settings_cache.mark_dirty(self.settings_snapshot());
+    }
+
+    /// 帧末落盘:写在配置目录的 settings.json 里,与主题(look.json)同一目录
+    fn persist_settings(&mut self) {
+        if !self.remember_paths {
+            return;
+        }
+        match self.settings_cache.save_if_dirty() {
+            Some(Ok(p)) => self.log(format!("设置已保存: {}", p.display())),
+            Some(Err(e)) => {
+                self.log(format!("设置保存失败({e}),本次改动只在本次运行内有效"));
+            }
+            None => {}
+        }
+    }
+
+    /// 在系统文件管理器里打开配置目录(找不到文件管理器时退回日志提示)
+    fn open_config_dir(&mut self) {
+        let dir = config_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.log(format!("无法创建配置目录 {}({e})", dir.display()));
+            return;
+        }
+        #[cfg(target_os = "windows")]
+        let cmd = "explorer";
+        #[cfg(target_os = "macos")]
+        let cmd = "open";
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let cmd = "xdg-open";
+        match std::process::Command::new(cmd).arg(&dir).spawn() {
+            Ok(_) => self.log(format!("已在文件管理器中打开: {}", dir.display())),
+            Err(_) => self.log(format!("配置目录(请手动打开): {}", dir.display())),
         }
     }
 }
@@ -1676,8 +1824,22 @@ impl eframe::App for PadApp {
                     .add(egui::Button::new(txt).fill(color.gamma_multiply(0.3)))
                     .clicked()
                 {
-                    let mut g = self.shared.lock().unwrap();
-                    g.enabled = !g.enabled;
+                    // 关闭映射必须走引擎的收尾(抬起所有按住的触点),否则手机上会"卡键"。
+                    // 引擎线程持有触点状态,故这里只置请求位,由引擎在下一轮(≤4ms)执行,
+                    // 与按总开关键关闭时用的是同一份实现(engine::release_all)。
+                    let now = {
+                        let mut g = self.shared.lock().unwrap();
+                        g.enabled = !g.enabled;
+                        if !g.enabled {
+                            g.toolbar_release = true;
+                        }
+                        g.enabled
+                    };
+                    if now {
+                        self.log("映射已开启");
+                    } else {
+                        self.log("映射已关闭: 正在抬起全部触点");
+                    }
                 }
 
                 ui.separator();
@@ -1740,6 +1902,11 @@ impl eframe::App for PadApp {
                          设置[启用键]后变临时轮盘\n\
                          (长按启用 / 再按切换),\n\
                          启用期间方向键归摇杆\n\
+                          \n\
+                          轮盘影响范围:决定方向键按下后手指\n\
+                          实际被推多远(= 半径 × 系数);界面上\n\
+                          的圈仍是半径,两者不同时会多画一圈\n\
+                          橙色虚线显示真实推出距离\n\
                          \n\
                          图层:截图上方[显示]可只看\n\
                          键位/轮盘/永久/临时/锚点(FPS)\n\
@@ -1756,6 +1923,10 @@ impl eframe::App for PadApp {
                          面板顶部会自检并显示当前触摸坐标空间\n\
                          \n\
                          scrcpy 管理:自动寻找/测试并刷新;\n\
+                         勾选[记住路径]后 scrcpy/server/adb\n\
+                         路径与启动参数存进配置目录的\n\
+                         settings.json,重启后直接生效,\n\
+                         不必重新寻找([打开配置目录]可查看);\n\
                          scrcpy参数旁的[...]是常用参数助手\n\
                          (含中文说明与 GitHub 链接);\n\
                          [启动预设]可选 2K/4K/1K/720P 与音频开关\n\
@@ -1908,6 +2079,31 @@ impl eframe::App for PadApp {
                             self.refresh_devices();
                         }
                     });
+                    // 记住路径:与主题(look.json)一样存在配置目录里,重启后自动沿用
+                    ui.horizontal(|ui| {
+                        if ui
+                            .checkbox(&mut self.remember_paths, "记住路径(下次启动直接用)")
+                            .on_hover_text(
+                                "把 scrcpy / scrcpy-server / adb 路径与启动参数存到配置目录的 settings.json,\
+                                 即使 scrcpy 目录不在程序同级,重启后也不必重新寻找。",
+                            )
+                            .changed()
+                        {
+                            if self.remember_paths {
+                                self.log("已开启记住路径: 本次路径将写入 settings.json");
+                                self.remember_now();
+                            } else {
+                                self.log("已关闭记住路径: 不再写入 settings.json(旧内容保留但不再读取)");
+                            }
+                        }
+                        if ui
+                            .small_button("打开配置目录")
+                            .on_hover_text("profile.json / look.json / settings.json 所在目录")
+                            .clicked()
+                        {
+                            self.open_config_dir();
+                        }
+                    });
                     if let Some((ok, msg)) = &self.test_msg {
                         let th = self.theme();
                         ui.colored_label(if *ok { th.ok } else { th.danger }, msg);
@@ -2040,12 +2236,18 @@ impl eframe::App for PadApp {
         // UI 里有些控件直接在持锁状态下改配置,无法即时加锁压栈,故先存快照、帧末统一记录;
         // 同一帧的多个改动合并成一个撤销步。若本帧已有显式撤销点则丢弃,避免重复。
         let pending = self.pending_undo.take();
-        if !self.undo_frame_marked {
-            if let Some(before) = pending {
-                self.push_undo_snapshot(before);
-            }
+        if let Some(before) = pending {
+            // 注意顺序与合并规则:
+            //  - 帧中没有显式撤销点:这份快照代表整帧改动的"改动前"状态,直接入栈;
+            //  - 帧中已有显式撤销点(某个按钮已压过栈):那份快照仍代表"更早"的状态,
+            //    必须保留,否则连拖多次后撤销只能回到拖动中途。
+            self.push_undo_snapshot(before);
         }
         self.undo_frame_marked = false;
+
+        // ---- 本帧的程序级设置统一落盘(路径改动 / 启动参数 / 选中设备) ----
+        self.remember_now();
+        self.persist_settings();
 
         ctx.request_repaint_after(Duration::from_millis(120));
     }
@@ -2085,7 +2287,9 @@ impl PadApp {
                     let mut swipe_edit = false;
                     {
                         let mut g = self.shared.lock().unwrap();
-                        let before = g.profile.clone();
+                        // 撤销快照只取这一个键位:每次拖动/聚焦都会压一份,
+                        // 而整份 Profile 的深拷贝与"键位总数"成正比,这里没必要。
+                        let before = g.profile.binds.get(i).cloned();
                         if let Some(b) = g.profile.binds.get_mut(i) {
                             if let Action::Swipe(s) = &mut b.action {
                                 swipe_edit = swipe_controls(
@@ -2102,7 +2306,11 @@ impl PadApp {
                         }
                         if swipe_edit {
                             // 拖拽/聚焦开始那一帧:快照即"修改之前"的状态
-                            self.pending_undo = Some(before);
+                            if let Some(before) = before {
+                                let mut snapshot = g.profile.clone();
+                                snapshot.binds[i] = before;
+                                self.pending_undo = Some(snapshot);
+                            }
                         }
                     }
                     if let Some(slot) = pick {
@@ -2119,7 +2327,8 @@ impl PadApp {
                     let m = self.mapper();
                     {
                         let mut g = self.shared.lock().unwrap();
-                        let before = g.profile.clone();
+                        // 同上:撤销快照只需这一个键位
+                        let before = g.profile.binds.get(i).cloned();
                         if let Some(b) = g.profile.binds.get_mut(i) {
                             match &mut b.action {
                                 Action::Tap {
@@ -2185,7 +2394,11 @@ impl PadApp {
                         }
                         if point_edit {
                             // 拖拽/聚焦开始那一帧:快照即"修改之前"的状态
-                            self.pending_undo = Some(before);
+                            if let Some(before) = before {
+                                let mut snapshot = g.profile.clone();
+                                snapshot.binds[i] = before;
+                                self.pending_undo = Some(snapshot);
+                            }
                         }
                     }
                     // 取点
@@ -2496,11 +2709,16 @@ impl PadApp {
                         self.waiting_key = Some(KeySlot::WheelDir { wheel: i, dir: d });
                     }
                 }
+            });
+            // 半径 / 影响范围:两行放不下(双向滚动区里横排太长),故半径独占一行、
+            // 影响范围另起一行,并给出"实际推出的像素距离"便于和游戏里的判定圈对照。
+            ui.horizontal(|ui| {
                 let waiting_p = self.picking == Some(CoordSlot::WheelCenter(i));
                 let m = self.mapper();
                 {
                     let mut g = self.shared.lock().unwrap();
-                    let before = g.profile.clone();
+                    // 撤销快照只取这一个轮盘(理由同按键区:避免每帧深拷贝整份配置)
+                    let before = g.profile.wheels.get(i).cloned();
                     let mut wheel_edit = false;
                     let w = &mut g.profile.wheels[i];
                     ui.label("圆心x:");
@@ -2524,9 +2742,46 @@ impl PadApp {
                         w.radius = m.rel_len(pr);
                     }
                     wheel_edit |= r.drag_started() || r.gained_focus();
-                    if wheel_edit {
-                        self.pending_undo = Some(before);
+                    // 影响范围:触点实际推出的距离 = 半径 × 系数。
+                    // 半径仍是截图上那个圆环(视觉/响应圈),系数单独决定手指推多远,
+                    // 于是可以把"看得见的圈"和"游戏里真实摇杆的判定圈"解耦。
+                    ui.label("影响范围:");
+                    let mut scope = w.scope();
+                    let r = ui
+                        .add(
+                            egui::DragValue::new(&mut scope)
+                                .speed(0.02)
+                                .range(crate::keymap::SCOPE_MIN..=crate::keymap::SCOPE_MAX)
+                                .suffix("×半径"),
+                        )
+                        .on_hover_text(
+                            "触点实际推出的距离 = 半径 × 该系数。\n\
+                             1.0 = 与半径一致(老配置默认);\n\
+                             调大 = 手指推得更远,摇杆更灵敏;调小 = 更精细。\n\
+                             不等于 1.0 时,截图上会多画一圈橙色虚线表示实际推出距离。",
+                        );
+                    if r.changed() {
+                        w.scope = crate::keymap::clamp_scope(scope);
                     }
+                    wheel_edit |= r.drag_started() || r.gained_focus();
+                    let push_px = w.push_px(&m);
+                    ui.small(format!("= {push_px:.0}px"));
+                    if wheel_edit {
+                        if let Some(before) = before {
+                            let mut snapshot = g.profile.clone();
+                            snapshot.wheels[i] = before;
+                            self.pending_undo = Some(snapshot);
+                        }
+                    }
+                }
+                if ui
+                    .button("影响范围复位")
+                    .on_hover_text("恢复为 1.0(推出距离等于半径)")
+                    .clicked()
+                {
+                    self.push_undo();
+                    self.shared.lock().unwrap().profile.wheels[i].scope =
+                        crate::keymap::DEFAULT_WHEEL_SCOPE;
                 }
                 if ui
                     .button(if waiting_p { "点击截图..." } else { "取圆心" })
@@ -2555,6 +2810,7 @@ impl PadApp {
                 cx: 0.278,
                 cy: 0.375,
                 radius: 0.111,
+                scope: crate::keymap::DEFAULT_WHEEL_SCOPE,
                 temp: None,
             });
         }
@@ -2722,6 +2978,15 @@ impl PadApp {
                 }
                 let c = to_screen(m.x(w.cx), m.y(w.cy));
                 let r = m.len(w.radius) * scale;
+                // 影响范围:触点实际推出的距离,默认与半径一致(scope=1.0)时两者重合,
+                // 此时不再多画一圈,避免与半径圆环糊在一起。
+                let push_r = w.push_px(&m) * scale;
+                let scope = w.scope();
+                let scope_txt = if (scope - 1.0).abs() > 1e-3 {
+                    format!(" 影响范围×{scope:.2}")
+                } else {
+                    String::new()
+                };
                 let dirs_label = format!(
                     "{}/{}/{}/{}",
                     short_name(w.up),
@@ -2753,7 +3018,11 @@ impl PadApp {
                     painter.text(
                         c - vec2(0.0, r + 14.0),
                         Align2::CENTER_CENTER,
-                        format!("临时摇杆[{}·{}] {dirs_label}", short_name(t.key), mode),
+                        format!(
+                            "临时摇杆[{}·{}] {dirs_label}{scope_txt}",
+                            short_name(t.key),
+                            mode
+                        ),
                         FontId::proportional(size::LABEL_FONT),
                         th.wheel_perm,
                     );
@@ -2766,9 +3035,35 @@ impl PadApp {
                     painter.text(
                         c - vec2(0.0, r + 14.0),
                         Align2::CENTER_CENTER,
-                        format!("摇杆 {dirs_label}"),
+                        format!("摇杆 {dirs_label}{scope_txt}"),
                         FontId::proportional(size::LABEL_FONT),
                         color,
+                    );
+                }
+                // 影响范围外环(橙色虚线):只在与半径明显不同时绘制,
+                // 它表示"方向键按下后手指实际被推到多远",用来对照游戏里真实摇杆的判定圈。
+                if (push_r - r).abs() > 1.0 {
+                    let n = 48;
+                    let pts: Vec<egui::Pos2> = (0..=n)
+                        .map(|i| {
+                            let a = i as f32 * std::f32::consts::TAU / n as f32;
+                            c + vec2(a.cos() * push_r, a.sin() * push_r)
+                        })
+                        .collect();
+                    for shape in egui::Shape::dashed_line(
+                        &pts,
+                        Stroke::new(1.5, th.key_hold),
+                        7.0,
+                        6.0,
+                    ) {
+                        painter.add(shape);
+                    }
+                    painter.text(
+                        c + vec2(0.0, push_r + 12.0),
+                        Align2::CENTER_CENTER,
+                        format!("影响范围 {push_r:.0}px(×{scope:.2})"),
+                        FontId::proportional(size::SMALL_FONT),
+                        th.key_hold,
                     );
                 }
             }
@@ -3745,18 +4040,35 @@ impl PadApp {
     }
 }
 
+/// 配置目录:profile.json / look.json / settings.json 三者同处一地,
+/// 便于一起备份、清理或整体搬走。
+///
+/// 优先系统标准配置目录:
+///   Linux   : ~/.config/scrcpy-pad
+///   Windows : %APPDATA%\scrcpy-pad\config
+///   macOS   : ~/Library/Application Support/dev.scrcpy-pad
+/// 取不到时(极少数环境)退化为"程序旁边",即**便携模式**:
+/// 配置跟着程序走,U 盘拷走也不丢。
+pub fn config_dir() -> PathBuf {
+    if let Some(dirs) = directories::ProjectDirs::from("dev", "", "scrcpy-pad") {
+        return dirs.config_dir().to_path_buf();
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            return dir.to_path_buf();
+        }
+    }
+    PathBuf::from(".")
+}
+
 fn profile_path() -> PathBuf {
-    directories::ProjectDirs::from("dev", "", "scrcpy-pad")
-        .map(|p| p.config_dir().join("profile.json"))
-        .unwrap_or_else(|| PathBuf::from("profile.json"))
+    config_dir().join("profile.json")
 }
 
 /// 外观设置的"程序自用"缓存:与键位配置同目录(便于一起备份/清理),
 /// 只由程序自己读写,不提供给用户选择或编辑。
 fn look_cache_path() -> PathBuf {
-    directories::ProjectDirs::from("dev", "", "scrcpy-pad")
-        .map(|p| p.config_dir().join("look.json"))
-        .unwrap_or_else(|| PathBuf::from("look.json"))
+    config_dir().join("look.json")
 }
 
 /// 读取外观缓存;不存在或内容损坏时返回 None(退回配置里的外观)

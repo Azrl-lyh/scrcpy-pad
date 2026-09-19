@@ -464,6 +464,30 @@ pub enum TempMode {
     Toggle,
 }
 
+/// 摇杆"影响范围"系数的取值范围。
+///
+/// 取值乘在半径上得到触点实际推出的距离:1.0 = 与半径一致(旧行为)。
+/// 下限不为 0:方向键按下却推不动会让摇杆彻底失效,是纯粹的配置事故;
+/// 上限 4.0:再大就推到屏幕外了(超出部分会被系统丢弃),没有意义。
+pub const SCOPE_MIN: f32 = 0.2;
+pub const SCOPE_MAX: f32 = 4.0;
+
+/// 影响范围系数的默认值(=1.0,与半径一致,保证老配置行为完全不变)
+pub const DEFAULT_WHEEL_SCOPE: f32 = 1.0;
+
+fn default_wheel_scope() -> f32 {
+    DEFAULT_WHEEL_SCOPE
+}
+
+/// 把任意输入(含手工编辑的 json)收敛到合法范围
+pub fn clamp_scope(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(SCOPE_MIN, SCOPE_MAX)
+    } else {
+        DEFAULT_WHEEL_SCOPE
+    }
+}
+
 /// 临时摇杆:设置启用键后,方向键仅在启用期间归摇杆,期间同键位的其它绑定失效
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TempWheel {
@@ -483,9 +507,29 @@ pub struct Wheel {
     pub cx: f32,
     pub cy: f32,
     pub radius: f32,
+    /// 影响范围系数:触点实际推出的距离 = radius × scope。
+    /// 1.0(默认)= 推出距离等于半径;>1 更大幅度、<1 更精细。
+    /// 老配置没有这个字段,反序列化后为 1.0,行为与旧版逐一致。
+    #[serde(default = "default_wheel_scope")]
+    pub scope: f32,
     /// None=永久摇杆;Some=临时摇杆(按启用键期间方向键归摇杆)
     #[serde(default)]
     pub temp: Option<TempWheel>,
+}
+
+impl Wheel {
+    /// 触点推出距离(像素)—— 半径与影响范围的乘积,一处定义、全链路使用。
+    ///
+    /// 所有"按方向后手指推多远"的计算都必须走这里,避免某处漏乘 scope
+    /// 导致界面显示的圈与实际手感对不上。
+    pub fn push_px(&self, m: &Mapper) -> f32 {
+        m.len(self.radius * clamp_scope(self.scope))
+    }
+
+    /// 影响范围系数(已收敛到合法范围)
+    pub fn scope(&self) -> f32 {
+        clamp_scope(self.scope)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -606,6 +650,7 @@ impl Default for Profile {
                 cx: 0.278,
                 cy: 0.375,
                 radius: 0.111,
+                scope: DEFAULT_WHEEL_SCOPE,
                 temp: None,
             }],
             aim: Aim::default(),
@@ -793,6 +838,7 @@ mod tests {
                 cx: 300.0,
                 cy: 900.0,
                 radius: 120.0,
+                scope: DEFAULT_WHEEL_SCOPE,
                 temp: None,
             }],
             ..Profile::default()
@@ -870,5 +916,63 @@ mod tests {
         }
         assert_eq!((m2.x(p.aim.anchor_x), m2.y(p.aim.anchor_y)), (810, 1200));
         assert_eq!(m2.point(p.wheels[0].cx, p.wheels[0].cy), (300, 900));
+    }
+
+    /// 新增的"影响范围"字段:老配置(没有该字段)读入后必须是 1.0,
+    /// 保证升级前后手感完全一致;越界与非法值(NaN/负数)必须被收敛。
+    #[test]
+    fn wheel_scope_defaults_and_clamps() {
+        // 老 json(无 scope 字段)
+        let old = r#"{
+            "up": 17, "down": 31, "left": 30, "right": 32,
+            "cx": 0.278, "cy": 0.375, "radius": 0.111
+        }"#;
+        let w: Wheel = serde_json::from_str(old).expect("老配置应可解析");
+        assert_eq!(w.scope, DEFAULT_WHEEL_SCOPE, "缺省影响范围必须是 1.0");
+        let m = Mapper::new(CoordUnit::Rel, (1000, 1000));
+        assert!(
+            (w.push_px(&m) - m.len(w.radius)).abs() < 1e-3,
+            "scope=1.0 时推出距离必须与半径一致"
+        );
+
+        // 放大 / 缩小都体现在推出距离上
+        let big = Wheel {
+            scope: 2.0,
+            ..w.clone()
+        };
+        assert!((big.push_px(&m) - m.len(w.radius) * 2.0).abs() < 1e-3);
+
+        // 越界与非法值被 clamp(SCOPE_MIN..=SCOPE_MAX)
+        assert_eq!(clamp_scope(0.0), SCOPE_MIN, "0 会让摇杆完全推不动,必须抬到下限");
+        assert_eq!(clamp_scope(-3.0), SCOPE_MIN);
+        assert_eq!(clamp_scope(99.0), SCOPE_MAX);
+        assert_eq!(clamp_scope(f32::NAN), DEFAULT_WHEEL_SCOPE);
+        let wild = Wheel {
+            scope: 100.0,
+            ..w.clone()
+        };
+        assert!(wild.push_px(&m) <= m.len(w.radius) * SCOPE_MAX + 1e-3);
+    }
+
+    /// 斜向推出距离不应超过 scope 描述的范围(归一化后半径分量 < 半径)
+    #[test]
+    fn wheel_push_px_is_a_radius_scale() {
+        let w = Wheel {
+            up: 17,
+            down: 31,
+            left: 30,
+            right: 32,
+            cx: 0.278,
+            cy: 0.375,
+            radius: 0.111,
+            scope: 1.5,
+            temp: None,
+        };
+        let m = Mapper::new(CoordUnit::Rel, (1080, 2400));
+        let r = m.len(w.radius);
+        assert!((w.push_px(&m) - r * 1.5).abs() < 1e-2);
+        // 换算器换了屏幕尺寸,推出距离按比例跟着变(仍是同一个 scope)
+        let m2 = Mapper::new(CoordUnit::Rel, (720, 1600));
+        assert!((w.push_px(&m2) - m2.len(w.radius) * 1.5).abs() < 1e-2);
     }
 }
