@@ -268,6 +268,10 @@ pub struct Look {
     /// 面板不透明度(255=完全不透明;有背景图时才会透出)
     #[serde(default = "default_panel_alpha")]
     pub panel_alpha: u8,
+    /// 键位浮层(键位/摇杆的响应范围圈与标注)的显示亮度档位,见 [`tone_color`]。
+    /// 0 = 默认,与旧版观感逐一致;>0 变浅、<0 加深。老配置没有这个字段,缺省 0。
+    #[serde(default)]
+    pub overlay_tone: f32,
 }
 
 fn default_bg_dim() -> u8 {
@@ -289,6 +293,7 @@ impl Default for Look {
             bg_fit: BgFit::default(),
             bg_dim: default_bg_dim(),
             panel_alpha: default_panel_alpha(),
+            overlay_tone: 0.0,
         }
     }
 }
@@ -378,12 +383,195 @@ pub fn with_alpha(c: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
 }
 
-/// 浮层标注文字:白色(在任意截图上都可读)
-pub fn outline_text() -> Color32 {
-    Color32::WHITE
+// 说明:早期这里有 outline_text()/outline_stroke() 两个"恒为白色"的浮层常量。
+// 引入"键位显示亮度"后,浮层颜色统一走 tone_color / tone_text / paint_label,
+// 那两个常量已无调用点,故删除 —— 免得以后又有人取到"永远白色"的颜色,
+// 让亮度档位在某一处失效。
+
+// ============================ 浮层显示亮度 ============================
+//
+// 用户诉求:"我的键位设置显示在画布上,有些时候背景可能很亮,看不清键位"
+// —— 需要一档能加深、也能变浅的"键位显示亮度",作用在键位与摇杆的响应范围圈上。
+//
+// 尺度(这个"度"由这里定死,界面只给一个滑块):
+//   * 只改**明度**、不改色相:拉到端点也只向白/黑混合 TONE_MIX(60%),
+//     于是"点按绿 / 长按橙 / 永久摇杆青 / 临时摇杆品红"这套语义色在任意档位
+//     依然分得清 —— 摇杆看上去仍然是个摇杆,不会糊成一坨纯白或纯黑。
+//   * 填充的透明度跟着一起走:变浅时更透(免得在暗背景上糊成亮块),
+//     加深时更实(让圈住的区域在亮背景上更明确)。上下限都留有余地,
+//     绝不会把截图彻底盖住 —— 圈里的内容始终能看见。
+//   * 标注文字另配对比描边(见 [`paint_label`]),因此加深到纯黑字、
+//     变浅到纯白字都仍然可读。
+
+/// 亮度档位的取值范围(界面滑块也用这一对常量,避免两处各写一遍)
+pub const TONE_MIN: f32 = -1.0;
+pub const TONE_MAX: f32 = 1.0;
+
+/// 端点处向白/黑混合的最大比例
+const TONE_MIX: f32 = 0.6;
+
+/// 填充透明度的缩放幅度(变浅 ×(1-0.35) / 加深 ×(1+0.35))
+const TONE_ALPHA_SWING: f32 = 0.35;
+
+/// 把任意输入(含手工编辑的 json)收敛到合法档位
+pub fn clamp_tone(t: f32) -> f32 {
+    if t.is_finite() {
+        t.clamp(TONE_MIN, TONE_MAX)
+    } else {
+        0.0
+    }
 }
 
-/// 浮层用的白色描边
-pub fn outline_stroke(width: f32) -> egui::Stroke {
-    egui::Stroke::new(width, Color32::WHITE)
+/// 按亮度档位调整一个浮层颜色:正值变浅(向白),负值加深(向黑),色相保持不变。
+pub fn tone_color(c: Color32, tone: f32) -> Color32 {
+    let t = clamp_tone(tone);
+    if t == 0.0 {
+        return c;
+    }
+    // 必须走**非预乘**通道:浮层填充色本身是半透明的,
+    // 直接改预乘分量再按原 alpha 存回去,会得到一个更暗的颜色(反而不受控)。
+    let [r, g, b, a] = c.to_srgba_unmultiplied();
+    let k = t.abs() * TONE_MIX;
+    let target: f32 = if t > 0.0 { 255.0 } else { 0.0 };
+    let mix = |v: u8| (v as f32 + (target - v as f32) * k).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgba_unmultiplied(mix(r), mix(g), mix(b), a)
+}
+
+/// 按亮度档位缩放填充透明度:变浅更透、加深更实(见本节开头说明)
+pub fn tone_alpha(a: u8, tone: f32) -> u8 {
+    let t = clamp_tone(tone);
+    ((a as f32) * (1.0 - t * TONE_ALPHA_SWING)).clamp(0.0, 255.0) as u8
+}
+
+/// 浮层标注文字的颜色:加深档用近黑字、其余用纯白字。
+/// 两者都配 [`paint_label`] 的对比描边,所以无论背景明暗都能读出来。
+pub fn tone_text(tone: f32) -> Color32 {
+    if clamp_tone(tone) < -0.02 {
+        Color32::from_rgb(16, 16, 16)
+    } else {
+        Color32::WHITE
+    }
+}
+
+/// 按亮度档位处理一个"描边 + 半透明填充"配色对 —— 键位圈、摇杆圈、滑动轨迹
+/// 全都用它,保证同一次调整在整张浮层上表现一致。
+///
+/// 两个要点:
+///   * `tone == 0` 时原样返回,一个字节都不改 —— "默认档与旧版观感逐一致"是明确的承诺;
+///   * 填充必须走**非预乘**通道再按新 alpha 存回去。`Color32` 内部是预乘存储,
+///     直接拿它去 `from_rgba_unmultiplied(..., 新alpha)` 会把颜色再预乘一次,
+///     得到的结果比预期暗一大截(档位一拉就会莫名发灰)。
+pub fn tone_ring_fill(ring: Color32, fill: Color32, tone: f32) -> (Color32, Color32) {
+    let t = clamp_tone(tone);
+    if t == 0.0 {
+        return (ring, fill);
+    }
+    let [r, g, b, a] = fill.to_srgba_unmultiplied();
+    let fill = Color32::from_rgba_unmultiplied(r, g, b, tone_alpha(a, t));
+    (tone_color(ring, t), tone_color(fill, t))
+}
+
+/// 绘制浮层标注文字:先按四个方向各画一层**对比色**描边,再画正文。
+///
+/// 为什么需要:背景图/游戏画面可能很亮,纯白文字会直接糊进背景里
+/// (用户反馈"看不清键位")。描边色按正文色的亮度自动取反
+/// (亮字配暗描边、暗字配亮描边),于是"键位显示亮度"可以放心加深/变浅,
+/// 而标注始终读得出来。
+pub fn paint_label(
+    painter: &egui::Painter,
+    pos: egui::Pos2,
+    align: egui::Align2,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+) {
+    let [r, g, b, _] = color.to_srgba_unmultiplied();
+    let luma = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+    let halo = if luma > 140.0 {
+        Color32::from_black_alpha(180)
+    } else {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 180)
+    };
+    for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+        painter.text(
+            pos + egui::vec2(dx, dy),
+            align,
+            text,
+            font.clone(),
+            halo,
+        );
+    }
+    painter.text(pos, align, text, font, color);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 老配置(没有 overlay_tone 字段)读入后必须是 0.0 —— 观感与旧版逐一致
+    #[test]
+    fn look_overlay_tone_defaults_to_neutral() {
+        let look: Look = serde_json::from_str(r#"{ "preset": "Nord", "bg_dim": 135 }"#).unwrap();
+        assert_eq!(look.overlay_tone, 0.0);
+        // 档位为 0 时颜色不做任何改动(连 alpha 也不动)
+        let c = Color32::from_rgba_unmultiplied(0, 200, 0, 60);
+        assert_eq!(tone_color(c, 0.0), c);
+        assert_eq!(tone_alpha(60, 0.0), 60);
+    }
+
+    /// 变浅/加深都必须真的改变明度,且**保持色相可辨**(不能变成纯白/纯黑),
+    /// 半透明填充的 alpha 也要跟着反向走。
+    #[test]
+    fn tone_changes_lightness_but_keeps_hue() {
+        let green = Color32::from_rgb(0, 160, 0);
+        let lighter = tone_color(green, TONE_MAX);
+        let darker = tone_color(green, TONE_MIN);
+        assert!(lighter.g() > green.g() && lighter.r() > green.r());
+        assert!(darker.g() < green.g());
+        // 端点不能变成纯白/纯黑:绿色分量仍是最大的那个
+        assert!(lighter.g() > lighter.r() && lighter.g() > lighter.b());
+        assert_eq!(darker.r(), 0);
+        assert!(darker.g() > 0, "加深不能把颜色压成纯黑,否则分不清语义色");
+
+        // 半透明填充:变浅更透、加深更实
+        assert!(tone_alpha(60, TONE_MAX) < 60);
+        assert!(tone_alpha(60, TONE_MIN) > 60);
+        // 加深也不能把填充顶爆(u8 上限),即不会把截图彻底盖住
+        assert!((tone_alpha(250, TONE_MIN) as u32) <= 255);
+
+        // 非法输入回落到默认档
+        assert_eq!(clamp_tone(f32::NAN), 0.0);
+        assert_eq!(clamp_tone(99.0), TONE_MAX);
+        assert_eq!(clamp_tone(-99.0), TONE_MIN);
+    }
+
+    /// 文字颜色:加深档用暗字、其余用白字(两者都靠 paint_label 的对比描边兜底)
+    #[test]
+    fn tone_text_switches_for_dark_tone() {
+        assert_eq!(tone_text(0.0), Color32::WHITE);
+        assert_eq!(tone_text(1.0), Color32::WHITE);
+        let dark = tone_text(-1.0);
+        assert!(dark.r() < 60 && dark.g() < 60 && dark.b() < 60);
+    }
+
+    /// 亮度档位为 0 时"描边 + 填充"必须**逐字节**等于旧版所用的那对颜色,
+    /// 否则"默认档与旧版观感一致"这句承诺就不成立(用户明确要求不与既有表现打架)。
+    #[test]
+    fn tone_ring_fill_is_identity_at_zero() {
+        let ring = Color32::from_rgb(0, 160, 0);
+        let fill = Color32::from_rgba_unmultiplied(0, 200, 0, 60);
+        assert_eq!(tone_ring_fill(ring, fill, 0.0), (ring, fill));
+
+        // 非 0 档:描边变明/变暗,填充的**非预乘**透明度跟着反向走,
+        // 且填充不能被"二次预乘"压成灰色 —— 色相(g 分量占优)必须保住
+        let (r_light, f_light) = tone_ring_fill(ring, fill, TONE_MAX);
+        let (r_dark, f_dark) = tone_ring_fill(ring, fill, TONE_MIN);
+        assert!(r_light.g() > ring.g() && r_dark.g() < ring.g());
+        assert!(f_light.a() < fill.a() && f_dark.a() > fill.a());
+        let [fr, fg, fb, _] = f_dark.to_srgba_unmultiplied();
+        assert!(
+            fg > 60 && fg > fr && fg > fb,
+            "加深档的填充仍应是可辨认的绿色,而不是被二次预乘压成灰: ({fr},{fg},{fb})"
+        );
+    }
 }

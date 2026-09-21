@@ -475,6 +475,27 @@ pub const SCOPE_MAX: f32 = 4.0;
 /// 影响范围系数的默认值(=1.0,与半径一致,保证老配置行为完全不变)
 pub const DEFAULT_WHEEL_SCOPE: f32 = 1.0;
 
+/// 新建摇杆的默认半径(**像素**,按当前触摸坐标空间换算成相对值后入配置)。
+///
+/// 为什么用像素而不是写死一个比例:界面上"半径:"一栏显示的就是这个像素值,
+/// 用户是拿它去对照游戏里真实摇杆的判定圈的(用户实测反馈"摇杆初始范围过大,
+/// 请修改到150")。写死比例的话,同一个比例在不同宽度的屏幕上会变成完全不同的
+/// 像素值 —— 用户缩小过的摇杆与新建的摇杆就会差出一大截。
+/// 存进配置的仍然是相对值(见 [`Wheel::radius`]),换手机/换方向时照旧自适应。
+pub const NEW_WHEEL_RADIUS_PX: f32 = 150.0;
+
+/// 新建摇杆时的参考屏宽:没有屏幕尺寸可用时按这个宽度把像素换成比例,
+/// 保证"没有屏幕信息"这一路也不会造出一个荒唐的圈。
+const REFERENCE_SCREEN_W: f32 = 1080.0;
+
+/// 新建摇杆的默认半径(相对值,按参考屏宽换算)—— 供 [`Profile::default`] 这类
+/// 拿不到屏幕尺寸的场合使用
+pub const DEFAULT_WHEEL_RADIUS: f32 = NEW_WHEEL_RADIUS_PX / REFERENCE_SCREEN_W;
+
+fn default_wheel_radius() -> f32 {
+    DEFAULT_WHEEL_RADIUS
+}
+
 fn default_wheel_scope() -> f32 {
     DEFAULT_WHEEL_SCOPE
 }
@@ -530,6 +551,83 @@ impl Wheel {
     pub fn scope(&self) -> f32 {
         clamp_scope(self.scope)
     }
+
+    /// 新建摇杆:圆心落在给定位置上,半径固定为
+    /// [`NEW_WHEEL_RADIUS_PX`] 像素(按当前坐标空间换算)。
+    ///
+    /// 抽成函数是为了让"新建摇杆"只有一处定义 —— 半径、scope、方向键默认值
+    /// 全在这里,界面与默认配置不会再各写一份而慢慢跑偏。
+    pub fn new_default(m: &Mapper, cx: f32, cy: f32) -> Self {
+        Self {
+            up: 17,    // W
+            down: 31,  // S
+            left: 30,  // A
+            right: 32, // D
+            cx,
+            cy,
+            radius: m.rel_len(NEW_WHEEL_RADIUS_PX),
+            scope: DEFAULT_WHEEL_SCOPE,
+            temp: None,
+        }
+    }
+}
+
+/// 两个摇杆圆心近到这个距离(占屏宽的比例)以内就算"叠在一起"了 ——
+/// 150px 的响应圈叠起来就是 300px,再近就分不清哪个是哪个。
+const WHEEL_MIN_GAP: f32 = 0.12;
+
+/// 新建摇杆的候选落点(相对坐标,按屏幕比例分布,避开四角与边缘)
+const WHEEL_SPOTS: &[(f32, f32)] = &[
+    (0.278, 0.375),
+    (0.78, 0.375),
+    (0.278, 0.72),
+    (0.78, 0.72),
+    (0.5, 0.5),
+    (0.5, 0.25),
+    (0.5, 0.75),
+    (0.22, 0.25),
+    (0.8, 0.25),
+    (0.22, 0.8),
+    (0.8, 0.8),
+];
+
+/// 新建摇杆的落点:在候选点里挑一个**离已有摇杆足够远**的。
+///
+/// 为什么不能固定写死一个点:多个摇杆圆心重合时,浮层上的圆环、方向标注与
+/// 影响范围圈会糊成一团,用户根本分不清哪个是刚建的那个
+/// (反馈"创建新摇杆时旧的摇杆会瞬间变大、新摇杆还可能和旧的换位")。
+///
+/// 候选点全被占满时(摇杆非常多),退而求其次挑"离最近的已有摇杆最远"的那个 ——
+/// 至少不会完全叠在一起。
+pub fn next_wheel_spot(wheels: &[Wheel]) -> (f32, f32) {
+    let nearest = |cx: f32, cy: f32| {
+        wheels
+            .iter()
+            .map(|w| (w.cx - cx).hypot(w.cy - cy))
+            .fold(f32::INFINITY, f32::min)
+    };
+    let mut best = WHEEL_SPOTS[0];
+    let mut best_d = f32::NEG_INFINITY;
+    for &(cx, cy) in WHEEL_SPOTS {
+        let d = nearest(cx, cy);
+        if d >= WHEEL_MIN_GAP {
+            return (cx, cy);
+        }
+        if d > best_d {
+            best_d = d;
+            best = (cx, cy);
+        }
+    }
+    // 极端情况:候选点全被占住(摇杆极多)。按小网格继续往外错开,
+    // 保证新建的摇杆至少不会和已有的完全重合。
+    for k in 1..=64i32 {
+        let cx = (best.0 + 0.05 * (k % 8) as f32).clamp(0.03, 0.97);
+        let cy = (best.1 + 0.05 * (k / 8) as f32).clamp(0.03, 0.97);
+        if nearest(cx, cy) > 1e-3 {
+            return (cx, cy);
+        }
+    }
+    best
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -646,10 +744,11 @@ impl Default for Profile {
                 down: 31,  // S
                 left: 30,  // A
                 right: 32, // D
-                // 相对坐标:左下角偏内,半径约为屏幕宽度的 1/9
+                // 相对坐标:左下角偏内,半径 = NEW_WHEEL_RADIUS_PX(150px)
+                // 按参考屏宽换算 —— 与界面上新建摇杆得到的像素半径一致
                 cx: 0.278,
                 cy: 0.375,
-                radius: 0.111,
+                radius: default_wheel_radius(),
                 scope: DEFAULT_WHEEL_SCOPE,
                 temp: None,
             }],
@@ -974,5 +1073,67 @@ mod tests {
         // 换算器换了屏幕尺寸,推出距离按比例跟着变(仍是同一个 scope)
         let m2 = Mapper::new(CoordUnit::Rel, (720, 1600));
         assert!((w.push_px(&m2) - m2.len(w.radius) * 1.5).abs() < 1e-2);
+    }
+
+    /// 新建摇杆的默认半径必须**在任何屏幕上都等于 150px**。
+    ///
+    /// 回归:旧版把默认半径写死成 0.111(宽度的 1/9),在 2772 宽的横屏手机上
+    /// 就是 307px、在 1080 宽的竖屏上是 120px —— 同一个"默认"在不同设备上
+    /// 差出一大截,用户在界面上看到的像素值也就跟着失控(反馈"摇杆初始范围过大")。
+    #[test]
+    fn new_wheel_radius_is_always_150px() {
+        for space in [(1080u32, 2400u32), (2772, 1280), (720, 1600)] {
+            let m = Mapper::new(CoordUnit::Rel, space);
+            let w = Wheel::new_default(&m, 0.3, 0.4);
+            let px = m.len(w.radius);
+            assert!(
+                (px - NEW_WHEEL_RADIUS_PX).abs() < 0.01,
+                "{}x{} 上新建摇杆半径应为 {}px,实际 {px}",
+                space.0,
+                space.1,
+                NEW_WHEEL_RADIUS_PX
+            );
+            assert_eq!(w.scope(), DEFAULT_WHEEL_SCOPE, "新建摇杆的影响范围默认为 1.0");
+            assert_eq!((w.up, w.down, w.left, w.right), (17, 31, 30, 32), "方向键默认 WASD");
+            assert!(w.temp.is_none(), "新建摇杆默认是永久摇杆");
+        }
+
+        // 默认配置(拿不到当前屏幕尺寸)按参考屏宽换算,同样是 150px
+        let m = Mapper::new(CoordUnit::Rel, (1080, 2400));
+        let d = &Profile::default().wheels[0];
+        assert!((m.len(d.radius) - NEW_WHEEL_RADIUS_PX).abs() < 0.01);
+    }
+
+    /// 新建轮盘的落点必须避开已有摇杆 —— 圆心重叠会让浮层上的圆环、方向标注与
+    /// 影响范围圈糊成一团,用户根本分不清哪个是刚建的那个
+    /// (反馈过"创建新摇杆时旧的摇杆会瞬间变大、新摇杆还可能和旧的换位")。
+    #[test]
+    fn new_wheels_do_not_stack_on_each_other() {
+        let m = Mapper::new(CoordUnit::Rel, (1080, 2400));
+        let mut wheels: Vec<Wheel> = Vec::new();
+        // 常见的头几个摇杆:必须与所有已有摇杆都拉开距离
+        for i in 0..8 {
+            let (cx, cy) = next_wheel_spot(&wheels);
+            for w in &wheels {
+                let d = (w.cx - cx).hypot(w.cy - cy);
+                assert!(
+                    d >= WHEEL_MIN_GAP - 1e-6,
+                    "第 {i} 个新建摇杆与已有摇杆只差 {d},会叠在一起"
+                );
+            }
+            assert!((0.0..=1.0).contains(&cx) && (0.0..=1.0).contains(&cy));
+            wheels.push(Wheel::new_default(&m, cx, cy));
+        }
+        // 候选点用尽(摇杆很多)时:退化为小网格错开,但绝不能重合
+        for _ in 0..6 {
+            let (cx, cy) = next_wheel_spot(&wheels);
+            let d = wheels
+                .iter()
+                .map(|w| (w.cx - cx).hypot(w.cy - cy))
+                .fold(f32::INFINITY, f32::min);
+            assert!(d > 1e-3, "挤满时也不能与已有摇杆重合(最近只差 {d})");
+            assert!((0.0..=1.0).contains(&cx) && (0.0..=1.0).contains(&cy));
+            wheels.push(Wheel::new_default(&m, cx, cy));
+        }
     }
 }

@@ -10,7 +10,7 @@ use crate::settings;
 use crate::settings::{Settings, SettingsCache};
 use crate::theme::{self, BgFit, Density, Preset, Theme};
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, channel};
@@ -261,6 +261,8 @@ impl OverlayFilter {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum DialogPurpose {
     ScrcpyExe,
+    /// 选择 scrcpy 所在目录(发行包解压出来的那个文件夹)
+    ScrcpyDir,
     ServerJar,
     AdbExe,
     SaveLog,
@@ -335,6 +337,10 @@ pub struct PadApp {
     look_cache_warned: bool,
     /// 程序级设置(scrcpy 三件套路径等,settings.json)的延迟写盘缓存
     settings_cache: SettingsCache,
+    /// 启动时从 settings.json 读到的**原始内容**(未清理)。
+    /// 用途:关掉[记住路径]时写回文件的内容要以它为准 —— 只翻开关、
+    /// 不丢已记住的路径文本(否则开关来回拨一次路径就没了)。
+    settings_loaded: Settings,
     /// 是否记住 scrcpy 路径(界面开关,紧随 settings.json 落盘)
     remember_paths: bool,
     _capture: Option<Capture>,
@@ -346,11 +352,14 @@ pub struct PadApp {
     scrcpy_args: String,
     /// scrcpy 可执行文件路径(空 = 使用 PATH 中的 scrcpy)
     scrcpy_path: String,
+    /// scrcpy 所在目录(空 = 未指定)。可直接指定目录,三件套由它推导补齐 ——
+    /// 用户嘴里的"scrcpy 目录"就是发行包解压出来的那个文件夹。
+    scrcpy_dir: String,
     server_path: String,
     /// adb 可执行文件路径(空 = 自动寻找:优先 scrcpy 同目录,再 PATH)
     adb_path: String,
     /// 已应用的 (scrcpy, server, adb) 三元组;用于文本改动后自动联动补齐
-    suite_synced: (String, String, String),
+    suite_synced: (String, String, String, String),
     /// 由[测试]/[自动寻找]检测出的版本,只读显示
     server_version: String,
     test_msg: Option<(bool, String)>,
@@ -570,6 +579,7 @@ impl PadApp {
             enabled: false,
             control: None,
             aim_live: Default::default(),
+            live: Default::default(),
             toolbar_release: false,
         }));
 
@@ -600,33 +610,35 @@ impl PadApp {
 
         // 程序级设置(scrcpy 三件套路径等):与 profile.json / look.json 同目录的 settings.json。
         // 有了它,scrcpy 目录即使不在程序同级,重启后也仍然记得,不必每次重新寻找。
-        let mut saved = settings::load().unwrap_or_default();
+        let mut saved = settings::load().unwrap_or_default();        // 先留一份"文件里原本写了什么":关掉[记住路径]时写回的内容要以它为准,
+        // 而且落盘判定也必须以磁盘上的真实内容为基准(否则"关掉开关"这一动作
+        // 永远写不出去,下次启动又变回"记住")。
+        let loaded_raw = saved.clone();
         if !saved.remember_paths {
             // 用户关掉了"记住路径":不采用其中的路径,但仍保留启动参数一类的偏好
             saved.clear_paths();
         }
         let remembered = saved.clone();
-        // 记住的路径可能早已被移动/删除:先校验,死路径一律丢弃(留空才能走自动寻找)
+        // 记住的路径可能早已被移动/删除:清掉死路径,但**保留它的位置线索**
+        // (所在目录会记进 scrcpy_dir),启动时能在那一带重新找回 scrcpy
         if saved.sanitize() && saved.remember_paths {
-            eprintln!("[settings] 已丢弃不存在的旧路径: {}", settings::path().display());
+            eprintln!(
+                "[settings] 已修正 settings.json 里的路径(死路径转为目录线索): {}",
+                settings::path().display()
+            );
         }
         let saved_args = saved.scrcpy_args.clone();
-        let settings_cache = SettingsCache::new(saved.clone());
+        let settings_cache = SettingsCache::new(loaded_raw.clone());
 
-        // 自动寻找 scrcpy 与 server:先用上次记住的路径,再自动寻找
+        // 自动寻找 scrcpy 与 server:先用上次记住的路径/目录,再自动寻找
         let (scrcpy_path, server_path, version, found_msg) = {
-            let remembered_exe = (!saved.scrcpy_path.trim().is_empty())
-                .then(|| PathBuf::from(saved.scrcpy_path.trim()));
-            let remembered_ok = remembered_exe
-                .as_ref()
-                .map(|p| p.is_file())
-                .unwrap_or(false);
-            let exe = if remembered_ok {
-                remembered_exe.clone()
-            } else {
-                adb::find_scrcpy()
+            let (remembered_exe, note) = locate_remembered_scrcpy(&saved);
+            let from_memory = remembered_exe.is_some();
+            let exe = match remembered_exe {
+                Some(p) => Some(p),
+                None => adb::find_scrcpy(),
             };
-            // server 找不到就留空:后续用户选定 scrcpy.exe 后,由 sync_suite 按其同目录
+            // server 找不到就留空:后续用户选定 scrcpy 位置后,由 sync_suite 按其同目录
             // 自动补齐(官方发行包三者同目录),避免预先填入的相对路径阻塞自动发现
             let server = if !saved.server_path.trim().is_empty() {
                 saved.server_path.trim().to_string()
@@ -639,7 +651,9 @@ impl PadApp {
                 Some(p) => {
                     let ps = p.display().to_string();
                     let v = adb::scrcpy_version_at(&ps).unwrap_or_default();
-                    let msg = if remembered_ok {
+                    let msg = if !note.is_empty() {
+                        format!("{note}(记忆来自 {})", settings::path().display())
+                    } else if from_memory {
                         format!(
                             "已使用上次记住的 scrcpy: {ps}(来自 {})",
                             settings::path().display()
@@ -653,9 +667,20 @@ impl PadApp {
                     String::new(),
                     server,
                     String::new(),
-                    "未找到 scrcpy,请在左栏手动指定路径(指定一次后会被记住)".to_string(),
+                    "未找到 scrcpy,请在左栏指定 scrcpy.exe 或它所在的目录(指定一次后会被记住)"
+                        .to_string(),
                 ),
             }
+        };
+        // 目录栏的初值:记住的目录 > 由记住的 exe 推导出的目录(都没有就留空)
+        let scrcpy_dir_init = if !saved.scrcpy_dir.trim().is_empty() {
+            saved.scrcpy_dir.trim().to_string()
+        } else {
+            PathBuf::from(scrcpy_path.trim())
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
         };
 
         // 启动时定位 adb:上次记住的手动路径 > scrcpy 同目录(官方 Windows 发行包含同目录
@@ -696,6 +721,7 @@ impl PadApp {
             look_saved: None,
             look_cache_warned: false,
             settings_cache,
+            settings_loaded: loaded_raw.clone(),
             remember_paths: remembered.remember_paths,
             _capture: capture,
             capture_err,
@@ -708,10 +734,16 @@ impl PadApp {
                 saved_args.clone()
             },
             scrcpy_path,
+            scrcpy_dir: scrcpy_dir_init,
             server_path,
             adb_path: adb_init,
             // 置空使其在首帧自动做一次全套联动补齐
-            suite_synced: (String::new(), String::new(), String::new()),
+            suite_synced: (
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ),
             applied_suite: None,
             server_version: version,
             test_msg: None,
@@ -1239,23 +1271,41 @@ impl PadApp {
 
     /// 手动改动路径的按钮(浏览/自动寻找/输入失焦)调用:强制下一帧做一次完整联动
     fn resync(&mut self) {
-        self.suite_synced = (String::new(), String::new(), String::new());
+        self.suite_synced = (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
         self.sync_suite();
     }
 
     /// 联动补齐:scrcpy.exe / scrcpy-server / adb.exe 三者任填一个,其余为空时
     /// 自动从同目录(官方 Windows 发行包三者在同一目录)推导补齐;
-    /// 生效的 adb 变化时自动刷新设备列表。每帧调用,仅在三元组文本变化时执行。
+    /// 另外"只指定了 scrcpy 目录"也走这里解析出可执行文件;
+    /// 生效的 adb 变化时自动刷新设备列表。每帧调用,仅在四元组文本变化时执行。
     fn sync_suite(&mut self) {
         let trio = (
             self.scrcpy_path.clone(),
             self.server_path.clone(),
             self.adb_path.clone(),
+            self.scrcpy_dir.clone(),
         );
         if trio == self.suite_synced {
             return;
         }
         self.suite_synced = trio;
+
+        // 0) 只给了"scrcpy 目录":先把它解析成可执行文件(用户最自然的用法)
+        if self.scrcpy_path.trim().is_empty() && !self.scrcpy_dir.trim().is_empty() {
+            let d = PathBuf::from(self.scrcpy_dir.trim());
+            if d.is_dir() {
+                if let Some(exe) = adb::find_scrcpy_under(&d, 3) {
+                    self.scrcpy_path = exe.display().to_string();
+                    self.log(format!("已按 scrcpy 目录补齐: {}", self.scrcpy_path));
+                }
+            }
+        }
 
         // 1) 由 scrcpy.exe 推导同目录/相邻的 scrcpy-server 与 adb
         let scrcpy_txt = self.scrcpy_path.trim().to_string();
@@ -1344,38 +1394,105 @@ impl PadApp {
 
     /// 把当前界面上的路径/参数打包成一份设置
     fn settings_snapshot(&self) -> Settings {
-        Settings {
+        let mut s = Settings {
             remember_paths: self.remember_paths,
             scrcpy_path: self.scrcpy_path.trim().to_string(),
+            scrcpy_dir: self.scrcpy_dir.trim().to_string(),
             server_path: self.server_path.trim().to_string(),
             adb_path: self.adb_path.trim().to_string(),
             scrcpy_args: self.scrcpy_args.trim().to_string(),
             selected_serial: self.serial(),
             saved_at: 0,
+        };
+        if !self.remember_paths {
+            // 关掉[记住路径]的语义是"下次启动不再使用",**不是**"把文件清空":
+            // 路径文本原样保留,免得开关来回拨一次就把辛苦找好的 scrcpy 位置弄丢。
+            s.scrcpy_path = self.settings_loaded.scrcpy_path.clone();
+            s.scrcpy_dir = self.settings_loaded.scrcpy_dir.clone();
+            s.server_path = self.settings_loaded.server_path.clone();
+            s.adb_path = self.settings_loaded.adb_path.clone();
         }
+        s
     }
 
-    /// 登记"路径需要记住"(帧末统一写盘,内容未变则跳过)
+    /// 登记"路径需要记住"(帧末统一写盘,内容未变则跳过)。
+    ///
+    /// 注意:**即使关掉了[记住路径]也要登记**。开关状态本身就是设置的一部分,
+    /// 早退不写会导致"我明明关掉了,下次启动它又自己打开了,还把旧路径读了回来"。
     fn remember_now(&mut self) {
-        if !self.remember_paths {
-            return;
-        }
         // 时间戳由 settings::save_if_dirty 在真正落盘时打,这里传 0 即可
         self.settings_cache.mark_dirty(self.settings_snapshot());
     }
 
-    /// 帧末落盘:写在配置目录的 settings.json 里,与主题(look.json)同一目录
-    fn persist_settings(&mut self) {
+    /// 立刻把设置写入磁盘并给出明确日志。
+    ///
+    /// 帧末也会存一次,但"用户刚设置好 scrcpy 目录"这种关键时刻必须当场确认:
+    /// 用户反馈过"设置好了、重启却依旧没被记住",而日志里看不出到底写没写。
+    fn save_settings_now(&mut self) {
+        self.remember_now();
         if !self.remember_paths {
+            // 开关本身照写(否则下次启动又变回"记住"),但要说清路径没有被存
+            let flag = self.settings_cache.save_if_dirty();
+            if let Some(Err(e)) = flag {
+                self.log(format!("设置保存失败({e})"));
+            }
+            self.log(format!(
+                "当前未勾选[记住路径]: 路径不会写入 {}(勾选后会自动补存)",
+                settings::path().display()
+            ));
             return;
         }
         match self.settings_cache.save_if_dirty() {
             Some(Ok(p)) => self.log(format!("设置已保存: {}", p.display())),
-            Some(Err(e)) => {
-                self.log(format!("设置保存失败({e}),本次改动只在本次运行内有效"));
-            }
-            None => {}
+            Some(Err(e)) => self.log(format!("设置保存失败({e}),本次改动只在本次运行内有效")),
+            None => self.log(format!(
+                "设置内容未变,无需写盘: {}",
+                settings::path().display()
+            )),
         }
+    }
+
+    /// 帧末落盘:写在配置目录的 settings.json 里,与主题(look.json)同一目录。
+    /// 成功时**不**打日志(路径栏边打边存,每敲一个字符都会写一次,刷屏没意义);
+    /// 失败必须说,否则用户以为记住了、其实没有。
+    fn persist_settings(&mut self) {
+        if let Some(Err(e)) = self.settings_cache.save_if_dirty() {
+            self.log(format!("设置保存失败({e}),本次改动只在本次运行内有效"));
+        }
+    }
+
+    /// 按"scrcpy 目录"补齐三件套(用户最自然的用法:直接指给它发行包那个文件夹)
+    fn apply_scrcpy_dir(&mut self) {
+        let dir = self.scrcpy_dir.trim().to_string();
+        if dir.is_empty() {
+            self.log("请先填写或选择 scrcpy 所在目录");
+            return;
+        }
+        let d = PathBuf::from(&dir);
+        if !d.is_dir() {
+            self.log(format!("不是有效目录: {dir}"));
+            return;
+        }
+        self.scrcpy_dir = dir.clone();
+        match adb::find_scrcpy_under(&d, 3) {
+            Some(exe) => {
+                self.scrcpy_path = exe.display().to_string();
+                if let Some(s) = adb::find_server(Some(&exe)) {
+                    self.server_path = s.display().to_string();
+                }
+                if let Some(a) = adb::find_adb(Some(&exe)) {
+                    self.adb_path = a.display().to_string();
+                }
+                self.log(format!("已按目录补齐 scrcpy: {}", self.scrcpy_path));
+            }
+            None => self.log(format!(
+                "该目录里没有找到 {}(可以直接指定 scrcpy 可执行文件本身): {dir}",
+                adb::scrcpy_exe_name()
+            )),
+        }
+        self.resync();
+        self.test_scrcpy();
+        self.save_settings_now();
     }
 
     /// 在系统文件管理器里打开配置目录(找不到文件管理器时退回日志提示)
@@ -1550,20 +1667,36 @@ impl eframe::App for PadApp {
                     (_, None) => self.log("已取消"),
                     (DialogPurpose::ScrcpyExe, Some(p)) => {
                         self.scrcpy_path = p.display().to_string();
-                        self.log(format!("已选择 scrcpy: {}", self.scrcpy_path));
-                        self.resync();
-                        self.test_scrcpy();
+                        // 选中的是**目录**时(有些系统对话框允许选中文件夹)按目录处理
+                        if PathBuf::from(&self.scrcpy_path).is_dir() {
+                            self.scrcpy_dir = self.scrcpy_path.clone();
+                            self.scrcpy_path.clear();
+                            self.apply_scrcpy_dir();
+                        } else {
+                            self.log(format!("已选择 scrcpy: {}", self.scrcpy_path));
+                            self.resync();
+                            self.test_scrcpy();
+                            // 选完立刻落盘并写日志:用户最在意的就是"这次到底记住了没有"
+                            self.save_settings_now();
+                        }
+                    }
+                    (DialogPurpose::ScrcpyDir, Some(p)) => {
+                        self.scrcpy_dir = p.display().to_string();
+                        self.log(format!("已选择 scrcpy 目录: {}", self.scrcpy_dir));
+                        self.apply_scrcpy_dir();
                     }
                     (DialogPurpose::ServerJar, Some(p)) => {
                         self.server_path = p.display().to_string();
                         self.log(format!("已选择 server: {}", self.server_path));
                         self.resync();
                         self.test_scrcpy();
+                        self.save_settings_now();
                     }
                     (DialogPurpose::AdbExe, Some(p)) => {
                         self.adb_path = p.display().to_string();
                         self.log(format!("已选择 adb: {}", self.adb_path));
                         self.resync();
+                        self.save_settings_now();
                     }
                     (DialogPurpose::SaveLog, Some(p)) => {
                         let content = self.pending_log.take().unwrap_or_default();
@@ -1901,12 +2034,25 @@ impl eframe::App for PadApp {
                          轮盘:永久轮盘始终生效;\n\
                          设置[启用键]后变临时轮盘\n\
                          (长按启用 / 再按切换),\n\
-                         启用期间方向键归摇杆\n\
-                          \n\
-                          轮盘影响范围:决定方向键按下后手指\n\
-                          实际被推多远(= 半径 × 系数);界面上\n\
-                          的圈仍是半径,两者不同时会多画一圈\n\
-                          橙色虚线显示真实推出距离\n\
+                         启用期间方向键归摇杆;\n\
+                         松开[启用键]的瞬间,还按着的键立刻\n\
+                         恢复成普通功能(不必松手再按一次),\n\
+                         启用期间按着的方向键也会立刻推动摇杆;\n\
+                         [添加轮盘]新建的摇杆半径固定 150px,\n\
+                         并自动落在不与已有摇杆重叠的位置\n\
+                         (画布上的编号与列表里的轮盘N一一对应)\n\
+                         \n\
+                         轮盘影响范围:决定方向键按下后手指\n\
+                         实际被推多远(= 半径 × 系数);界面上\n\
+                         的圈仍是半径,两者不同时会多画一圈\n\
+                         橙色虚线显示真实推出距离\n\
+                         \n\
+                         键位显示亮度([外观]里):\n\
+                         截图上的键位/摇杆响应圈可加深也可\n\
+                         变浅(往左加深/往右变浅),背景太亮\n\
+                         看不清键位时用它;只改明暗不改色相,\n\
+                         摇杆的圆环+圆心+方向标注结构不变,\n\
+                         标注自带对比描边,深浅都读得清\n\
                          \n\
                          图层:截图上方[显示]可只看\n\
                          键位/轮盘/永久/临时/锚点(FPS)\n\
@@ -1922,14 +2068,24 @@ impl eframe::App for PadApp {
                          开打后 Ctrl+Alt 把鼠标交还系统,再按收回\n\
                          面板顶部会自检并显示当前触摸坐标空间\n\
                          \n\
-                         scrcpy 管理:自动寻找/测试并刷新;\n\
-                         勾选[记住路径]后 scrcpy/server/adb\n\
-                         路径与启动参数存进配置目录的\n\
-                         settings.json,重启后直接生效,\n\
-                         不必重新寻找([打开配置目录]可查看);\n\
+                         scrcpy 管理:可以直接指定 scrcpy 所在\n\
+                         **目录**(最省事,填一个就够),[自动寻找\n\
+                         全部]/[测试并刷新]也可;\n\
+                         勾选[记住路径]后 scrcpy 目录/路径、\n\
+                         server/adb 与启动参数存进配置目录的\n\
+                         settings.json,重启后直接生效,不必\n\
+                         重新寻找([打开配置目录]可查看);\n\
+                         路径被搬走也不会丢:程序会记住它的\n\
+                         所在目录,下次启动在那附近重新找回;\n\
                          scrcpy参数旁的[...]是常用参数助手\n\
                          (含中文说明与 GitHub 链接);\n\
                          [启动预设]可选 2K/4K/1K/720P 与音频开关\n\
+                         \n\
+                         引擎状态(左栏):显示此刻占用的触点数\n\
+                         (设备端最多 10 个,键位/摇杆/瞄准共用)\n\
+                         与「因为挤不进去而被放弃的按下次数」。\n\
+                         若这个数不为 0,那一次按下会被设备丢掉\n\
+                         (表现为按了没反应),此时少按几个键即可\n\
                          \n\
                          快捷键(键位捕获/取点/打字时不生效):\n\
                          Ctrl+Z 撤销 ⟳重做用 Ctrl+Y\n\
@@ -1947,6 +2103,8 @@ impl eframe::App for PadApp {
                          密度可选紧凑/标准/宽松;\n\
                          可设置背景图片(铺满/完整/平铺)\n\
                          与暗化遮罩、面板不透明度;\n\
+                         [键位显示亮度]单独调截图上键位圈\n\
+                         与摇杆圈的明暗(见上文);\n\
                          外观随配置保存,[选用配置]会一并切换;\n\
                          另外还会自动缓存到程序目录(与键位\n\
                          配置同目录的 look.json),重启后保持\n\
@@ -2044,21 +2202,82 @@ impl eframe::App for PadApp {
                         "映射时屏蔽原键(grab)\n注意:开启后映射期间键盘只对本程序生效",
                     );
 
+                    // 引擎运行状态:把"按了没反应"的原因直接摆出来
+                    {
+                        let g = self.shared.lock().unwrap();
+                        let st = g.live;
+                        let th = g.profile.look.theme();
+                        let max = crate::engine::DEVICE_MAX_POINTERS;
+                        let (color, tail) = if st.refused > 0 {
+                            (
+                                th.warn,
+                                format!(
+                                    "(最近被放弃的是 {})",
+                                    if st.last_refused == 0 {
+                                        "瞄准".to_string()
+                                    } else {
+                                        key_name(st.last_refused)
+                                    }
+                                ),
+                            )
+                        } else {
+                            (th.muted, String::new())
+                        };
+                        ui.colored_label(
+                            color,
+                            format!("引擎: 触点 {}/{} · 因触点池满被放弃 {} 次{tail}", st.pointers, max, st.refused),
+                        )
+                        .on_hover_text(
+                            "设备端同时最多认 10 个触点(普通键位 + 摇杆 + 瞄准共用)。\n\
+                             这里显示此刻占用了几个。\n\
+                             若『被放弃』不为 0,说明某一刻同时按住的键比设备能接的还多 ——\n\
+                             那一次按下会被设备直接丢掉(表现为『按了没反应』),日志里也会记。",
+                        );
+                    }
+
                     ui.separator();
                     ui.heading("scrcpy 管理");
                     ui.small(
-                        "官方 Windows 包里 scrcpy.exe、scrcpy-server、adb.exe 三者同目录:\n填好任意一个,其余留空会自动补齐。",
+                        "官方 Windows 包里 scrcpy.exe、scrcpy-server、adb.exe 三者同目录。\n\
+                         可以直接指定 scrcpy 所在**目录**(最省事),也可以只填其中一个文件,\n\
+                         其余留空会自动补齐。",
                     );
+                    // scrcpy 目录:用户最自然的用法就是把发行包那个文件夹指给它
+                    ui.horizontal(|ui| {
+                        ui.label("scrcpy 目录");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.scrcpy_dir)
+                                .desired_width(220.0)
+                                .hint_text("例如 D:\\scrcpy-win64-v3.3"),
+                        );
+                        if ui.small_button("浏览目录").clicked() {
+                            self.dialog = Some(crate::filedialog::pick_folder());
+                            self.dialog_purpose = DialogPurpose::ScrcpyDir;
+                        }
+                        if ui
+                            .small_button("应用")
+                            .on_hover_text("按这个目录补齐 scrcpy / server / adb")
+                            .clicked()
+                        {
+                            self.apply_scrcpy_dir();
+                        }
+                    });
                     ui.horizontal(|ui| {
                         if ui.button("自动寻找全部").clicked() {
                             match adb::find_scrcpy() {
                                 Some(p) => {
                                     self.scrcpy_path = p.display().to_string();
+                                    if let Some(d) = PathBuf::from(&self.scrcpy_path).parent() {
+                                        self.scrcpy_dir = d.display().to_string();
+                                    }
                                     self.log(format!("已找到 scrcpy: {}", self.scrcpy_path));
                                     self.resync();
                                     self.test_scrcpy();
+                                    self.save_settings_now();
                                 }
-                                None => self.log("未找到 scrcpy,请手动指定其所在目录"),
+                                None => {
+                                    self.log("未找到 scrcpy,请手动指定它所在目录或 scrcpy.exe")
+                                }
                             }
                         }
                         if ui.button("测试并刷新").clicked() {
@@ -2084,17 +2303,20 @@ impl eframe::App for PadApp {
                         if ui
                             .checkbox(&mut self.remember_paths, "记住路径(下次启动直接用)")
                             .on_hover_text(
-                                "把 scrcpy / scrcpy-server / adb 路径与启动参数存到配置目录的 settings.json,\
-                                 即使 scrcpy 目录不在程序同级,重启后也不必重新寻找。",
+                                "把 scrcpy / scrcpy-server / adb 路径、scrcpy 目录与启动参数存到\n\
+                                 配置目录的 settings.json,即使 scrcpy 目录不在程序同级,\n\
+                                 重启后也不必重新寻找。关掉它只是『下次启动不再使用』,\n\
+                                 文件里已记住的路径会保留。",
                             )
                             .changed()
                         {
                             if self.remember_paths {
                                 self.log("已开启记住路径: 本次路径将写入 settings.json");
-                                self.remember_now();
                             } else {
-                                self.log("已关闭记住路径: 不再写入 settings.json(旧内容保留但不再读取)");
+                                self.log("已关闭记住路径: 下次启动不再使用其中的路径(文件里已记住的内容保留)");
                             }
+                            // 开关状态本身立刻落盘,免得下次启动又变回上一次的样子
+                            self.save_settings_now();
                         }
                         if ui
                             .small_button("打开配置目录")
@@ -2801,18 +3023,26 @@ impl PadApp {
         }
         if ui.button("添加轮盘").clicked() {
             self.push_undo();
-            self.shared.lock().unwrap().profile.wheels.push(Wheel {
-                up: 17,
-                down: 31,
-                left: 30,
-                right: 32,
-                // 相对坐标:左下角偏内(与默认配置一致)
-                cx: 0.278,
-                cy: 0.375,
-                radius: 0.111,
-                scope: crate::keymap::DEFAULT_WHEEL_SCOPE,
-                temp: None,
-            });
+            // 半径固定 150px、落点避开已有摇杆(见 keymap::Wheel::new_default /
+            // next_wheel_spot):新建出来的摇杆不该比用户辛苦调小的那个大一圈,
+            // 也不该叠在别的摇杆上让人分不清
+            let m = self.mapper();
+            let (cx, cy) = {
+                let g = self.shared.lock().unwrap();
+                crate::keymap::next_wheel_spot(&g.profile.wheels)
+            };
+            let wheel = Wheel::new_default(&m, cx, cy);
+            let r_px = m.len(wheel.radius);
+            let n = {
+                let mut g = self.shared.lock().unwrap();
+                g.profile.wheels.push(wheel);
+                g.profile.wheels.len()
+            };
+            self.log(format!(
+                "已添加轮盘 {n}(半径 {r_px:.0}px,圆心 {:.0}%,{:.0}%)",
+                cx * 100.0,
+                cy * 100.0
+            ));
         }
     }
 
@@ -2830,6 +3060,9 @@ impl PadApp {
         let m = self.mapper();
         let g = self.shared.lock().unwrap();
         let th = g.profile.look.theme();
+        // 键位浮层的显示亮度档位(0=默认;负=加深,正=变浅)。
+        // 背景/游戏画面很亮时把圈加深、昏暗时变浅,键位才看得清(用户诉求)。
+        let tone = g.profile.look.overlay_tone;
 
         // 键位(含草稿标记)仅在"全部/仅键位"时显示
         if matches!(self.overlay_filter, OverlayFilter::All | OverlayFilter::Keys) {
@@ -2852,14 +3085,16 @@ impl PadApp {
                         } else {
                             (th.key_hold, th.key_hold_fill)
                         };
+                        let (ring, fill) = theme::tone_ring_fill(ring, fill, tone);
                         painter.circle_filled(p, r, fill);
                         painter.circle_stroke(p, r, Stroke::new(size::KEY_STROKE, ring));
-                        painter.text(
+                        theme::paint_label(
+                            painter,
                             p,
                             Align2::CENTER_CENTER,
-                            short_name(b.key),
+                            &short_name(b.key),
                             FontId::proportional(size::KEY_FONT),
-                            theme::outline_text(),
+                            theme::tone_text(tone),
                         );
                     }
                     Action::Swipe(s) => {
@@ -2874,6 +3109,7 @@ impl PadApp {
                             &to_screen,
                             scale,
                             &short_name(b.key),
+                            tone,
                         );
                     }
                     Action::AndroidKey { .. } => {}
@@ -2898,18 +3134,24 @@ impl PadApp {
                         &to_screen,
                         scale,
                         "新增",
+                        tone,
                     );
                 }
                 1 => {
                     let dp = to_screen(self.draft.x, self.draft.y);
                     let r = self.draft.radius * scale;
-                    painter.circle_stroke(dp, r, Stroke::new(size::KEY_STROKE, th.draft));
-                    painter.text(
+                    painter.circle_stroke(
+                        dp,
+                        r,
+                        Stroke::new(size::KEY_STROKE, theme::tone_color(th.draft, tone)),
+                    );
+                    theme::paint_label(
+                        painter,
                         dp + vec2(0.0, r + 10.0),
                         Align2::CENTER_CENTER,
                         "新增",
                         FontId::proportional(size::SMALL_FONT),
-                        th.draft,
+                        theme::tone_color(th.draft, tone),
                     );
                 }
                 _ => {}
@@ -2922,7 +3164,7 @@ impl PadApp {
         {
             let aim = &g.profile.aim;
             let p = to_screen(m.x(aim.anchor_x), m.y(aim.anchor_y));
-            let c = th.aim;
+            let c = theme::tone_color(th.aim, tone);
             let thin = Stroke::new(1.0, c);
             // 阈值归中时,先把触发归中的偏移范围画成虚线圆,便于对照调参
             if aim.recenter == RecenterMode::Threshold {
@@ -2956,18 +3198,19 @@ impl PadApp {
             } else {
                 format!("瞄准锚点 [{}]", key_name(aim.hold_key))
             };
-            painter.text(
+            theme::paint_label(
+                painter,
                 p + vec2(0.0, -(arm + 6.0)),
                 Align2::CENTER_CENTER,
-                label,
+                &label,
                 FontId::proportional(size::LABEL_FONT),
-                c,
+                theme::tone_text(tone),
             );
         }
 
         // 轮盘按过滤条件显示;临时轮盘用虚线圆环区分
         if !matches!(self.overlay_filter, OverlayFilter::Keys | OverlayFilter::Aim) {
-            for w in &g.profile.wheels {
+            for (wi, w) in g.profile.wheels.iter().enumerate() {
                 let show = match self.overlay_filter {
                     OverlayFilter::PermWheels => w.temp.is_none(),
                     OverlayFilter::TempWheels => w.temp.is_some(),
@@ -2994,9 +3237,12 @@ impl PadApp {
                     short_name(w.down),
                     short_name(w.right)
                 );
+                // 编号与列表里的"轮盘N"一一对应:两个摇杆方向键相同时,只靠方向键
+                // 根本分不清画面上哪一圈是哪一个(用户反馈过"新旧摇杆换位"的困惑)
+                let idx_label = format!("{}", wi + 1);
                 if let Some(t) = &w.temp {
-                    // 临时轮盘:虚线圆环
-                    let color = th.wheel_temp;
+                    // 临时轮盘:虚线圆环(摇杆的视觉结构不变,只按亮度档位调明暗)
+                    let color = theme::tone_color(th.wheel_temp, tone);
                     let n = 48;
                     let pts: Vec<egui::Pos2> = (0..=n)
                         .map(|i| {
@@ -3010,34 +3256,46 @@ impl PadApp {
                         painter.add(shape);
                     }
                     painter.circle_filled(c, 5.0, color);
-                    painter.circle_stroke(c, size::WHEEL_RING, theme::outline_stroke(1.0));
+                    // 圆心那个小圈是"摇杆"观感的关键:它让圆心看起来是个可推的摇杆头,
+                    // 所以无论亮度档位怎么调都保留(只跟着一起调明暗)
+                    painter.circle_stroke(
+                        c,
+                        size::WHEEL_RING,
+                        Stroke::new(1.0, theme::tone_color(egui::Color32::WHITE, tone)),
+                    );
                     let mode = match t.mode {
                         TempMode::Hold => "按住",
                         TempMode::Toggle => "切换",
                     };
-                    painter.text(
+                    theme::paint_label(
+                        painter,
                         c - vec2(0.0, r + 14.0),
                         Align2::CENTER_CENTER,
-                        format!(
-                            "临时摇杆[{}·{}] {dirs_label}{scope_txt}",
+                        &format!(
+                            "临时摇杆{idx_label}[{}·{}] {dirs_label}{scope_txt}",
                             short_name(t.key),
                             mode
                         ),
                         FontId::proportional(size::LABEL_FONT),
-                        th.wheel_perm,
+                        theme::tone_text(tone),
                     );
                 } else {
                     // 永久轮盘:实线圆环
-                    let color = th.wheel_perm;
+                    let color = theme::tone_color(th.wheel_perm, tone);
                     painter.circle_stroke(c, r, Stroke::new(size::KEY_STROKE, color));
                     painter.circle_filled(c, 5.0, color);
-                    painter.circle_stroke(c, size::WHEEL_RING, theme::outline_stroke(1.0));
-                    painter.text(
+                    painter.circle_stroke(
+                        c,
+                        size::WHEEL_RING,
+                        Stroke::new(1.0, theme::tone_color(egui::Color32::WHITE, tone)),
+                    );
+                    theme::paint_label(
+                        painter,
                         c - vec2(0.0, r + 14.0),
                         Align2::CENTER_CENTER,
-                        format!("摇杆 {dirs_label}{scope_txt}"),
+                        &format!("摇杆{idx_label} {dirs_label}{scope_txt}"),
                         FontId::proportional(size::LABEL_FONT),
-                        color,
+                        theme::tone_text(tone),
                     );
                 }
                 // 影响范围外环(橙色虚线):只在与半径明显不同时绘制,
@@ -3052,18 +3310,19 @@ impl PadApp {
                         .collect();
                     for shape in egui::Shape::dashed_line(
                         &pts,
-                        Stroke::new(1.5, th.key_hold),
+                        Stroke::new(1.5, theme::tone_color(th.key_hold, tone)),
                         7.0,
                         6.0,
                     ) {
                         painter.add(shape);
                     }
-                    painter.text(
+                    theme::paint_label(
+                        painter,
                         c + vec2(0.0, push_r + 12.0),
                         Align2::CENTER_CENTER,
-                        format!("影响范围 {push_r:.0}px(×{scope:.2})"),
+                        &format!("影响范围 {push_r:.0}px(×{scope:.2})"),
                         FontId::proportional(size::SMALL_FONT),
-                        th.key_hold,
+                        theme::tone_text(tone),
                     );
                 }
             }
@@ -3272,17 +3531,36 @@ impl PadApp {
         }
     }
 
-    /// 设备屏幕尺寸:优先已连接控制通道的尺寸,其次截图尺寸
+    /// **界面/画布**用的坐标空间:优先截图尺寸,其次控制通道尺寸。
+    ///
+    /// 为什么优先截图:键位浮层是画在截图上的,用截图自己的尺寸换算,
+    /// "画的圈"与"看到的图"才永远对齐。以前优先取控制通道尺寸,而那个尺寸会在
+    /// 连接控制、手机转屏、后台刷新时改变 —— 于是同一个摇杆会**毫无征兆地突然变大
+    /// 或移位**(用户反馈"创建新摇杆的时候,旧的摇杆会瞬间变大")。
+    /// 注入使用的坐标空间由引擎按控制通道尺寸单独计算,不受这里影响。
     fn screen_size(&self) -> Option<(u32, u32)> {
-        {
-            let g = self.shared.lock().unwrap();
-            if let Some(c) = g.control.as_ref() {
-                if c.screen_w > 0 && c.screen_h > 0 {
-                    return Some((c.screen_w, c.screen_h));
-                }
+        if let Some((_, w, h)) = self.shot.as_ref() {
+            if *w > 0 && *h > 0 {
+                return Some((*w, *h));
             }
         }
-        self.shot.as_ref().map(|(_, w, h)| (*w, *h))
+        let g = self.shared.lock().unwrap();
+        if let Some(c) = g.control.as_ref() {
+            if c.screen_w > 0 && c.screen_h > 0 {
+                return Some((c.screen_w, c.screen_h));
+            }
+        }
+        None
+    }
+
+    /// **注入**用的坐标空间(引擎实际使用的那个):控制通道的尺寸。
+    /// 仅用于界面提示 —— 截图与它不一致时,取点会不准。
+    fn inject_space(&self) -> Option<(u32, u32)> {
+        let g = self.shared.lock().unwrap();
+        g.control
+            .as_ref()
+            .map(|c| (c.screen_w, c.screen_h))
+            .filter(|(w, h)| *w > 0 && *h > 0)
     }
 
     /// 坐标换算器:配置坐标(相对值) <-> 当前屏幕像素。
@@ -3441,6 +3719,25 @@ impl PadApp {
                 if r.drag_started() || r.gained_focus() {
                     edit = true;
                 }
+            }
+            // 键位显示亮度:截图上键位/摇杆的响应范围圈与标注可加深也可变浅。
+            // 这是"游戏画面很亮、圈看不清"的直接解法(与背景图无关,所以放在 if 外面)。
+            let r = ui
+                .add(
+                    egui::Slider::new(
+                        &mut look.overlay_tone,
+                        theme::TONE_MIN..=theme::TONE_MAX,
+                    )
+                    .text("键位显示亮度"),
+                )
+                .on_hover_text(
+                    "调整截图上键位/摇杆响应范围圈与标注的明暗:\n\
+                     往左=加深(适合明亮的游戏画面),往右=变浅(适合昏暗画面),0=默认。\n\
+                     只改明暗、不改色相:点按绿/长按橙/永久摇杆青/临时摇杆品红照样分得清,\n\
+                     摇杆的圆环 + 圆心小圈 + 方向标注也原样保留。",
+                );
+            if r.drag_started() || r.gained_focus() {
+                edit = true;
             }
             ui.small("外观随配置保存;[选用配置]会一并切换外观");
         }
@@ -3953,12 +4250,32 @@ impl PadApp {
             }
         });
 
+        // 截图方向/尺寸与当前触摸坐标空间不一致时(手机转过屏、或截图是上一次
+        // 方向下截的)必须说清楚:浮层按**截图**绘制(所以画得对),但注入按
+        // **坐标空间**走 —— 这种状态下取点会落偏,重新截一张即可恢复。
+        if let Some((_, sw, sh)) = self.shot.as_ref().map(|(t, w, h)| (t.id(), *w, *h)) {
+            if let Some((iw, ih)) = self.inject_space() {
+                if (iw, ih) != (sw, sh) {
+                    ui.colored_label(
+                        self.theme().warn,
+                        format!(
+                            "注意: 截图是 {sw}x{sh},当前触摸坐标空间是 {iw}x{ih}(手机转过屏?)\n\
+                             浮层按截图绘制,注入却按坐标空间走 —— 建议重新[截取手机屏幕]后再取点"
+                        ),
+                    );
+                }
+            }
+        }
+
         let shot = self.shot.as_ref().map(|(t, w, h)| (t.id(), *w, *h));
         if let Some((tex_id, w, h)) = shot {
             let avail = ui.available_width();
-            // 纵向截图很窄,以前按高度硬压到 500px 会缩得几乎没有操作空间;
-            // 改为优先铺满可用宽度,只在过高时按可视高度的 2 倍兜底(超出部分滚动看)。
-            let max_h = (ui.available_height().max(320.0) * 2.0).max(500.0);
+            // 缩放系数只能跟"窗口高度 + 截图尺寸"有关。以前用当前剩余高度算,
+            // 右侧多出一行轮盘设置就会让 available_height 变化,整张浮层跟着一起
+            // 缩放(这也是"摇杆突然变大"的观感来源之一);改成按窗口高度算,
+            // 窗口不变时同一张截图的缩放系数恒定。
+            let win_h = ui.ctx().content_rect().height();
+            let max_h = (win_h * 2.0).max(500.0);
             let scale = (avail / w as f32).min(1.0).min(max_h / h as f32);
             let size = egui::vec2(w as f32 * scale, h as f32 * scale);
             // 取点或修改响应范围时需要拖拽响应
@@ -4073,20 +4390,87 @@ fn look_cache_path() -> PathBuf {
 
 /// 读取外观缓存;不存在或内容损坏时返回 None(退回配置里的外观)
 fn load_look_cache() -> Option<theme::Look> {
-    let text = std::fs::read_to_string(look_cache_path()).ok()?;
-    serde_json::from_str(&text).ok()
+    let path = look_cache_path();
+    let text = read_config_text(&path)?;
+    match serde_json::from_str::<theme::Look>(&text) {
+        Ok(l) => Some(l),
+        Err(e) => {
+            eprintln!("[look] {} 解析失败({e}),改用配置里的外观", path.display());
+            backup_broken_config(&path);
+            None
+        }
+    }
 }
 
 fn load_profile() -> Option<Profile> {
     let path = profile_path();
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    let text = read_config_text(&path)?;
+    match serde_json::from_str::<Profile>(&text) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("[profile] {} 解析失败({e}),改用默认配置", path.display());
+            backup_broken_config(&path);
+            None
+        }
+    }
+}
+
+/// 读取配置文件文本,容忍 UTF-8 BOM。
+///
+/// 必要性:Windows 上记事本/若干编辑器保存 UTF-8 时会加上 BOM(EF BB BF),
+/// 而 BOM 会让 serde_json 直接解析失败 —— 程序于是悄悄退回默认值,
+/// 并在下一次落盘时**把用户原本的内容整份覆盖掉**。
+/// 用户反馈的"我设置好 scrcpy 目录后,settings.json 里根本没有位置信息"
+/// 正是这一类的表现;一个字节的差别不该毁掉整份配置,所以读进来先去掉它。
+pub(crate) fn read_config_text(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    Some(match text.strip_prefix('\u{feff}') {
+        Some(rest) => rest.to_string(),
+        None => text,
+    })
+}
+
+/// 配置解析失败时把原文件另存一份(`xxx.json` -> `xxx.json.broken`)。
+///
+/// 为什么:解析失败后程序按默认值运行,而帧末的"内容变了就落盘"会把默认值
+/// 写回同一个文件 —— 用户辛苦配的内容就此消失。先留个副本,至少还能捞回来。
+pub(crate) fn backup_broken_config(path: &Path) {
+    if path.is_file() {
+        let _ = std::fs::copy(path, path.with_extension("json.broken"));
+    }
 }
 
 /// 读取并严格校验任意路径下的键位 json;返回详细中文错误便于排查
 fn read_profile_at(path: &std::path::Path) -> Result<Profile, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("读取失败: {e}"))?;
+    let text = read_config_text(path).ok_or_else(|| "读取失败".to_string())?;
     serde_json::from_str(&text).map_err(|e| format!("不是合法的键位 json: {e}"))
+}
+
+/// 按记住的设置定位 scrcpy 可执行文件。返回 (可执行文件, 额外说明)。
+///
+/// 三级兜底,专门对付"设置过了、重启还是找不到":
+///   ① 记住的路径本身能解析出可执行文件(**目录也算**,里面找 scrcpy.exe);
+///   ② 到记住的目录(以及上次 exe 的所在目录)里重新找一遍
+///      —— 换版本时目录名会变(scrcpy-win64-v3.1 → v3.3)、解压时多套一层,
+///      只要基准目录没变就还能找回来;
+///   ③ 交给调用方走自动寻找。
+fn locate_remembered_scrcpy(remembered: &Settings) -> (Option<PathBuf>, String) {
+    if let Some(p) = adb::find_scrcpy_explicit(&remembered.scrcpy_path) {
+        return (Some(p), String::new());
+    }
+    // 记住的目录可能是发行包目录本身,也可能是"解压到某个文件夹"的那一层 ——
+    // find_scrcpy_under 两种都认,且只往名字像 scrcpy 的子目录里下探
+    for dir in remembered.search_dirs() {
+        let d = PathBuf::from(&dir);
+        if let Some(p) = adb::find_scrcpy_under(&d, 3) {
+            return (
+                Some(p),
+                format!("已在记住的目录里重新找到 scrcpy: {}", d.display()),
+            );
+        }
+    }
+    (None, String::new())
 }
 
 /// 向指定路径写入全新默认配置(父目录不存在则自动创建)
@@ -4331,7 +4715,7 @@ fn swipe_controls(
 }
 
 /// 在截图上绘制滑动轨迹示意:边界实色、内部半透明,尽量不遮挡截图内容。
-/// 入参为像素坐标(调用方负责从配置的相对坐标换算)。
+/// 入参为像素坐标(调用方负责从配置的相对坐标换算);`tone` 是键位显示亮度档位。
 fn draw_swipe_track<F: Fn(i32, i32) -> egui::Pos2>(
     painter: &egui::Painter,
     th: &Theme,
@@ -4341,6 +4725,7 @@ fn draw_swipe_track<F: Fn(i32, i32) -> egui::Pos2>(
     to_screen: &F,
     scale: f32,
     label: &str,
+    tone: f32,
 ) {
     use egui::{Align2, FontId, Stroke};
     let pts: Vec<egui::Pos2> = crate::keymap::swipe_points(path, start, end, 64)
@@ -4350,8 +4735,8 @@ fn draw_swipe_track<F: Fn(i32, i32) -> egui::Pos2>(
     if pts.len() < 2 {
         return;
     }
-    let edge = Stroke::new(theme::size::KEY_STROKE, th.swipe);
-    let fill = theme::with_alpha(th.swipe, 40);
+    let (edge_color, fill) = theme::tone_ring_fill(th.swipe, theme::with_alpha(th.swipe, 40), tone);
+    let edge = Stroke::new(theme::size::KEY_STROKE, edge_color);
     match path {
         SwipePath::Line => {
             painter.add(egui::Shape::line(pts.clone(), Stroke::new(10.0, fill)));
@@ -4375,12 +4760,13 @@ fn draw_swipe_track<F: Fn(i32, i32) -> egui::Pos2>(
     }
     let p0 = pts[0];
     painter.circle_stroke(p0, 12.0, edge);
-    painter.text(
+    theme::paint_label(
+        painter,
         p0,
         Align2::CENTER_CENTER,
         label,
         FontId::proportional(theme::size::SMALL_FONT),
-        theme::outline_text(),
+        theme::tone_text(tone),
     );
 }
 
@@ -4404,4 +4790,76 @@ fn draw_easing_preview(ui: &mut egui::Ui, e: Easing) {
         })
         .collect();
     painter.add(egui::Shape::line(pts, egui::Stroke::new(2.0, accent)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归:"设置好 scrcpy 目录后,再次启动依旧找不到 scrcpy"。
+    ///
+    /// 这个测试完整走一遍启动时的定位逻辑:把官方发行包的布局
+    /// (scrcpy.exe / scrcpy-server / adb.exe 同目录)造在临时目录里,
+    /// 然后分别以"记住的是目录""记住的是 exe""exe 被换版本改名了"三种情况
+    /// 检查程序是否还能把它找回来。
+    #[test]
+    fn remembered_scrcpy_location_survives_restart_and_move() {
+        let root = std::env::temp_dir().join(format!("scrcpy-pad-app-locate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pkg = root.join("scrcpy-win64-v3.3.3");
+        std::fs::create_dir_all(&pkg).unwrap();
+        let exe = pkg.join(adb::scrcpy_exe_name());
+        std::fs::write(&exe, b"x").unwrap();
+        std::fs::write(pkg.join("scrcpy-server"), b"x").unwrap();
+        std::fs::write(pkg.join(adb::adb_exe_name()), b"x").unwrap();
+
+        // ① 记住的是**目录**(用户嘴里就是"scrcpy 目录")
+        let mut s = Settings {
+            scrcpy_dir: pkg.display().to_string(),
+            ..Settings::default()
+        };
+        s.sanitize();
+        assert_eq!(locate_remembered_scrcpy(&s).0, Some(exe.clone()));
+
+        // ② 记住的是可执行文件本身
+        let mut s = Settings {
+            scrcpy_path: exe.display().to_string(),
+            ..Settings::default()
+        };
+        s.sanitize();
+        assert_eq!(locate_remembered_scrcpy(&s).0, Some(exe.clone()));
+
+        // ③ 升级 scrcpy:把新版本解压到旁边、删掉旧版本目录。
+        //    记住的 exe 路径与它的**父目录**都没了 —— 必须靠"再上一级"这条线索
+        //    把新版本找回来(用户反馈正是"重启后依旧找不到")。
+        let newer = root.join("scrcpy-win64-v3.4");
+        std::fs::create_dir_all(&newer).unwrap();
+        let newer_exe = newer.join(adb::scrcpy_exe_name());
+        std::fs::write(&newer_exe, b"x").unwrap();
+        let stale_dir = root.join("scrcpy-win64-v3.3.3");
+        let stale_exe = stale_dir.join(adb::scrcpy_exe_name());
+        let mut s = Settings {
+            scrcpy_path: stale_exe.display().to_string(),
+            ..Settings::default()
+        };
+        std::fs::remove_dir_all(&pkg).unwrap(); // 旧版本目录被删掉了
+        assert!(s.sanitize(), "死路径应被清理");
+        assert_eq!(
+            PathBuf::from(&s.scrcpy_dir),
+            root,
+            "父目录也没了时,应把线索留在再上一级"
+        );
+        assert_eq!(locate_remembered_scrcpy(&s).0, Some(newer_exe.clone()));
+
+        // ④ 记住的位置彻底不存在 -> 交给自动寻找(这里只验证"不误报")
+        let mut s = Settings {
+            scrcpy_dir: root.join("根本没有这个目录").display().to_string(),
+            ..Settings::default()
+        };
+        s.sanitize();
+        assert_eq!(s.scrcpy_dir, "", "不存在的目录必须清掉");
+        assert_eq!(locate_remembered_scrcpy(&s).0, None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

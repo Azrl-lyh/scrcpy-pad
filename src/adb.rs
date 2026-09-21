@@ -200,6 +200,85 @@ pub fn find_scrcpy() -> Option<PathBuf> {
     find_scrcpy_portable()
 }
 
+/// 用户(或上次记住的设置)明确给出的 scrcpy 位置。
+///
+/// **既接受可执行文件,也接受目录** —— 用户嘴里的"scrcpy 目录"就是发行包解压出来的
+/// 那个文件夹(scrcpy-win64-vX.Y)。只认 exe 会让"我设置好 scrcpy 目录后,
+/// 再次启动依旧找不到"这种体验问题反复出现;目录里再多套一层子目录也能命中。
+pub fn find_scrcpy_explicit(path: &str) -> Option<PathBuf> {
+    let t = path.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(t);
+    if p.is_file() {
+        return Some(p);
+    }
+    if p.is_dir() {
+        return find_scrcpy_in_dir(&p, 3);
+    }
+    None
+}
+
+/// 在给定目录(含至多 depth 层子目录)里查 scrcpy 可执行文件。
+/// 文件名精确匹配 `scrcpy.exe`(Windows)/`scrcpy`,因此不会把 `scrcpy-pad.exe` 认错。
+pub fn find_scrcpy_in_dir(dir: &Path, depth: usize) -> Option<PathBuf> {
+    find_file_recursive(dir, scrcpy_exe_name(), depth)
+}
+
+/// 在基准目录"一带"找 scrcpy。与 [`find_scrcpy_in_dir`] 的区别:
+/// 这里只往**名字像 scrcpy 的子目录**里下探(允许外面再套一层任意名字的文件夹,
+/// 因为"解压到一个文件夹里"很常见)。
+///
+/// 因此它可以安全地拿桌面、下载目录、用户主目录这类大目录当基准 ——
+/// 代价只有每层一次 read_dir,不会递归整棵目录树。用户记住的 scrcpy 目录
+/// 被换版本/改名之后,就是靠它从"上一级"把新版本找回来的。
+pub fn find_scrcpy_under(base: &Path, depth: usize) -> Option<PathBuf> {
+    // 1) 基准目录本身就是发行包目录
+    if let Some(p) = find_scrcpy_in_dir(base, 0) {
+        return Some(p);
+    }
+    // 2) 基准目录下以 scrcpy 开头的子目录(官方发行包解压出来的样子)
+    for d in scrcpy_named_subdirs(base) {
+        if let Some(p) = find_scrcpy_in_dir(&d, depth.saturating_sub(1)) {
+            return Some(p);
+        }
+    }
+    // 3) 再套一层任意名字的文件夹,例如 "D:\下载\一个文件夹\scrcpy-win64-v3.3"
+    if depth > 0 {
+        for outer in subdirs(base) {
+            for d in scrcpy_named_subdirs(&outer) {
+                if let Some(p) = find_scrcpy_in_dir(&d, 0) {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 目录下的子目录(排序,保证结果稳定可测)
+fn subdirs(dir: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut v: Vec<PathBuf> = rd
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.path())
+        .collect();
+    v.sort();
+    v
+}
+
+/// 目录下名字以 "scrcpy" 开头的子目录
+fn scrcpy_named_subdirs(dir: &Path) -> Vec<PathBuf> {
+    subdirs(dir)
+        .into_iter()
+        .filter(|p| is_scrcpy_dir_name(p))
+        .collect()
+}
+
 /// 在"程序目录附近"寻找便携部署的 scrcpy。
 ///
 /// 扫描程序所在目录及其父目录下、名字以 "scrcpy" 开头的文件夹
@@ -218,30 +297,12 @@ pub fn find_scrcpy_portable() -> Option<PathBuf> {
 /// 在给定基准目录附近寻找便携 scrcpy:
 /// 先看基准目录内部,再看其父目录(即"同级"位置)下的 scrcpy* 子目录。
 fn find_scrcpy_portable_under(base: &Path) -> Option<PathBuf> {
-    let exe_name = scrcpy_exe_name();
     // 候选扫描根:程序目录本身;以及程序目录的父目录(即"同级"位置)
     let mut roots = vec![base.to_path_buf()];
     if let Some(parent) = base.parent() {
         roots.push(parent.to_path_buf());
     }
-    for root in roots {
-        let Ok(rd) = std::fs::read_dir(&root) else {
-            continue;
-        };
-        let mut dirs: Vec<PathBuf> = rd
-            .flatten()
-            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-            .map(|e| e.path())
-            .filter(|p| is_scrcpy_dir_name(p))
-            .collect();
-        dirs.sort();
-        for dir in dirs {
-            if let Some(exe) = find_file_recursive(&dir, exe_name, 3) {
-                return Some(exe);
-            }
-        }
-    }
-    None
+    roots.into_iter().find_map(|root| find_scrcpy_under(&root, 3))
 }
 
 /// 目录名是否以 "scrcpy" 开头(不区分大小写)
@@ -547,6 +608,90 @@ mod tests {
         std::fs::create_dir_all(&other).unwrap();
         std::fs::write(other.join(scrcpy_exe_name()), b"x").unwrap();
         assert_eq!(find_scrcpy_portable_under(&prog), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 用户给出的位置可能是**目录**而不是 exe —— 必须能解析出目录里的可执行文件。
+    ///
+    /// 回归:用户原话"我设置好 scrcpy 目录后,再次启动,scrcpy 依旧没有被找到",
+    /// 而旧逻辑只接受 `is_file()`,目录会被当作死路径直接丢掉。
+    #[test]
+    fn explicit_path_accepts_a_directory() {
+        let root =
+            std::env::temp_dir().join(format!("scrcpy-pad-test-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // 官方发行包布局:exe/server/adb 同目录
+        let pkg = root.join("scrcpy-win64-v3.3.3");
+        std::fs::create_dir_all(&pkg).unwrap();
+        let exe = pkg.join(scrcpy_exe_name());
+        std::fs::write(&exe, b"x").unwrap();
+        std::fs::write(pkg.join("scrcpy-server"), b"x").unwrap();
+        std::fs::write(pkg.join(adb_exe_name()), b"x").unwrap();
+
+        // 1) 给目录 -> 解析出目录里的 exe
+        assert_eq!(find_scrcpy_explicit(&pkg.display().to_string()), Some(exe.clone()));
+        // 2) 给 exe 本身 -> 原样返回
+        assert_eq!(find_scrcpy_explicit(&exe.display().to_string()), Some(exe.clone()));
+        // 3) 目录里再多套一层也能找到(解压时多一层文件夹是常事)
+        let outer = root.join("解压出来的文件夹");
+        let nested = outer.join("再套一层").join("scrcpy-win64-v9.9");
+        std::fs::create_dir_all(&nested).unwrap();
+        let nested_exe = nested.join(scrcpy_exe_name());
+        std::fs::write(&nested_exe, b"x").unwrap();
+        assert_eq!(find_scrcpy_in_dir(&outer, 3), Some(nested_exe));
+        // 空目录里不能凭空造一个出来
+        let empty = root.join("空目录");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(find_scrcpy_in_dir(&empty, 3), None);
+        // 4) 空字符串 / 不存在的位置一律 None(交给自动寻找)
+        assert_eq!(find_scrcpy_explicit("   "), None);
+        assert_eq!(
+            find_scrcpy_explicit(&root.join("nope").display().to_string()),
+            None
+        );
+
+        // 5) 同目录推导:server 与 adb 都能从 scrcpy 的位置补齐
+        assert_eq!(find_server(Some(&exe)).map(|p| p.file_name().unwrap().to_owned()),
+                   Some("scrcpy-server".into()));
+        assert_eq!(find_adb(Some(&exe)).map(|p| p.file_name().unwrap().to_owned()),
+                   Some(adb_exe_name().into()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `find_scrcpy_under`:记住的目录可能是发行包本身,也可能是"解压到某个
+    /// 文件夹"的那一层;它只往名字像 scrcpy 的子目录里下探,因此可以安全地
+    /// 拿大目录(桌面/下载)当基准 —— 这是"scrcpy 换版本后仍能找回"的关键。
+    #[test]
+    fn find_scrcpy_under_handles_wrapped_and_versioned_dirs() {
+        let root = std::env::temp_dir().join(format!("scrcpy-pad-under-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // 基准目录 -> 任意名字的文件夹 -> scrcpy 发行包
+        let pkg = root.join("一个文件夹").join("scrcpy-win64-v3.4");
+        std::fs::create_dir_all(&pkg).unwrap();
+        let exe = pkg.join(scrcpy_exe_name());
+        std::fs::write(&exe, b"x").unwrap();
+
+        // 直接给发行包目录
+        assert_eq!(find_scrcpy_under(&pkg, 3), Some(exe.clone()));
+        // 给外面那层(名字完全不像 scrcpy)
+        assert_eq!(find_scrcpy_under(&root.join("一个文件夹"), 3), Some(exe.clone()));
+        // 给最外层大目录
+        assert_eq!(find_scrcpy_under(&root, 3), Some(exe.clone()));
+        // 非 scrcpy 命名的目录里即便有同名 exe 也不能被认成 scrcpy 包
+        let other = root.join("别的东西");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join(scrcpy_exe_name()), b"x").unwrap();
+        assert_eq!(
+            find_scrcpy_under(&other, 3),
+            Some(other.join(scrcpy_exe_name())),
+            "基准目录本身就是包目录时应当认它(与 find_scrcpy_in_dir 一致)"
+        );
+        // 空目录 -> None
+        let empty = root.join("空的");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(find_scrcpy_under(&empty, 3), None);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

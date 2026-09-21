@@ -8,11 +8,24 @@
 //!          Toggle=按一下开/再按关),启用期间方向键归摇杆、同键位的其它绑定失效。
 //! 并发:普通键位(点按/长按/滑动)各自独立跟踪按下/抬起(见 Fingers),最多
 //!       MAX_CONCURRENT_KEYS 个键可同时按下,互不干扰,便于战斗中放组合技。
+//!
+//! 三条贯穿全文件的铁律(踩过的坑都在这三条上):
+//!   ① **触点绝不能漏抬**:设备端同时只认 10 个触点,漏掉一个就少一个,
+//!      攒够了新按键就"按了没反应"。凡是"状态被重建"的地方,必须先把
+//!      还在按着的触点抬起来。
+//!   ② **归属切换必须立刻对账**:键盘事件是边沿触发的,同一个物理键在
+//!      "轮盘方向"与"普通绑定"之间改换门庭的那一瞬间,必须按[`Held`]
+//!      里的物理状态把两边的触点重新算一遍,否则那个键要等用户松开再按
+//!      才会生效(战场上这很致命)。
+//!   ③ **状态一律按"当前配置"重算,不做增量假设**:用户随时可能在开打中
+//!      增删键位/摇杆,索引会整体位移。与其维护一堆增量标志,不如在结构变化时
+//!      释放 + 重算 —— 慢一帧无所谓,丢一个触点就是事故。
 
 use crate::capture::CaptureEvent;
 use crate::control::ControlClient;
 use crate::keymap::{
-    Action, Aim, Mapper, Profile, RecenterMode, TempMode, Wheel, easing_apply, swipe_points,
+    Action, Aim, KeyBind, Mapper, Profile, RecenterMode, TempMode, Wheel, easing_apply,
+    swipe_points,
 };
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +36,14 @@ use std::time::{Duration, Instant};
 /// 普通键位(点按/长按/滑动)可同时按下的数量上限。
 /// 设备端 PointersState.MAX_POINTERS = 10;瞄准指针与轮盘指针另计,
 /// 因此这里留出余量,便于 FPS 场景同时按住开火/蹲/跳等多个键。
+/// 真正的硬上限由 [`DEVICE_MAX_POINTERS`] 兜底(见 [`Fingers::try_down`])。
 const MAX_CONCURRENT_KEYS: usize = 8;
+
+/// 设备端 scrcpy-server 的 `PointersState.MAX_POINTERS`:
+/// 同时按下的触点超过这个数时,**多出来的按下会被服务端直接丢弃**(不是排队),
+/// 在用户侧就表现为"按下没反应"。所以客户端必须自己守住这个上限 ——
+/// 这是"普通按键按下无反应"最后一层、也是最隐蔽的一层原因。
+pub const DEVICE_MAX_POINTERS: usize = 10;
 
 /// 瞄准指针的固定 id(与普通绑定 1000+、轮盘 2000+ 区分开)
 const AIM_PID: u64 = 3000;
@@ -93,10 +113,24 @@ impl Fingers {
         self.down.get(idx).copied().unwrap_or(false)
     }
 
-    /// 登记一次按下;已按下或并发已达上限时返回 false(调用方不注入 DOWN)
-    fn try_down(&mut self, idx: usize) -> bool {
+    /// 登记一次按下;已按下、并发已达上限、或**加上轮盘/瞄准占用的触点后**
+    /// 会超过设备端触点池上限([`DEVICE_MAX_POINTERS`])时返回 false
+    /// (调用方据此不注入 DOWN)。
+    ///
+    /// `others` 是此刻被轮盘与瞄准子系统占用的触点数 —— 它们和普通绑定抢同一个
+    /// 设备端指针池,必须一起算,否则"按住好几个键 + 摇杆一直推着"时,
+    /// 超出的那次按下会被服务端悄悄丢掉(用户只看到"按键没反应")。
+    fn try_down(&mut self, idx: usize, others: usize) -> bool {
         if self.is_down(idx) || self.count >= MAX_CONCURRENT_KEYS {
             return false;
+        }
+        if self.count + others >= DEVICE_MAX_POINTERS {
+            return false;
+        }
+        // 防御:调用方本应先 align,但引擎线程一旦 panic 就等于整个映射失效,
+        // 所以这里宁可自己补一格,也不让越界索引把线程带走。
+        if idx >= self.down.len() {
+            self.down.resize(idx + 1, false);
         }
         self.down[idx] = true;
         self.count += 1;
@@ -120,6 +154,314 @@ impl Fingers {
         self.count = 0;
     }
 }
+
+/// 物理按键状态镜像:当前**物理上真的按住**的键码集合。
+///
+/// 为什么必须有它:临时轮盘启用/停用时,同一个物理键的归属会在"轮盘方向"与
+/// "普通绑定"之间来回切换,而键盘事件是边沿触发的 —— 切换的那一瞬间,
+/// 引擎必须知道这个键此刻到底还按着没有。否则停用摇杆后,那个键的普通绑定要等
+/// 用户"松开再按一次"才重新生效(用户反馈:"松开启用键后,那个键必须松开手一次
+/// 才能触发。战场是瞬息万变的,所以请修复他")。
+///
+/// 它只认按键事件,不受配置改动、轮盘启用状态影响,因此是唯一可信的依据。
+#[derive(Default)]
+struct Held {
+    codes: HashSet<u16>,
+}
+
+impl Held {
+    fn set(&mut self, code: u16, pressed: bool) {
+        if pressed {
+            self.codes.insert(code);
+        } else {
+            self.codes.remove(&code);
+        }
+    }
+
+    fn has(&self, code: u16) -> bool {
+        self.codes.contains(&code)
+    }
+}
+
+/// 引擎运行状态快照(界面诊断显示,回答"为什么按了没反应")
+#[derive(Default, Clone, Copy)]
+pub struct EngineLive {
+    /// 当前占用的注入触点数(设备端最多同时 [`DEVICE_MAX_POINTERS`] 个)
+    pub pointers: usize,
+    /// 因触点池已满而被放弃的按下次数(累计)
+    pub refused: u64,
+    /// 最近一次被放弃的按键(便于定位是哪个键被挤掉)
+    pub last_refused: u16,
+}
+
+/// 把"普通绑定"的实际按下状态对齐到物理按键状态。
+///
+/// 这是"归属切换"这条铁律的落地点:凡是会让某个物理键改换门庭的操作
+/// (临时轮盘启用/停用、总开关切换、配置被编辑),都要在之后调用它。
+///
+/// 只对**状态型**动作对账:
+///   * `Hold`      —— 按着就该有触点,松开就该抬起;
+///   * `AndroidKey`—— 同上(系统键也要成对);
+///   * `Tap`(duration=0)是"按一下翻一次"的开关、`Tap`(duration>0)与 `Swipe`
+///     是一次性动作,都由事件自己收尾 —— 在这里对账会把它们反复翻转/重放。
+///
+/// 归属给某个生效中的轮盘方向键、或临时轮盘启用键的物理键不参与普通绑定
+/// (与事件路径的优先级链完全一致:总开关键 > 启用键 > 轮盘方向键 > 普通绑定)。
+fn reconcile_binds(
+    ctl: &ControlClient,
+    m: &Mapper,
+    profile: &Profile,
+    wheels: &[WheelState],
+    aim_pointers: usize,
+    held: &Held,
+    fingers: &mut Fingers,
+    active_android_keys: &mut HashSet<u16>,
+    live: &mut EngineLive,
+) {
+    // 轮盘与瞄准占用的触点(普通绑定自己不占;对账期间它们不变)
+    let reserved = wheel_pointers(wheels) + aim_pointers;
+    for (idx, bind) in profile.binds.iter().enumerate() {
+        let want = held.has(bind.key) && !key_owned_by_wheel(profile, wheels, bind.key);
+        match &bind.action {
+            Action::Hold { x, y, .. } => {
+                let pid = bind_pid(idx);
+                let (px, py) = m.point(*x, *y);
+                if want {
+                    if !fingers.is_down(idx) {
+                        if fingers.try_down(idx, reserved) {
+                            ctl.touch_down(pid, px, py);
+                        } else {
+                            refuse(live, bind.key);
+                        }
+                    }
+                } else if fingers.release(idx) {
+                    ctl.touch_up(pid, px, py);
+                }
+            }
+            Action::AndroidKey { keycode } => {
+                let kc = *keycode as u16;
+                if want {
+                    if active_android_keys.insert(kc) {
+                        ctl.key(true, *keycode);
+                    }
+                } else if active_android_keys.remove(&kc) {
+                    ctl.key(false, *keycode);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 把轮盘方向状态对齐到物理按键状态(与 [`reconcile_binds`] 同理)。
+///
+/// 方向状态完全由"该轮盘此刻是否生效 × 对应物理键是否按着"决定,于是:
+///   * 启用临时摇杆的瞬间,已按着的方向键立刻推动摇杆(而不是要重按一次);
+///   * 停用/配置变化/切总开关时,不再生效的方向一定被抬起来;
+///   * 不会出现"某个方向永远以为自己被按着"。
+///
+/// `extra_pointers` 是普通绑定 + 瞄准此刻占用的触点数(它们与轮盘抢同一个池子)。
+fn reconcile_wheels(
+    ctl: &ControlClient,
+    m: &Mapper,
+    profile: &Profile,
+    wheels: &mut [WheelState],
+    held: &Held,
+    extra_pointers: usize,
+    live: &mut EngineLive,
+) {
+    for (j, w) in profile.wheels.iter().enumerate() {
+        if j >= wheels.len() {
+            break;
+        }
+        let engaged = w.temp.is_none() || wheels[j].active;
+        for (d, key) in [w.up, w.down, w.left, w.right].iter().enumerate() {
+            wheels[j].pressed[d] = engaged && held.has(*key);
+        }
+        // 本轮盘此刻若已经按着,update_wheel 不会再去申请新触点,故不必减掉自己
+        let reserved = extra_pointers + wheel_pointers(wheels);
+        if update_wheel(ctl, m, j, w, &mut wheels[j], reserved) {
+            refuse(live, w.up);
+        }
+    }
+}
+
+/// 该物理键此刻是否归摇杆(生效中的轮盘方向键,或任意临时轮盘的启用键)。
+///
+/// 临时轮盘的启用键**无论是否生效**都归它自己:事件路径上它总是被消费掉
+/// (见 run() 里的启用键分支),所以普通绑定永远收不到它。
+fn key_owned_by_wheel(profile: &Profile, wheels: &[WheelState], code: u16) -> bool {
+    profile.wheels.iter().enumerate().any(|(j, w)| {
+        if let Some(t) = &w.temp {
+            if t.key == code {
+                return true;
+            }
+        }
+        let engaged = w.temp.is_none() || wheels.get(j).map(|s| s.active).unwrap_or(false);
+        engaged && (w.up == code || w.down == code || w.left == code || w.right == code)
+    })
+}
+
+/// 轮盘此刻占用的触点数(每个轮盘最多一个:按着才有)
+fn wheel_pointers(wheels: &[WheelState]) -> usize {
+    wheels.iter().filter(|w| w.down).count()
+}
+
+/// 记一次"因为触点池满而放弃按下"
+fn refuse(live: &mut EngineLive, code: u16) {
+    live.refused += 1;
+    live.last_refused = code;
+}
+
+/// 抬起当前所有普通绑定触点与系统键(状态重建/结构变化前调用)。
+/// 不动轮盘与瞄准 —— 它们各有自己的释放路径。
+///
+/// 遍历的是**按下表本身的长度**而不是当前配置的绑定数:用户删掉几个键位时,
+/// 那几个被删掉的槽位里可能还记着"按着",漏掉它们就是永久卡在设备上的触点。
+/// 越界槽位用 (0,0) 抬起 —— 坐标一定落在屏内,不会因为"落在屏外"被系统整条丢弃。
+fn release_all_binds(
+    ctl: &ControlClient,
+    m: &Mapper,
+    profile: &Profile,
+    fingers: &mut Fingers,
+    active_android_keys: &mut HashSet<u16>,
+) {
+    let n = fingers.down.len().max(profile.binds.len());
+    for idx in 0..n {
+        if fingers.release(idx) {
+            let (x, y) = bind_point(profile, m, idx);
+            ctl.touch_up(bind_pid(idx), x, y);
+        }
+    }
+    for kc in active_android_keys.drain() {
+        ctl.key(false, kc as u32);
+    }
+    fingers.free_all();
+}
+
+/// 让引擎的运行状态与当前配置对齐;返回是否发生了结构变化。
+///
+/// 用户随时可能在开打中增删键位/摇杆,索引会整体位移。这里的原则是
+/// **宁可抬手重算,绝不带着旧状态跑**:
+///   * 普通绑定表结构变了 -> 先抬起全部绑定触点与系统键,再重建按下表;
+///   * 轮盘表结构变了 -> 先用旧状态把在按的轮盘触点抬起来(回中再抬),
+///     再按新配置重建轮盘状态。
+/// 重建后**按物理按键状态恢复临时轮盘的启用标记**(长按模式):用户正按着某个
+/// 启用键时,重建不该让摇杆"悄悄失效"。调用方在返回 true 时应立刻对账一次,
+/// 把仍按着的键/方向补回来 —— 于是对玩家来说,增删一个键位或摇杆是无感的。
+fn sync_structures(
+    ctl: &ControlClient,
+    m: &Mapper,
+    profile: &Profile,
+    wheels: &mut Vec<WheelState>,
+    wheel_sig: &mut u64,
+    binds_sig: &mut u64,
+    fingers: &mut Fingers,
+    active_android_keys: &mut HashSet<u16>,
+    held: &Held,
+) -> bool {
+    let mut changed = false;
+
+    // ---- 普通绑定 ----
+    let bs = binds_signature(&profile.binds);
+    if bs != *binds_sig {
+        *binds_sig = bs;
+        release_all_binds(ctl, m, profile, fingers, active_android_keys);
+        // 按下表按新长度重建(旧槽位里的残留已被 free_all 清掉)
+        fingers.down.clear();
+        fingers.align(profile.binds.len());
+        changed = true;
+    }
+    fingers.align(profile.binds.len());
+
+    // ---- 轮盘 ----
+    let ws = wheel_signature(&profile.wheels);
+    if ws != *wheel_sig {
+        *wheel_sig = ws;
+        for (j, st) in wheels.iter_mut().enumerate() {
+            if !st.down {
+                continue;
+            }
+            // 回中再抬:旧圆心若在新配置里已经不在了,就用最后推送的位置,
+            // 兜底也要给一个屏内坐标 —— 落在屏外的 UP 会被系统整条丢弃,
+            // 那个触点就永远留在设备上了。
+            let (cx, cy) = profile
+                .wheels
+                .get(j)
+                .map(|w| m.point(w.cx, w.cy))
+                .unwrap_or(st.last);
+            ctl.touch_move(wheel_pid(j), cx, cy);
+            ctl.touch_up(wheel_pid(j), cx, cy);
+            st.down = false;
+        }
+        *wheels = vec![WheelState::default(); profile.wheels.len()];
+        // 长按模式的临时轮盘:启用状态直接由"启用键是否还按着"恢复;
+        // 切换模式是锁存状态,没有可信的物理依据,一律回到未启用(按一下即可再开)
+        for (j, w) in profile.wheels.iter().enumerate() {
+            if let Some(t) = &w.temp {
+                wheels[j].active = t.mode == TempMode::Hold && held.has(t.key);
+            }
+        }
+        changed = true;
+    }
+    changed
+}
+
+/// 普通绑定的结构指纹:数量 + 每个键的键码与动作类型。
+///
+/// 索引是引擎跟踪"哪个键按着"的依据(pid = 1000+idx)。用户增删一个键位,
+/// 后面所有索引都会整体位移:旧触点的按下记录会被错记到别的键上,
+/// 那个键于是"按了没反应",而真正的旧触点则永久留在设备上。
+/// 因此指纹一变就必须先抬起全部触点、再按新配置重建。
+fn binds_signature(binds: &[KeyBind]) -> u64 {
+    let mut h = binds.len() as u64;
+    for b in binds {
+        let kind = match &b.action {
+            Action::Tap { duration_ms, .. } => {
+                if *duration_ms == 0 { 1 } else { 2 }
+            }
+            Action::Hold { .. } => 3,
+            Action::Swipe(_) => 4,
+            Action::AndroidKey { .. } => 5,
+        };
+        h = h
+            .wrapping_mul(0x100_0000_01b3)
+            .wrapping_add(b.key as u64 + 1)
+            .rotate_left(7)
+            .wrapping_add(kind);
+    }
+    h
+}
+
+/// 轮盘的结构指纹:数量 + 方向键 + 启用键与模式。
+///
+/// 只关心会改变**键位归属与 pid 分配**的字段。坐标/半径/影响范围的变化不需要
+/// 重建(下一帧推一下就是新的位置了),否则玩家一边调参一边打会被反复抬手。
+///
+/// 指纹变化必须"先释放旧触点、再重建状态",否则会同时踩中三种老毛病:
+///   ① 旧触点永远留在设备上(触点池越用越少 → 新按键按不动);
+///   ② 旧触点的 pid 被新轮盘接管(用户看到的"新摇杆与旧摇杆换位/乱动");
+///   ③ 临时轮盘的启用状态错挂到别的轮盘上。
+fn wheel_signature(wheels: &[Wheel]) -> u64 {
+    let mut h = wheels.len() as u64;
+    for w in wheels {
+        for k in [w.up, w.down, w.left, w.right] {
+            h = h.wrapping_mul(0x100_0000_01b3).wrapping_add(k as u64 + 1);
+        }
+        match &w.temp {
+            None => h = h.wrapping_mul(31).wrapping_add(0x9E37_79B9),
+            Some(t) => {
+                h = h.wrapping_mul(31).wrapping_add(t.key as u64 + 1);
+                h = h.wrapping_mul(31).wrapping_add(match t.mode {
+                    TempMode::Hold => 1,
+                    TempMode::Toggle => 2,
+                });
+            }
+        }
+    }
+    h
+}
+
 
 // ============================ FPS 鼠标瞄准 ============================
 //
@@ -243,10 +585,23 @@ fn aim_recenter(ctl: &ControlClient, m: &Mapper, aim: &Aim, st: &mut AimState) {
     st.last_motion = Some(Instant::now());
 }
 
-/// 鼠标相对位移 -> 手机上的拖动
-fn aim_on_motion(ctl: &ControlClient, m: &Mapper, aim: &Aim, st: &mut AimState, dx: f32, dy: f32) {
+/// 鼠标相对位移 -> 手机上的拖动。
+/// 返回是否因为触点池已满而没能落下瞄准触点(供诊断计数;落不下就不落下,
+/// 下一次位移会再试,不会留下半个状态)。
+fn aim_on_motion(
+    ctl: &ControlClient,
+    m: &Mapper,
+    aim: &Aim,
+    st: &mut AimState,
+    dx: f32,
+    dy: f32,
+    reserved: usize,
+) -> bool {
     if !aim_active(aim, st) {
-        return;
+        return false;
+    }
+    if !st.down && reserved >= DEVICE_MAX_POINTERS {
+        return true;
     }
     let anchor = aim_anchor(m, aim);
     // 锚点被改动过(或屏幕方向变了):结束旧拖动,从新锚点重新开始
@@ -282,6 +637,7 @@ fn aim_on_motion(ctl: &ControlClient, m: &Mapper, aim: &Aim, st: &mut AimState, 
     if threshold_hit || edge_hit {
         aim_recenter(ctl, m, aim, st);
     }
+    false
 }
 
 /// 定期维护:映射关闭/门控松开 -> 收手;静止归中 -> 回锚点
@@ -309,6 +665,10 @@ pub struct Shared {
     pub control: Option<ControlClient>,
     /// 瞄准运行状态(界面诊断显示)
     pub aim_live: AimLive,
+    /// 引擎运行状态(触点占用 / 因触点池满被拒的按下次数),界面诊断显示。
+    /// 用户抱怨过"普通按键按下无反应,原因不明" —— 有了它,界面就能直接
+    /// 说出"此刻占了几个触点、刚才哪个键因为挤不进去被放弃了"。
+    pub live: EngineLive,
     /// 顶栏[映射:开/关]按钮请求引擎执行一次"关闭映射"的收尾。
     ///
     /// 为什么需要它:关闭映射时必须抬起所有仍按着的触点(否则手机上会一直按着,
@@ -369,7 +729,10 @@ pub(crate) fn release_all(
             let m = shared.profile.mapper(screen);
             // 瞄准触点一并抬起(否则松手后仍按在屏幕上)
             aim_lift(c, st.aim);
-            for idx in 0..shared.profile.binds.len() {
+            // 遍历按下表本身的长度而不是当前绑定数:被删掉的槽位里可能还记着"按着",
+            // 漏掉它就是一个永久卡在设备上的触点(触点池会被越用越少)。
+            let n = st.fingers.down.len().max(shared.profile.binds.len());
+            for idx in 0..n {
                 if st.fingers.release(idx) {
                     let (x, y) = bind_point(&shared.profile, &m, idx);
                     c.touch_up(bind_pid(idx), x, y);
@@ -379,15 +742,20 @@ pub(crate) fn release_all(
                 c.key(false, kc as u32);
             }
             for (j, ws) in st.wheels.iter_mut().enumerate() {
-                if ws.down {
-                    // 配置可能刚被编辑过,轮盘数量以取得到的那一个为准
-                    if let Some(w) = shared.profile.wheels.get(j) {
-                        let (cx, cy) = m.point(w.cx, w.cy);
-                        c.touch_move(wheel_pid(j), cx, cy);
-                        c.touch_up(wheel_pid(j), cx, cy);
-                    }
-                    ws.down = false;
+                if !ws.down {
+                    continue;
                 }
+                // 配置可能刚被编辑过:轮盘数量以取得到的那一个为准,
+                // 取不到就用最后推送过的位置 —— 总之必须把这个触点抬起来
+                let (cx, cy) = shared
+                    .profile
+                    .wheels
+                    .get(j)
+                    .map(|w| m.point(w.cx, w.cy))
+                    .unwrap_or(ws.last);
+                c.touch_move(wheel_pid(j), cx, cy);
+                c.touch_up(wheel_pid(j), cx, cy);
+                ws.down = false;
             }
         }
         None => {
@@ -413,7 +781,14 @@ pub fn run(
     let mut fingers = Fingers::default();
     let mut active_android_keys: HashSet<u16> = HashSet::new();
     let mut wheels: Vec<WheelState> = Vec::new();
-    let mut wheel_count = usize::MAX; // 触发重建
+    // 配置的"结构指纹":绑定表与轮盘表各一份。指纹变化 = 索引会整体位移,
+    // 此时必须先把在按的触点全部抬起来再重建状态(见 sync_structures)。
+    let mut binds_sig = 0u64;
+    let mut wheel_sig = 0u64;
+    // 物理按键镜像(归属切换对账的唯一依据)
+    let mut held = Held::default();
+    // 引擎运行状态(触点占用/被拒次数),供界面诊断显示
+    let mut live = EngineLive::default();
     let mut aim = AimState::default();
     // Ctrl+Alt 组合:按下即把鼠标交还给系统,再按一次收回(需用全局钩子判定,
     // 因为开打时焦点通常在 scrcpy 窗口,主程序收不到按键)
@@ -534,6 +909,9 @@ pub fn run(
             l.down = aim.down;
             l.active = aim_active(&cfg, &aim);
             l.sent = aim.sent;
+            // 触点占用是"此刻"的量:轮盘/瞄准的状态可能刚被上面的维护改动过
+            live.pointers = fingers.count + wheel_pointers(&wheels) + usize::from(aim.down);
+            s.live = live;
         }
 
         // 等待下一个事件。有未到期的计划动作时,精确等到最早那个到期为止,
@@ -575,7 +953,12 @@ pub fn run(
                     if let Some(ctl) = control.as_ref() {
                         if ctl.is_connected() {
                             let m = profile.mapper((ctl.screen_w, ctl.screen_h));
-                            aim_on_motion(ctl, &m, &cfg, &mut aim, dx, dy);
+                            // 瞄准触点也要占设备端指针池:挤不进去就别落下,
+                            // 记为一次"被拒",免得用户以为瞄准坏了
+                            let reserved = wheel_pointers(&wheels) + fingers.count;
+                            if aim_on_motion(ctl, &m, &cfg, &mut aim, dx, dy, reserved) {
+                                refuse(&mut live, 0);
+                            }
                         }
                     }
                 }
@@ -584,6 +967,7 @@ pub fn run(
                 l.oy = aim.oy;
                 l.down = aim.down;
                 l.sent = aim.sent;
+                s.live = live;
                 continue;
             }
         };
@@ -623,6 +1007,10 @@ pub fn run(
             aim.released = !aim.released;
         }
 
+        // 物理按键镜像:所有按键事件先落到这里。它是"某个物理键此刻是否真的按着"
+        // 的唯一可信依据 —— 归属切换(临时摇杆启用/停用、配置改动)时的对账全靠它。
+        held.set(ev.code, ev.pressed);
+
         // 总开关键:任何时候都生效
         if ev.code == toggle_key && ev.pressed {
             let mut g = shared.lock().unwrap();
@@ -651,6 +1039,45 @@ pub fn run(
             } else {
                 // 每次重新开打都恢复捕获,避免上一局的"交还鼠标"状态带过来
                 aim.released = false;
+                // 重新开打时按**物理按键状态**对账一遍:用户此刻按住不放的键
+                // 立刻生效,而不是要松手再按一次(关映射时全部触点都被抬起了)
+                if let Some(ctl) = g.control.as_ref() {
+                    if ctl.is_connected() {
+                        let m = g.profile.mapper((ctl.screen_w, ctl.screen_h));
+                        sync_structures(
+                            ctl,
+                            &m,
+                            &g.profile,
+                            &mut wheels,
+                            &mut wheel_sig,
+                            &mut binds_sig,
+                            &mut fingers,
+                            &mut active_android_keys,
+                            &held,
+                        );
+                        let extra = usize::from(aim.down);
+                        reconcile_binds(
+                            ctl,
+                            &m,
+                            &g.profile,
+                            &wheels,
+                            extra,
+                            &held,
+                            &mut fingers,
+                            &mut active_android_keys,
+                            &mut live,
+                        );
+                        reconcile_wheels(
+                            ctl,
+                            &m,
+                            &g.profile,
+                            &mut wheels,
+                            &held,
+                            fingers.count + usize::from(aim.down),
+                            &mut live,
+                        );
+                    }
+                }
             }
             // 按钮若正好也请求了收尾,视作已一并处理,避免下一轮再收一次
             if g.toolbar_release {
@@ -675,13 +1102,45 @@ pub fn run(
         // 坐标换算器:配置里的相对坐标 -> 当前屏幕像素(唯一换算入口)
         let m = profile.mapper((ctl.screen_w, ctl.screen_h));
 
-        // 轮盘状态数量对齐(配置可能被编辑)
-        if wheel_count != profile.wheels.len() {
-            wheels = vec![WheelState::default(); profile.wheels.len()];
-            wheel_count = profile.wheels.len();
+        // ---- 与配置对齐 ----
+        // 用户随时可能在开打中增删键位/摇杆。结构一变,索引就整体位移 ——
+        // 先把在按的触点全部抬起来,再按新配置重建,绝不会漏下一个触点;
+        // 重建后立刻对账一次,于是对玩家来说"改配置"是无感的。
+        let restructured = sync_structures(
+            ctl,
+            &m,
+            profile,
+            &mut wheels,
+            &mut wheel_sig,
+            &mut binds_sig,
+            &mut fingers,
+            &mut active_android_keys,
+            &held,
+        );
+        if restructured {
+            let extra = usize::from(aim.down);
+            reconcile_binds(
+                ctl,
+                &m,
+                profile,
+                &wheels,
+                extra,
+                &held,
+                &mut fingers,
+                &mut active_android_keys,
+                &mut live,
+            );
+            reconcile_wheels(
+                ctl,
+                &m,
+                profile,
+                &mut wheels,
+                &held,
+                fingers.count + usize::from(aim.down),
+                &mut live,
+            );
         }
-        // 普通绑定并发跟踪对齐
-        fingers.align(profile.binds.len());
+        live.pointers = fingers.count + wheel_pointers(&wheels) + usize::from(aim.down);
 
         // ---- 临时轮盘启用键 ----
         let mut consumed = false;
@@ -690,40 +1149,58 @@ pub fn run(
             if ev.code != t.key {
                 continue;
             }
-            match t.mode {
-                TempMode::Hold => {
-                    if ev.pressed {
-                        wheels[j].active = true;
-                        // 启用瞬间,释放与方向键冲突的普通绑定,避免触点卡死
-                        release_conflicting_binds(
-                            ctl,
-                            &m,
-                            profile,
-                            &mut fingers,
-                            &mut active_android_keys,
-                            w,
-                        );
-                    } else {
-                        deactivate_wheel(ctl, &m, j, w, &mut wheels[j]);
-                    }
-                }
+            // 目标状态:长按模式 = 按住期间生效;切换模式 = 只在按下那一刻翻转
+            let want_active = match t.mode {
+                TempMode::Hold => ev.pressed,
                 TempMode::Toggle => {
                     if ev.pressed {
-                        if wheels[j].active {
-                            deactivate_wheel(ctl, &m, j, w, &mut wheels[j]);
-                        } else {
-                            wheels[j].active = true;
-                            release_conflicting_binds(
-                                ctl,
-                                &m,
-                                profile,
-                                &mut fingers,
-                                &mut active_android_keys,
-                                w,
-                            );
-                        }
+                        !wheels[j].active
+                    } else {
+                        wheels[j].active
                     }
                 }
+            };
+            if want_active != wheels[j].active {
+                if want_active {
+                    wheels[j].active = true;
+                    // 启用瞬间,释放与方向键冲突的普通绑定(避免触点卡死),
+                    // 再按物理状态对账:已经按着的方向键立刻推动摇杆(不必松手重按),
+                    // 该让位的普通绑定也一定被抬起来
+                    release_conflicting_binds(
+                        ctl,
+                        &m,
+                        profile,
+                        &mut fingers,
+                        &mut active_android_keys,
+                        w,
+                    );
+                } else {
+                    deactivate_wheel(ctl, &m, j, w, &mut wheels[j]);
+                }
+                // 归属刚改变 -> 两个方向都立刻对账一遍。
+                // 停用这一边正是"松开启用键后,原来长按着的键必须继续奏效"的关键:
+                // 那个键还按在手上,普通绑定必须马上补上它的触点。
+                let extra = usize::from(aim.down);
+                reconcile_binds(
+                    ctl,
+                    &m,
+                    profile,
+                    &wheels,
+                    extra,
+                    &held,
+                    &mut fingers,
+                    &mut active_android_keys,
+                    &mut live,
+                );
+                reconcile_wheels(
+                    ctl,
+                    &m,
+                    profile,
+                    &mut wheels,
+                    &held,
+                    fingers.count + usize::from(aim.down),
+                    &mut live,
+                );
             }
             consumed = true;
         }
@@ -732,34 +1209,32 @@ pub fn run(
         }
 
         // ---- 轮盘方向键(仅生效中的轮盘:永久 或 已启用的临时) ----
-        let mut handled = false;
-        for (j, w) in profile.wheels.iter().enumerate() {
+        // 方向状态 = "该轮盘此刻是否生效 × 对应物理键是否按着"(见 reconcile_wheels),
+        // 所以这里只判断"这个事件是不是某个生效轮盘的方向键",剩下的交给对账。
+        // 多个轮盘共用同一个方向键时,它们会一起响应(与旧行为一致)。
+        let handled = profile.wheels.iter().enumerate().any(|(j, w)| {
             let engaged = w.temp.is_none() || wheels[j].active;
-            if !engaged {
-                continue;
-            }
-            let dir_idx = if ev.code == w.up {
-                Some(0)
-            } else if ev.code == w.down {
-                Some(1)
-            } else if ev.code == w.left {
-                Some(2)
-            } else if ev.code == w.right {
-                Some(3)
-            } else {
-                None
-            };
-            if let Some(d) = dir_idx {
-                wheels[j].pressed[d] = ev.pressed;
-                update_wheel(ctl, &m, j, w, &mut wheels[j]);
-                handled = true;
-            }
-        }
+            engaged
+                && (w.up == ev.code || w.down == ev.code || w.left == ev.code || w.right == ev.code)
+        });
         if handled {
+            reconcile_wheels(
+                ctl,
+                &m,
+                profile,
+                &mut wheels,
+                &held,
+                fingers.count + usize::from(aim.down),
+                &mut live,
+            );
             continue;
         }
 
         // ---- 普通绑定(每键独立按/抬状态,最多 MAX_CONCURRENT_KEYS 并发) ----
+        // 与轮盘/瞄准共用同一个设备端触点池:先把它们的占用算出来,
+        // 挤不进去的按下在这里被明确拒绝并计入诊断 —— 而不是发出去被服务端
+        // 悄悄丢掉(那正是"按下没反应、原因不明"的来源)
+        let reserved = wheel_pointers(&wheels) + usize::from(aim.down);
         for (idx, bind) in profile.binds.iter().enumerate() {
             if bind.key != ev.code {
                 continue;
@@ -779,8 +1254,10 @@ pub fn run(
                             if fingers.is_down(idx) {
                                 ctl.touch_up(pid, px, py);
                                 fingers.release(idx);
-                            } else if fingers.try_down(idx) {
+                            } else if fingers.try_down(idx, reserved) {
                                 ctl.touch_down(pid, px, py);
+                            } else {
+                                refuse(&mut live, bind.key);
                             }
                         }
                     } else if ev.pressed {
@@ -792,13 +1269,15 @@ pub fn run(
                             ctl.touch_up(pid, px, py);
                             fingers.release(idx);
                         }
-                        if fingers.try_down(idx) {
+                        if fingers.try_down(idx, reserved) {
                             ctl.touch_down(pid, px, py);
                             scheduled.push((
                                 Instant::now()
                                     + Duration::from_millis((*duration_ms as u64).max(5)),
                                 SchedAct::Up { pid, x: px, y: py },
                             ));
+                        } else {
+                            refuse(&mut live, bind.key);
                         }
                     }
                     // 松开不在此处理,统一由定时抬起收尾
@@ -806,8 +1285,13 @@ pub fn run(
                 Action::Hold { x, y, .. } => {
                     let (px, py) = m.point(*x, *y);
                     if ev.pressed {
-                        if fingers.try_down(idx) {
+                        if fingers.try_down(idx, reserved) {
                             ctl.touch_down(pid, px, py);
+                        } else {
+                            // 已经按着(钩子自动重复)不算"被拒",只有挤不进触点池才算
+                            if !fingers.is_down(idx) {
+                                refuse(&mut live, bind.key);
+                            }
                         }
                     } else if fingers.release(idx) {
                         ctl.touch_up(pid, px, py);
@@ -816,7 +1300,7 @@ pub fn run(
                 Action::Swipe(s) => {
                     // 按下触发滑动;中途松手不打断,滑到终点由定时抬起清理按下状态
                     if ev.pressed {
-                        if fingers.try_down(idx) {
+                        if fingers.try_down(idx, reserved) {
                             // 相对坐标 -> 像素后再生成轨迹采样点
                             let start_px = m.point(s.start.0, s.start.1);
                             let end_px = m.point(s.end.0, s.end.1);
@@ -845,6 +1329,8 @@ pub fn run(
                                     SchedAct::Up { pid, x: xe, y: ye },
                                 ));
                             }
+                        } else {
+                            refuse(&mut live, bind.key);
                         }
                     }
                 }
@@ -861,6 +1347,7 @@ pub fn run(
                 }
             }
         }
+        live.pointers = fingers.count + reserved;
     }
 }
 
@@ -976,7 +1463,19 @@ fn release_conflicting_binds(
     }
 }
 
-fn update_wheel(ctl: &ControlClient, m: &Mapper, j: usize, w: &Wheel, st: &mut WheelState) {
+/// 按当前方向状态更新轮盘触点。返回是否因为设备端触点池已满而**放弃**了这次按下
+/// (供调用方计入诊断 —— 这种情况以前会直接把消息发出去、被服务端悄悄丢掉)。
+///
+/// `reserved` 是此刻被普通绑定/瞄准/其它轮盘占用的触点数:大家抢的是同一个
+/// 设备端指针池(`PointersState.MAX_POINTERS`),所以按下之前必须先问一句挤不挤得下。
+fn update_wheel(
+    ctl: &ControlClient,
+    m: &Mapper,
+    j: usize,
+    w: &Wheel,
+    st: &mut WheelState,
+    reserved: usize,
+) -> bool {
     let pid = wheel_pid(j);
     let (wx, wy) = m.point(w.cx, w.cy);
     // 触点推出距离 = 半径 × 影响范围(scope)。
@@ -993,7 +1492,7 @@ fn update_wheel(ctl: &ControlClient, m: &Mapper, j: usize, w: &Wheel, st: &mut W
             ctl.touch_up(pid, wx, wy);
             st.down = false;
         }
-        return;
+        return false;
     }
 
     // 斜向归一化
@@ -1007,6 +1506,10 @@ fn update_wheel(ctl: &ControlClient, m: &Mapper, j: usize, w: &Wheel, st: &mut W
     let ty = wy + (fy * wr as f64).round() as i32;
 
     if !st.down {
+        if reserved >= DEVICE_MAX_POINTERS {
+            // 触点池满了:不注入(注入了也会被服务端丢掉),下次方向变化时再试
+            return true;
+        }
         ctl.touch_down(pid, wx, wy);
         ctl.touch_move(pid, tx, ty);
         st.down = true;
@@ -1014,6 +1517,7 @@ fn update_wheel(ctl: &ControlClient, m: &Mapper, j: usize, w: &Wheel, st: &mut W
         ctl.touch_move(pid, tx, ty);
     }
     st.last = (tx, ty);
+    false
 }
 
 #[cfg(test)]
@@ -1164,22 +1668,46 @@ mod tests {
     fn fingers_enforces_concurrency_and_pairing() {
         let mut f = Fingers::default();
         f.align(4);
-        assert!(f.try_down(0), "首次按下应成功");
-        assert!(!f.try_down(0), "未抬起的重复按下必须被忽略(防钩子自动重复)");
+        assert!(f.try_down(0, 0), "首次按下应成功");
+        assert!(
+            !f.try_down(0, 0),
+            "未抬起的重复按下必须被忽略(防钩子自动重复)"
+        );
         assert!(f.release(0), "抬起应有记录");
         assert!(!f.release(0), "无按下记录的抬起不得误抬其它键");
 
         // 占满并发额度后新按下被拒绝;释放一个后又能按下
         f.align(MAX_CONCURRENT_KEYS + 2);
         for i in 0..MAX_CONCURRENT_KEYS {
-            assert!(f.try_down(i), "第 {i} 个键应在额度内");
+            assert!(f.try_down(i, 0), "第 {i} 个键应在额度内");
         }
         assert!(
-            !f.try_down(MAX_CONCURRENT_KEYS),
+            !f.try_down(MAX_CONCURRENT_KEYS, 0),
             "超出额度必须拒绝,否则设备端指针池会被撑爆"
         );
         assert!(f.release(3));
-        assert!(f.try_down(MAX_CONCURRENT_KEYS), "腾出额度后应可再按下");
+        assert!(f.try_down(MAX_CONCURRENT_KEYS, 0), "腾出额度后应可再按下");
+    }
+
+    /// 设备端触点池是**共享**的:普通绑定、轮盘、瞄准抢同一个池子(上限 10)。
+    /// 轮盘/瞄准已经占住的名额必须从普通绑定的额度里扣掉 —— 否则我们发出的
+    /// DOWN 会被服务端悄悄丢掉,表现就是"按下没反应、原因不明"。
+    #[test]
+    fn fingers_respects_shared_device_pointer_pool() {
+        let mut f = Fingers::default();
+        f.align(MAX_CONCURRENT_KEYS);
+        // 摇杆+瞄准先占掉 4 个:普通绑定最多再占 6 个
+        let others = 4;
+        for i in 0..(DEVICE_MAX_POINTERS - others) {
+            assert!(f.try_down(i, others), "第 {i} 个键仍在设备额度内");
+        }
+        assert_eq!(f.count, DEVICE_MAX_POINTERS - others);
+        assert!(
+            !f.try_down(DEVICE_MAX_POINTERS - others, others),
+            "再按下去就会超过设备端的 10 个触点,必须在这里挡住"
+        );
+        // 松开一个轮盘触点(others 减少)后又能按下
+        assert!(f.try_down(DEVICE_MAX_POINTERS - others, others - 1));
     }
 
     /// 变长绑定列表:align 只补长,补长后旧状态保留、新槽位为未按下
@@ -1187,11 +1715,190 @@ mod tests {
     fn fingers_align_grows_only() {
         let mut f = Fingers::default();
         f.align(2);
-        assert!(f.try_down(1));
+        assert!(f.try_down(1, 0));
         f.align(5);
         assert!(f.is_down(1), "补长不得丢失已按下状态");
         assert!(!f.is_down(4), "新槽位应为未按下");
         f.free_all();
         assert!(!f.is_down(1) && f.count == 0, "free_all 必须清空计数");
+    }
+
+    /// 结构指纹:键位表/轮盘表"数量或键码"一变就必须变,只有坐标之类
+    /// 不影响归属的字段变化时保持不变(否则一边打一边调参会被反复抬手)。
+    #[test]
+    fn signatures_track_structure_not_geometry() {
+        use crate::keymap::{KeyBind, TempWheel};
+
+        let mut p = Profile::default();
+        p.binds = vec![
+            KeyBind {
+                key: 37,
+                action: Action::Hold {
+                    x: 0.5,
+                    y: 0.5,
+                    radius: 0.03,
+                },
+            },
+            KeyBind {
+                key: 36,
+                action: Action::Hold {
+                    x: 0.5,
+                    y: 0.5,
+                    radius: 0.03,
+                },
+            },
+        ];
+        let b0 = binds_signature(&p.binds);
+        // 改坐标/半径:不是结构变化,不该触发抬手重建
+        p.binds[0].action = Action::Hold {
+            x: 0.1,
+            y: 0.9,
+            radius: 0.09,
+        };
+        assert_eq!(binds_signature(&p.binds), b0, "只改坐标不算结构变化");
+        // 改键码 / 增删键位:索引会整体位移,必须识别出来
+        p.binds[0].key = 38;
+        assert_ne!(binds_signature(&p.binds), b0, "换键码必须触发重建");
+        let b1 = binds_signature(&p.binds);
+        p.binds.pop();
+        assert_ne!(binds_signature(&p.binds), b1, "增删键位必须触发重建");
+
+        let w0 = wheel_signature(&p.wheels);
+        p.wheels[0].cx = 0.9;
+        p.wheels[0].radius = 0.02;
+        assert_eq!(wheel_signature(&p.wheels), w0, "只改圆心/半径不算结构变化");
+        p.wheels[0].up = 30;
+        assert_ne!(wheel_signature(&p.wheels), w0, "换方向键必须触发重建");
+        let w1 = wheel_signature(&p.wheels);
+        p.wheels[0].temp = Some(TempWheel {
+            key: 18,
+            mode: TempMode::Hold,
+        });
+        assert_ne!(wheel_signature(&p.wheels), w1, "设置启用键必须触发重建");
+        let w2 = wheel_signature(&p.wheels);
+        p.wheels.push(crate::keymap::Wheel {
+            up: 1,
+            down: 2,
+            left: 3,
+            right: 4,
+            cx: 0.5,
+            cy: 0.5,
+            radius: 0.05,
+            scope: 1.0,
+            temp: None,
+        });
+        assert_ne!(wheel_signature(&p.wheels), w2, "增删轮盘必须触发重建");
+    }
+
+    /// 归属判定:生效中的轮盘方向键归摇杆;临时轮盘的启用键**永远**归它自己;
+    /// 未启用的临时轮盘方向键不归摇杆(要让位给普通绑定)。
+    #[test]
+    fn wheel_ownership_follows_engagement() {        use crate::keymap::TempWheel;
+        let mut p = Profile::default();
+        p.binds = Vec::new();
+        p.wheels = vec![
+            crate::keymap::Wheel {
+                up: 17,
+                down: 31,
+                left: 30,
+                right: 32,
+                cx: 0.3,
+                cy: 0.4,
+                radius: 0.05,
+                scope: 1.0,
+                temp: None,
+            },
+            crate::keymap::Wheel {
+                up: 23,
+                down: 37,
+                left: 36,
+                right: 22,
+                cx: 0.7,
+                cy: 0.4,
+                radius: 0.05,
+                scope: 1.0,
+                temp: Some(TempWheel {
+                    key: 18,
+                    mode: TempMode::Hold,
+                }),
+            },
+        ];
+        let mut st = vec![WheelState::default(); 2];
+
+        // 永久轮盘:方向键一直归它
+        assert!(key_owned_by_wheel(&p, &st, 17));
+        // 临时轮盘未启用:方向键与启用键的归属不同
+        assert!(!key_owned_by_wheel(&p, &st, 37), "未启用的临时摇杆不占方向键");
+        assert!(key_owned_by_wheel(&p, &st, 18), "启用键永远归临时摇杆");
+        // 启用后方向键归它
+        st[1].active = true;
+        assert!(key_owned_by_wheel(&p, &st, 37));
+        assert!(key_owned_by_wheel(&p, &st, 23));
+        // 与摇杆无关的键始终不归摇杆
+        assert!(!key_owned_by_wheel(&p, &st, 24));
+    }
+
+    /// 用户实测场景(本轮修复的核心):"我按着 K 键正在连招,忽然按下临时摇杆的
+    /// 启用键,又松开启用键 —— 这时 K 还按在手上,却必须等松开手再按一次才触发,
+    /// 战场瞬息万变,这很被动。"
+    ///
+    /// 判定层必须表达出:松开启用键的**那一瞬间**,仍被按住的 K 的普通绑定
+    /// 立刻重新生效(它由物理按键镜像 [`Held`] 推导,不依赖任何键盘事件)。
+    #[test]
+    fn held_key_resumes_its_normal_bind_the_moment_the_wheel_deactivates() {
+        use crate::keymap::{KeyBind, TempWheel};
+
+        // 配置:K(37) 是长按绑定;临时摇杆的方向键里也有 K,启用键是 E(18)
+        let mut p = Profile::default();
+        p.binds = vec![KeyBind {
+            key: 37,
+            action: Action::Hold {
+                x: 0.9,
+                y: 0.8,
+                radius: 0.03,
+            },
+        }];
+        p.wheels = vec![crate::keymap::Wheel {
+            up: 23,
+            down: 37,
+            left: 36,
+            right: 22,
+            cx: 0.8,
+            cy: 0.7,
+            radius: 0.05,
+            scope: 1.0,
+            temp: Some(TempWheel {
+                key: 18,
+                mode: TempMode::Hold,
+            }),
+        }];
+        let mut st = vec![WheelState::default(); 1];
+        let held = {
+            let mut h = Held::default();
+            h.set(37, true); // 用户一直按着 K
+            h
+        };
+        // "普通绑定此刻该不该按下"的判定(与 reconcile_binds 内完全同构)
+        let want = |held: &Held, st: &[WheelState]| {
+            held.has(37) && !key_owned_by_wheel(&p, st, 37)
+        };
+
+        // 摇杆未启用:K 归普通绑定,按着 -> 该有触点
+        assert!(want(&held, &st));
+
+        // 按下启用键:K 被摇杆接管 -> 普通绑定必须让位(同一时刻只能有一处生效)
+        st[0].active = true;
+        assert!(!want(&held, &st), "启用期间 K 归摇杆,普通绑定必须让位");
+
+        // 松开启用键:摇杆停用,而 K 仍在手上 -> 普通绑定必须**立刻**重新生效
+        st[0].active = false;
+        assert!(
+            want(&held, &st),
+            "松开启用键的瞬间,仍按着的 K 必须马上回到普通绑定(不必松手重按)"
+        );
+
+        // 直到 K 真正松开,才该抬起
+        let released = Held::default();
+        assert!(!want(&released, &st));
     }
 }

@@ -25,6 +25,13 @@ pub struct Settings {
     /// scrcpy 可执行文件路径(空 = 交给自动寻找 / PATH)
     #[serde(default)]
     pub scrcpy_path: String,
+    /// scrcpy 所在目录(空 = 未指定)。
+    ///
+    /// 为什么除了可执行文件路径还要记目录:官方发行包换版本时目录名会变
+    /// (scrcpy-win64-v3.1 → v3.3),用户也常常整个搬走。只记死的 exe 路径,
+    /// 一旦搬动就"重启后依旧找不到";记着**目录**就能在那一带把它重新找回来。
+    #[serde(default)]
+    pub scrcpy_dir: String,
     /// scrcpy-server 路径(空 = 由 scrcpy 同目录推导)
     #[serde(default)]
     pub server_path: String,
@@ -52,6 +59,7 @@ impl Default for Settings {
         Self {
             remember_paths: true,
             scrcpy_path: String::new(),
+            scrcpy_dir: String::new(),
             server_path: String::new(),
             adb_path: String::new(),
             scrcpy_args: String::new(),
@@ -65,6 +73,7 @@ impl Settings {
     /// 是否有任何路径被记住(用于启动日志与界面上的"已记住"提示)
     pub fn has_any_path(&self) -> bool {
         !self.scrcpy_path.trim().is_empty()
+            || !self.scrcpy_dir.trim().is_empty()
             || !self.server_path.trim().is_empty()
             || !self.adb_path.trim().is_empty()
     }
@@ -72,33 +81,113 @@ impl Settings {
     /// 清空全部路径(保留 remember_paths 与启动参数)
     pub fn clear_paths(&mut self) {
         self.scrcpy_path.clear();
+        self.scrcpy_dir.clear();
         self.server_path.clear();
         self.adb_path.clear();
         self.selected_serial.clear();
     }
 
-    /// 校正路径:只保留**当前确实存在**的文件路径,顺带去掉首尾空白。
-    /// 返回是否发生了改动。
+    /// 内容是否一致(**不含** `saved_at`)。
+    ///
+    /// 必要性:`saved_at` 每次真正落盘都会被重新打上时间戳。若它参与"内容变没变"
+    /// 的比较,那么"落盘后的内容"与"下一帧登记的内容"永远不相等 ——
+    /// 结果是**每一帧都写一次盘**(界面每 120ms 一帧),既费磁盘又毫无意义。
+    /// 判定只应看用户真正改了什么。
+    pub fn content_eq(&self, other: &Self) -> bool {
+        let mut a = self.clone();
+        let mut b = other.clone();
+        a.saved_at = 0;
+        b.saved_at = 0;
+        a == b
+    }
+
+    /// 值得"再去重新找一遍 scrcpy"的目录(按优先级)。
+    ///
+    /// 用于用户搬动/升级 scrcpy 目录后的自动恢复:`scrcpy_dir` 是明确指定的目录,
+    /// 其次退到"上次那个 exe 的所在目录"。都取不到就返回空(走自动寻找)。
+    pub fn search_dirs(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = Vec::new();
+        let dir = self.scrcpy_dir.trim();
+        if !dir.is_empty() {
+            v.push(PathBuf::from(dir));
+        }
+        let exe = self.scrcpy_path.trim();
+        if !exe.is_empty() {
+            if let Some(parent) = Path::new(exe).parent() {
+                let p = parent.to_path_buf();
+                if !p.as_os_str().is_empty() && !v.contains(&p) {
+                    v.push(p);
+                }
+            }
+        }
+        v
+    }
+
+    /// 校正路径:去掉首尾空白,并**把死路径里的位置信息保留下来**。
     ///
     /// 必要性:用户升级/移动 scrcpy 目录后,记住的旧路径会变成死路径。
     /// 死路径比空路径更糟 —— 空路径还能走"同目录推导 + PATH"的自动逻辑,
-    /// 死路径却会让 [启动 scrcpy] 直接失败。因此读到之后立即校验并丢弃。
+    /// 死路径却会让 [启动 scrcpy] 直接失败。所以这里仍会清掉死路径,
+    /// 但**先把它的所在目录记进 `scrcpy_dir`**,供启动时在那一带重新找回
+    /// (旧版是直接抹掉,于是"重启后依旧找不到 scrcpy"),返回是否发生了改动。
     pub fn sanitize(&mut self) -> bool {
         let mut changed = false;
-        let mut fix = |field: &mut String| {
+
+        // ---- 1) scrcpy 目录字段 ----
+        let trimmed = self.scrcpy_dir.trim().to_string();
+        if trimmed != self.scrcpy_dir {
+            self.scrcpy_dir = trimmed;
+            changed = true;
+        }
+        let mut dir = self.scrcpy_dir.clone();
+        if !dir.is_empty() && !Path::new(dir.as_str()).is_dir() {
+            // 目录栏里被填成了文件:还给"路径"一栏处理(下面按可执行文件校验)
+            if Path::new(dir.as_str()).is_file() && self.scrcpy_path.trim().is_empty() {
+                self.scrcpy_path = dir.clone();
+            }
+            dir.clear();
+            changed = true;
+        }
+
+        // ---- 2) 三个文件路径 ----
+        // 一起取出引用(三个字段互不相交,借用合法),目录提示写在本地的 dir 里
+        for field in [
+            &mut self.scrcpy_path,
+            &mut self.server_path,
+            &mut self.adb_path,
+        ] {
             let t = field.trim().to_string();
             if t != *field {
                 *field = t;
                 changed = true;
             }
-            if !field.is_empty() && !Path::new(field.as_str()).is_file() {
-                field.clear();
-                changed = true;
+            if field.is_empty() {
+                continue;
             }
-        };
-        fix(&mut self.scrcpy_path);
-        fix(&mut self.server_path);
-        fix(&mut self.adb_path);
+            let p = Path::new(field.as_str());
+            if p.is_file() {
+                continue;
+            }
+            if p.is_dir() {
+                // 用户把**目录**填/选进了"路径"栏:这不算错,记成 scrcpy 目录,
+                // 具体可执行文件由启动逻辑在目录里找。
+                // (旧版把这个目录当死路径直接抹掉 —— 这正是
+                //  "我设置好 scrcpy 目录后,再次启动依旧找不到" 的成因之一。)
+                if dir.is_empty() {
+                    dir = field.clone();
+                }
+            } else if dir.is_empty() {
+                // 死路径:把"它原来在哪"留下来,启动时可在那一带重新找到
+                if let Some(up) = nearest_existing_dir(p, 2) {
+                    dir = up.display().to_string();
+                }
+            }
+            field.clear();
+            changed = true;
+        }
+        self.scrcpy_dir = dir;
+
+        // ---- 3) 上次设备 ----
         let serial = self.selected_serial.trim().to_string();
         if serial != self.selected_serial {
             self.selected_serial = serial;
@@ -106,6 +195,31 @@ impl Settings {
         }
         changed
     }
+}
+
+/// 从一条(已经不存在的)路径出发,向上找最近的**确实存在**的目录。
+///
+/// `max_up` 是允许跳过的、同样不存在的层数。为什么要往上跳:用户升级 scrcpy 时
+/// 常常是"把新版本解压到旁边、删掉旧版本目录" —— 旧 exe 的**父目录也没了**,
+/// 只有再上一级还在。记着那一级,启动时就能在附近把新版本重新找回来
+/// (搜索是[`crate::adb::find_scrcpy_under`],只往名字像 scrcpy 的子目录里下探,
+/// 所以即便记到桌面/下载目录这种大目录也不会拖慢启动)。
+///
+/// 上溯有限(默认两层):一路退到盘符根目录对用户没有任何意义。
+fn nearest_existing_dir(path: &Path, max_up: usize) -> Option<PathBuf> {
+    let mut cur = path.parent();
+    let mut up = 0;
+    while let Some(p) = cur {
+        if p.is_dir() {
+            return Some(p.to_path_buf());
+        }
+        if up >= max_up {
+            return None;
+        }
+        up += 1;
+        cur = p.parent();
+    }
+    None
 }
 
 /// 延迟写盘的缓存:持有"待写入的内容"与"上次已写出的内容",
@@ -156,11 +270,13 @@ impl SettingsCache {
     /// 把标记过的最新设置写入磁盘;无改动或内容未变时直接返回 None。
     /// 返回 Some(...) 表示"确实尝试了写入"(供调用方决定是否提示用户)。
     pub fn save_if_dirty(&mut self) -> Option<std::io::Result<PathBuf>> {
-        let mut want = self.pending.take()?;
-        if self.saved.as_ref() == Some(&want) {
-            return None;
+        let want = self.pending.take()?;
+        if let Some(saved) = &self.saved {
+            if saved.content_eq(&want) {
+                return None;
+            }
         }
-        want = stamped(want);
+        let want = stamped(want);
         let path = path();
         if let Some(dir) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(dir) {
@@ -189,10 +305,22 @@ pub fn path() -> PathBuf {
     crate::app::config_dir().join("settings.json")
 }
 
-/// 读取设置;文件不存在、内容损坏或读取失败时返回 None(调用方用默认值)
+/// 读取设置;文件不存在、内容损坏或读取失败时返回 None(调用方用默认值)。
+///
+/// 这里走程序里唯一那份"容忍 BOM 的配置文件读取"(见
+/// [`crate::app::read_config_text`]):Windows 编辑器加上的 BOM 曾经会让
+/// 整份设置被当成损坏而退回默认值,进而在下一次落盘时被覆盖掉。
 pub fn load() -> Option<Settings> {
-    let text = std::fs::read_to_string(path()).ok()?;
-    serde_json::from_str::<Settings>(&text).ok()
+    let path = path();
+    let text = crate::app::read_config_text(&path)?;
+    match serde_json::from_str::<Settings>(&text) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("[settings] {} 解析失败({e}),改用默认设置", path.display());
+            crate::app::backup_broken_config(&path);
+            None
+        }
+    }
 }
 
 /// 生成一份带当前时间戳的设置副本(落盘前调用)
@@ -215,16 +343,24 @@ mod tests {
         assert!(s.remember_paths, "缺省应视为记住");
         assert_eq!(s.scrcpy_path, "/usr/bin/scrcpy");
         assert_eq!(s.scrcpy_args, "");
+        assert_eq!(s.scrcpy_dir, "", "老文件没有目录字段,缺省为空");
     }
 
     /// 死路径必须被清空 —— 留着它会让 [启动 scrcpy] 直接失败,
-    /// 清空后才能走"同目录推导 + PATH"的自动逻辑
+    /// 清空后才能走"同目录推导 + PATH"的自动逻辑。
+    ///
+    /// 同时**必须留下位置线索**:用户搬动/升级 scrcpy 目录后,
+    /// 记着它原来在哪个目录,启动时才能在那附近重新找回;
+    /// 旧版把位置信息一并抹掉,于是"重启后依旧找不到 scrcpy"。
     #[test]
-    fn sanitize_drops_nonexistent_paths() {
+    fn sanitize_drops_nonexistent_paths_but_keeps_location_hint() {
+        let dir = std::env::temp_dir();
+        let gone = dir.join("scrcpy-pad-这个文件不存在.exe");
         let mut s = Settings {
-            scrcpy_path: "  /definitely/not/here/scrcpy  ".into(),
-            server_path: "/also/not/here/scrcpy-server".into(),
+            scrcpy_path: format!("  {}  ", gone.display()),
+            server_path: String::new(),
             adb_path: String::new(),
+            scrcpy_dir: String::new(),
             remember_paths: true,
             scrcpy_args: "--stay-awake".into(),
             selected_serial: " ABC123 ".into(),
@@ -232,44 +368,77 @@ mod tests {
         };
         assert!(s.sanitize(), "存在死路径时 sanitize 应报告改动");
         assert_eq!(s.scrcpy_path, "", "不存在的文件必须清空");
-        assert_eq!(s.server_path, "", "不存在的文件必须清空");
         assert_eq!(s.selected_serial, "ABC123", "序列号应去掉首尾空白");
         assert_eq!(s.scrcpy_args, "--stay-awake", "启动参数不受影响");
+        // 死路径的所在目录存在 -> 必须被记下来供启动时重新寻找
+        assert_eq!(
+            PathBuf::from(&s.scrcpy_dir),
+            dir,
+            "死路径的位置线索必须保留,否则无法在附近重新找到 scrcpy"
+        );
+        assert_eq!(s.search_dirs(), vec![dir]);
 
         // 已干净的内容再调用不应报告改动(否则会每帧写盘)
         assert!(!s.sanitize());
     }
 
+    /// 用户把**目录**填进"scrcpy 路径"栏时必须被当作目录接受(而不是当死路径丢掉)
+    /// —— 用户原话就是"我设置好 scrcpy 目录后…"。
+    #[test]
+    fn sanitize_accepts_a_directory_as_scrcpy_location() {
+        let dir = std::env::temp_dir();
+        let mut s = Settings {
+            scrcpy_path: dir.display().to_string(),
+            scrcpy_dir: String::new(),
+            ..Settings::default()
+        };
+        assert!(s.sanitize());
+        assert_eq!(s.scrcpy_path, "", "目录不该留在可执行文件栏里");
+        assert_eq!(
+            s.scrcpy_dir,
+            dir.display().to_string(),
+            "目录必须被记为 scrcpy 目录,启动时才好在里面找 scrcpy.exe"
+        );
+        // 目录本身就是"位置",必须算作已记住的路径
+        assert!(s.has_any_path());
+        assert_eq!(s.search_dirs(), vec![dir.clone()]);
+    }
+
     /// 缓存只在内容真的变化时才报告"需要落盘"。
     ///
     /// 注意:这里**不真的调用 save_if_dirty**(它会写用户真实的 settings.json),
-    /// 而是直接验证判定语义 —— 写盘与否完全由这一步的相等判断决定。
+    /// 而是直接验证判定语义 —— 写盘与否完全由 content_eq 这一步决定。
     #[test]
     fn cache_skips_identical_content() {
-        let base = Settings::default();
+        let mut base = Settings::default();
+        // 模拟"刚从磁盘读出来"的设置:带上一轮落盘的时间戳
+        base.saved_at = 1_789_821_325;
+        let mut zeroed = base.clone();
+        zeroed.saved_at = 0; // mark_dirty 会把时间戳归零
         let mut c = SettingsCache::new(base.clone());
 
-        // 登记与"已落盘内容"完全一致的一份:应当不产生待写内容
         c.mark_dirty(base.clone());
         assert!(
-            c.pending_for_test().as_ref() == Some(&base),
+            c.pending_for_test().as_ref() == Some(&zeroed),
             "登记的内容应原样保存(时间戳归零)"
         );
 
         // 关键行为:时间戳不参与"内容是否变化"的判断。
-        // 若参与,由于每次登记的时间戳都不同,会变成每帧都写盘。
-        let mut stamped = base.clone();
-        stamped.saved_at = 12345;
-        c.mark_dirty(stamped);
-        assert_eq!(
-            c.pending_for_test().unwrap().saved_at,
-            0,
-            "登记时必须把时间戳归零,否则内容永不相等"
+        // 若参与,那么"已落盘内容(带时间戳)"与"下一帧登记的内容(时间戳归零)"
+        // 永远不相等 —— 结果是每帧都写一次盘(界面 120ms 一帧)。
+        assert!(
+            base.content_eq(&zeroed),
+            "只有时间戳不同时,必须判定为『内容没变』-> 不写盘"
         );
-        assert_eq!(
-            c.pending_for_test().as_ref(),
-            Some(&base),
-            "归零后应与已保存内容逐字段相等 -> 不触发写盘"
+        // 真正的字段变化必须被识别出来
+        let mut changed = zeroed.clone();
+        changed.scrcpy_path = "/opt/scrcpy/scrcpy".into();
+        assert!(!base.content_eq(&changed), "路径变了就必须写盘");
+        let mut flag = zeroed.clone();
+        flag.remember_paths = !base.remember_paths;
+        assert!(
+            !base.content_eq(&flag),
+            "『记住路径』开关本身也必须能落盘(否则用户关了它下次又变回开着)"
         );
     }
 
@@ -280,7 +449,31 @@ mod tests {
         assert!(!s.has_any_path());
         s.scrcpy_path = "/x".into();
         assert!(s.has_any_path());
+        s.scrcpy_dir = "/y".into();
         s.clear_paths();
         assert!(!s.has_any_path());
+        assert!(s.scrcpy_dir.is_empty(), "clear_paths 也必须清掉目录记忆");
+    }
+
+    /// search_dirs 的优先级:明确的 scrcpy 目录 > 上次 exe 的所在目录;去重
+    #[test]
+    fn search_dirs_prefers_explicit_dir() {
+        let s = Settings {
+            scrcpy_path: "/opt/scrcpy/scrcpy".into(),
+            scrcpy_dir: "/data/scrcpy".into(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            s.search_dirs(),
+            vec![PathBuf::from("/data/scrcpy"), PathBuf::from("/opt/scrcpy")]
+        );
+        // 只记住 exe 时,退回它的所在目录
+        let s2 = Settings {
+            scrcpy_path: "/opt/scrcpy/scrcpy".into(),
+            ..Settings::default()
+        };
+        assert_eq!(s2.search_dirs(), vec![PathBuf::from("/opt/scrcpy")]);
+        // 什么都没有 -> 空(走自动寻找)
+        assert!(Settings::default().search_dirs().is_empty());
     }
 }
