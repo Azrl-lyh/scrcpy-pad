@@ -314,6 +314,86 @@ impl Default for DraftBind {
     }
 }
 
+/// 截图的"局部亮度网格":浮层自动对比的依据。
+///
+/// 把截图缩成至多 64×64 的亮度均值(每格覆盖几十像素),于是"这一块底下是亮是暗"
+/// 一查就知道。内存可忽略,却能让每个键位/摇杆**按自己底下的画面**选深浅 ——
+/// 这是本程序比一般 HUD 多出来的条件:画布底下就是手机截图本身。
+#[derive(Default)]
+struct LumaGrid {
+    /// 网格宽高(格数)
+    gw: usize,
+    gh: usize,
+    /// 每格的平均亮度(0..1)
+    cells: Vec<f32>,
+    /// 对应的截图尺寸(像素)
+    w: u32,
+    h: u32,
+}
+
+impl LumaGrid {
+    /// 由截图建立亮度网格;尺寸非法时返回 None(此时浮层退回手动档位)
+    fn new(img: &egui::ColorImage) -> Option<Self> {
+        let (w, h) = (img.size[0], img.size[1]);
+        if w == 0 || h == 0 || img.pixels.len() < w * h {
+            return None;
+        }
+        // 网格最多 64×64:再细也没意义(浮层圈本身的直径就有几十像素),
+        // 而 64×64 的采样在建立时也只是一次线性扫描。
+        let gw = w.min(64).max(1);
+        let gh = h.min(64).max(1);
+        let mut sum = vec![0f32; gw * gh];
+        let mut cnt = vec![0f32; gw * gh];
+        for y in 0..h {
+            let gy = y * gh / h;
+            for x in 0..w {
+                let gx = x * gw / w;
+                let [r, g, b, _] = img.pixels[y * w + x].to_srgba_unmultiplied();
+                let l = (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) / 255.0;
+                let i = gy * gw + gx;
+                sum[i] += l;
+                cnt[i] += 1.0;
+            }
+        }
+        let cells = sum
+            .iter()
+            .zip(&cnt)
+            .map(|(s, c)| if *c > 0.0 { s / c } else { 0.5 })
+            .collect();
+        Some(Self {
+            gw,
+            gh,
+            cells,
+            w: w as u32,
+            h: h as u32,
+        })
+    }
+
+    /// 以截图像素 (x, y) 为中心的 3×3 格平均亮度。
+    /// 取 3×3 而不是单格:单格可能整好压在一条亮边或一小块高光上,
+    /// 平均一下更接近"这一块看上去的明暗"。
+    fn around(&self, x: i32, y: i32) -> f32 {
+        if self.cells.is_empty() || self.w == 0 || self.h == 0 {
+            return 0.5;
+        }
+        let gx = ((x.max(0) as usize) * self.gw / self.w as usize).min(self.gw - 1);
+        let gy = ((y.max(0) as usize) * self.gh / self.h as usize).min(self.gh - 1);
+        let (mut s, mut n) = (0.0f32, 0.0f32);
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                let cx = gx as i32 + dx;
+                let cy = gy as i32 + dy;
+                if cx < 0 || cy < 0 || cx >= self.gw as i32 || cy >= self.gh as i32 {
+                    continue;
+                }
+                s += self.cells[cy as usize * self.gw + cx as usize];
+                n += 1.0;
+            }
+        }
+        if n > 0.0 { s / n } else { 0.5 }
+    }
+}
+
 pub struct PadApp {
     shared: SharedState,
     grab_flag: Arc<std::sync::atomic::AtomicBool>,
@@ -380,8 +460,12 @@ pub struct PadApp {
     /// 新增键位草稿是否进行中(决定预览圆圈/轨迹是否显示,并允许取消)
     draft_active: bool,
     shot: Option<(egui::TextureHandle, u32, u32)>,
+    /// 截图的局部亮度网格(浮层自动对比用);没截图时为 None
+    shot_lum: Option<LumaGrid>,
     shot_rx: Option<Receiver<Result<egui::ColorImage, String>>>,
     overlay_filter: OverlayFilter,
+    /// 在画布上点开的摇杆(显示它的四个方向键);None = 未点开
+    wheel_info: Option<usize>,
 
     draft: DraftBind,
     logs: VecDeque<String>,
@@ -580,6 +664,8 @@ impl PadApp {
             control: None,
             aim_live: Default::default(),
             live: Default::default(),
+            notices: Vec::new(),
+            space_recheck: false,
             toolbar_release: false,
         }));
 
@@ -755,8 +841,10 @@ impl PadApp {
             easing_edit: None,
             draft_active: false,
             shot: None,
+            shot_lum: None,
             shot_rx: None,
             overlay_filter: OverlayFilter::All,
+            wheel_info: None,
             draft: DraftBind::default(),
             logs: VecDeque::new(),
             profile_path,
@@ -1648,8 +1736,11 @@ impl eframe::App for PadApp {
                 match r {
                     Ok(img) => {
                         let (w, h) = (img.width() as u32, img.height() as u32);
+                        // 先建亮度网格再交给纹理:浮层要靠它做"自动对比"
+                        self.shot_lum = LumaGrid::new(&img);
                         let tex = ctx.load_texture("screenshot", img, Default::default());
                         self.shot = Some((tex, w, h));
+                        self.wheel_info = None; // 换了截图,之前点开的摇杆信息卡作废
                         self.log(format!("截图成功 {w}x{h},点击图像可取点"));
                         self.sync_display_space(w, h);
                     }
@@ -1809,6 +1900,29 @@ impl eframe::App for PadApp {
             if let (Some(slot), Some(code)) = (self.waiting_key, ev.pressed_code()) {
                 self.waiting_key = None;
                 self.assign_key(slot, code);
+            }
+        }
+
+        // ---- 引擎侧的解释性消息(映射开关、触点池满、配置重建等)写进日志 ----
+        // 总开关键是在引擎线程里处理的,以前不留任何痕迹 —— 于是"映射到底开没开、
+        // 刚才是谁把它关了"完全看不出来,用户只能反复按 F8 试。
+        {
+            let (msgs, recheck) = {
+                let mut g = self.shared.lock().unwrap();
+                (
+                    std::mem::take(&mut g.notices),
+                    std::mem::take(&mut g.space_recheck),
+                )
+            };
+            for m in msgs {
+                self.log(m);
+            }
+            // 引擎发现"空闲后又开始按键":重新确认一次触摸坐标空间。
+            // 这期间手机可能转过屏,而坐标空间不更新的话注入会落到错的地方
+            // (表现同样是"按键不反应"),以前只能靠关一次开一次映射来碰运气。
+            if recheck {
+                self.space_rx = None;
+                self.refresh_display_space();
             }
         }
 
@@ -2040,19 +2154,26 @@ impl eframe::App for PadApp {
                          启用期间按着的方向键也会立刻推动摇杆;\n\
                          [添加轮盘]新建的摇杆半径固定 150px,\n\
                          并自动落在不与已有摇杆重叠的位置\n\
-                         (画布上的编号与列表里的轮盘N一一对应)\n\
+                         \n\
+                         画布上的摇杆只标「摇杆N」;\n\
+                         想看某个摇杆的方向键,直接在截图上\n\
+                         点一下那个摇杆的圈,旁边会弹出信息卡\n\
+                         (四个方向 + 启用键与模式),再点一下收起;\n\
+                         点空白处也会收起\n\
                          \n\
                          轮盘影响范围:决定方向键按下后手指\n\
                          实际被推多远(= 半径 × 系数);界面上\n\
                          的圈仍是半径,两者不同时会多画一圈\n\
                          橙色虚线显示真实推出距离\n\
                          \n\
-                         键位显示亮度([外观]里):\n\
-                         截图上的键位/摇杆响应圈可加深也可\n\
-                         变浅(往左加深/往右变浅),背景太亮\n\
-                         看不清键位时用它;只改明暗不改色相,\n\
-                         摇杆的圆环+圆心+方向标注结构不变,\n\
-                         标注自带对比描边,深浅都读得清\n\
+                         键位看得清吗([外观]里):\n\
+                         默认开启[键位自动对比] —— 按截图每个\n\
+                         键位/摇杆底下的明暗,自动决定那一处用\n\
+                         深色还是浅色;每个圈还描一圈反相外套、\n\
+                         每个标注垫一层半透明衬底(制图学的光晕\n\
+                         与字幕衬底那套做法),亮块暗块上都看得清\n\
+                         [键位显示亮度]是在自动结果上的微调;\n\
+                         关掉自动对比后它就等同旧版的固定档位\n\
                          \n\
                          图层:截图上方[显示]可只看\n\
                          键位/轮盘/永久/临时/锚点(FPS)\n\
@@ -2086,6 +2207,9 @@ impl eframe::App for PadApp {
                          与「因为挤不进去而被放弃的按下次数」。\n\
                          若这个数不为 0,那一次按下会被设备丢掉\n\
                          (表现为按了没反应),此时少按几个键即可\n\
+                         映射的每一次开关(总开关键 / 顶栏按钮)\n\
+                         都会写进日志 —— 遇到「按键不反应」时,\n\
+                         先看日志里映射是不是被误关了\n\
                          \n\
                          快捷键(键位捕获/取点/打字时不生效):\n\
                          Ctrl+Z 撤销 ⟳重做用 Ctrl+Y\n\
@@ -2103,8 +2227,8 @@ impl eframe::App for PadApp {
                          密度可选紧凑/标准/宽松;\n\
                          可设置背景图片(铺满/完整/平铺)\n\
                          与暗化遮罩、面板不透明度;\n\
-                         [键位显示亮度]单独调截图上键位圈\n\
-                         与摇杆圈的明暗(见上文);\n\
+                         [键位自动对比]与[键位显示亮度]单独调\n\
+                         截图上键位圈与摇杆圈的清晰度(见上文);\n\
                          外观随配置保存,[选用配置]会一并切换;\n\
                          另外还会自动缓存到程序目录(与键位\n\
                          配置同目录的 look.json),重启后保持\n\
@@ -3061,8 +3185,14 @@ impl PadApp {
         let g = self.shared.lock().unwrap();
         let th = g.profile.look.theme();
         // 键位浮层的显示亮度档位(0=默认;负=加深,正=变浅)。
-        // 背景/游戏画面很亮时把圈加深、昏暗时变浅,键位才看得清(用户诉求)。
-        let tone = g.profile.look.overlay_tone;
+        // 手动微调档位;每个标注的实际档位还要叠上"按截图采样的自动对比"
+        // (见 theme 的浮层可读性说明:描边 + 衬底 + 自动对比三招)
+        let tone_manual = g.profile.look.overlay_tone;
+        let auto = g.profile.look.overlay_auto;
+        let tone_at = |sx: i32, sy: i32| match (&self.shot_lum, auto) {
+            (Some(grid), true) => theme::auto_tone(grid.around(sx, sy), tone_manual),
+            _ => theme::clamp_tone(tone_manual),
+        };
 
         // 键位(含草稿标记)仅在"全部/仅键位"时显示
         if matches!(self.overlay_filter, OverlayFilter::All | OverlayFilter::Keys) {
@@ -3075,8 +3205,10 @@ impl PadApp {
                         ..
                     }
                     | Action::Hold { x, y, radius } => {
-                        let p = to_screen(m.x(*x), m.y(*y));
+                        let (px, py) = (m.x(*x), m.y(*y));
+                        let p = to_screen(px, py);
                         let r = m.len(*radius) * scale;
+                        let tone = tone_at(px, py);
                         // 修改响应范围中的键位显示黄色;否则点按绿、长按橙
                         let (ring, fill) = if self.resizing == Some(i) {
                             (th.key_resize, th.key_resize_fill)
@@ -3087,6 +3219,13 @@ impl PadApp {
                         };
                         let (ring, fill) = theme::tone_ring_fill(ring, fill, tone);
                         painter.circle_filled(p, r, fill);
+                        // 外套(halo):先画一圈反相粗线,再画本色圈 ——
+                        // 于是无论在亮块还是暗块上,圈都有一圈边界可辨
+                        painter.circle_stroke(
+                            p,
+                            r,
+                            Stroke::new(size::KEY_STROKE + 2.5, theme::casing(ring)),
+                        );
                         painter.circle_stroke(p, r, Stroke::new(size::KEY_STROKE, ring));
                         theme::paint_label(
                             painter,
@@ -3109,7 +3248,7 @@ impl PadApp {
                             &to_screen,
                             scale,
                             &short_name(b.key),
-                            tone,
+                            tone_at(sp.0, sp.1),
                         );
                     }
                     Action::AndroidKey { .. } => {}
@@ -3134,24 +3273,27 @@ impl PadApp {
                         &to_screen,
                         scale,
                         "新增",
-                        tone,
+                        tone_at(self.draft.swipe_start.0, self.draft.swipe_start.1),
                     );
                 }
                 1 => {
                     let dp = to_screen(self.draft.x, self.draft.y);
                     let r = self.draft.radius * scale;
+                    let tone = tone_at(self.draft.x, self.draft.y);
+                    let ink = theme::tone_color(th.draft, tone);
                     painter.circle_stroke(
                         dp,
                         r,
-                        Stroke::new(size::KEY_STROKE, theme::tone_color(th.draft, tone)),
+                        Stroke::new(size::KEY_STROKE + 2.5, theme::casing(ink)),
                     );
+                    painter.circle_stroke(dp, r, Stroke::new(size::KEY_STROKE, ink));
                     theme::paint_label(
                         painter,
                         dp + vec2(0.0, r + 10.0),
                         Align2::CENTER_CENTER,
                         "新增",
                         FontId::proportional(size::SMALL_FONT),
-                        theme::tone_color(th.draft, tone),
+                        ink,
                     );
                 }
                 _ => {}
@@ -3163,7 +3305,9 @@ impl PadApp {
             && g.profile.aim.anchor_set()
         {
             let aim = &g.profile.aim;
-            let p = to_screen(m.x(aim.anchor_x), m.y(aim.anchor_y));
+            let (ax, ay) = (m.x(aim.anchor_x), m.y(aim.anchor_y));
+            let p = to_screen(ax, ay);
+            let tone = tone_at(ax, ay);
             let c = theme::tone_color(th.aim, tone);
             let thin = Stroke::new(1.0, c);
             // 阈值归中时,先把触发归中的偏移范围画成虚线圆,便于对照调参
@@ -3185,10 +3329,15 @@ impl PadApp {
                     i += 3; // 隔两段画一段 => 虚线
                 }
             }
-            // 落点范围示意:半透明填充 + 圆圈 + 十字
+            // 落点范围示意:半透明填充 + 圆圈 + 十字(圈同样带反相外套)
             let ring = size::AIM_RING;
             let arm = size::AIM_ARM;
             painter.circle_filled(p, ring, theme::with_alpha(c, 56));
+            painter.circle_stroke(
+                p,
+                ring,
+                Stroke::new(size::KEY_STROKE + 2.5, theme::casing(c)),
+            );
             painter.circle_stroke(p, ring, Stroke::new(size::KEY_STROKE, c));
             painter.line_segment([p - vec2(arm, 0.0), p + vec2(arm, 0.0)], thin);
             painter.line_segment([p - vec2(0.0, arm), p + vec2(0.0, arm)], thin);
@@ -3221,25 +3370,20 @@ impl PadApp {
                 }
                 let c = to_screen(m.x(w.cx), m.y(w.cy));
                 let r = m.len(w.radius) * scale;
+                let tone = tone_at(m.x(w.cx), m.y(w.cy));
+                let selected = self.wheel_info == Some(wi);
                 // 影响范围:触点实际推出的距离,默认与半径一致(scope=1.0)时两者重合,
                 // 此时不再多画一圈,避免与半径圆环糊在一起。
                 let push_r = w.push_px(&m) * scale;
                 let scope = w.scope();
-                let scope_txt = if (scope - 1.0).abs() > 1e-3 {
-                    format!(" 影响范围×{scope:.2}")
-                } else {
-                    String::new()
-                };
-                let dirs_label = format!(
-                    "{}/{}/{}/{}",
-                    short_name(w.up),
-                    short_name(w.left),
-                    short_name(w.down),
-                    short_name(w.right)
+                // 画布上的标注**只留"摇杆N / 临时摇杆N"**。
+                // 方向键、启用键、影响范围这些细节改由"点一下摇杆"弹出信息卡显示
+                // (用户反馈:那一长串字压在游戏画面上,既挡视野又看不清)。
+                let quick_label = format!(
+                    "{}{}",
+                    if w.temp.is_some() { "临时摇杆" } else { "摇杆" },
+                    wi + 1
                 );
-                // 编号与列表里的"轮盘N"一一对应:两个摇杆方向键相同时,只靠方向键
-                // 根本分不清画面上哪一圈是哪一个(用户反馈过"新旧摇杆换位"的困惑)
-                let idx_label = format!("{}", wi + 1);
                 if let Some(t) = &w.temp {
                     // 临时轮盘:虚线圆环(摇杆的视觉结构不变,只按亮度档位调明暗)
                     let color = theme::tone_color(th.wheel_temp, tone);
@@ -3250,50 +3394,60 @@ impl PadApp {
                             c + vec2(a.cos() * r, a.sin() * r)
                         })
                         .collect();
+                    // 外套:先用反相粗虚线垫一层,再画本色虚线
+                    for shape in
+                        egui::Shape::dashed_line(&pts, Stroke::new(5.0, theme::casing(color)), 6.0, 5.0)
+                    {
+                        painter.add(shape);
+                    }
                     for shape in
                         egui::Shape::dashed_line(&pts, Stroke::new(2.0, color), 6.0, 5.0)
                     {
                         painter.add(shape);
                     }
+                    if selected {
+                        painter.circle_stroke(
+                            c,
+                            r + 6.0,
+                            Stroke::new(1.5, theme::tone_text(tone)),
+                        );
+                    }
                     painter.circle_filled(c, 5.0, color);
                     // 圆心那个小圈是"摇杆"观感的关键:它让圆心看起来是个可推的摇杆头,
                     // 所以无论亮度档位怎么调都保留(只跟着一起调明暗)
-                    painter.circle_stroke(
-                        c,
-                        size::WHEEL_RING,
-                        Stroke::new(1.0, theme::tone_color(egui::Color32::WHITE, tone)),
-                    );
-                    let mode = match t.mode {
-                        TempMode::Hold => "按住",
-                        TempMode::Toggle => "切换",
-                    };
+                    let knob = theme::tone_color(egui::Color32::WHITE, tone);
+                    painter.circle_stroke(c, size::WHEEL_RING, Stroke::new(3.5, theme::casing(knob)));
+                    painter.circle_stroke(c, size::WHEEL_RING, Stroke::new(1.0, knob));
                     theme::paint_label(
                         painter,
                         c - vec2(0.0, r + 14.0),
                         Align2::CENTER_CENTER,
-                        &format!(
-                            "临时摇杆{idx_label}[{}·{}] {dirs_label}{scope_txt}",
-                            short_name(t.key),
-                            mode
-                        ),
+                        &quick_label,
                         FontId::proportional(size::LABEL_FONT),
                         theme::tone_text(tone),
                     );
+                    let _ = t;
                 } else {
                     // 永久轮盘:实线圆环
                     let color = theme::tone_color(th.wheel_perm, tone);
+                    painter.circle_stroke(c, r, Stroke::new(6.0, theme::casing(color)));
                     painter.circle_stroke(c, r, Stroke::new(size::KEY_STROKE, color));
+                    if selected {
+                        painter.circle_stroke(
+                            c,
+                            r + 6.0,
+                            Stroke::new(1.5, theme::tone_text(tone)),
+                        );
+                    }
                     painter.circle_filled(c, 5.0, color);
-                    painter.circle_stroke(
-                        c,
-                        size::WHEEL_RING,
-                        Stroke::new(1.0, theme::tone_color(egui::Color32::WHITE, tone)),
-                    );
+                    let knob = theme::tone_color(egui::Color32::WHITE, tone);
+                    painter.circle_stroke(c, size::WHEEL_RING, Stroke::new(3.5, theme::casing(knob)));
+                    painter.circle_stroke(c, size::WHEEL_RING, Stroke::new(1.0, knob));
                     theme::paint_label(
                         painter,
                         c - vec2(0.0, r + 14.0),
                         Align2::CENTER_CENTER,
-                        &format!("摇杆{idx_label} {dirs_label}{scope_txt}"),
+                        &quick_label,
                         FontId::proportional(size::LABEL_FONT),
                         theme::tone_text(tone),
                     );
@@ -3308,12 +3462,15 @@ impl PadApp {
                             c + vec2(a.cos() * push_r, a.sin() * push_r)
                         })
                         .collect();
-                    for shape in egui::Shape::dashed_line(
-                        &pts,
-                        Stroke::new(1.5, theme::tone_color(th.key_hold, tone)),
-                        7.0,
-                        6.0,
-                    ) {
+                    let ring_ink = theme::tone_color(th.key_hold, tone);
+                    for shape in
+                        egui::Shape::dashed_line(&pts, Stroke::new(3.5, theme::casing(ring_ink)), 7.0, 6.0)
+                    {
+                        painter.add(shape);
+                    }
+                    for shape in
+                        egui::Shape::dashed_line(&pts, Stroke::new(1.5, ring_ink), 7.0, 6.0)
+                    {
                         painter.add(shape);
                     }
                     theme::paint_label(
@@ -3324,6 +3481,10 @@ impl PadApp {
                         FontId::proportional(size::SMALL_FONT),
                         theme::tone_text(tone),
                     );
+                }
+                // 点开的摇杆:在圈旁显示一张信息卡(四个方向键 + 启用键),不点不显示
+                if selected {
+                    draw_wheel_card(painter, &th, rect, w, wi, c, r, tone);
                 }
             }
         }
@@ -3720,21 +3881,37 @@ impl PadApp {
                     edit = true;
                 }
             }
-            // 键位显示亮度:截图上键位/摇杆的响应范围圈与标注可加深也可变浅。
-            // 这是"游戏画面很亮、圈看不清"的直接解法(与背景图无关,所以放在 if 外面)。
+            // 键位浮层的可读性:自动对比 + 手动微调。
+            // 光靠手动调亮度解决不了"画面上既有亮块又有暗块"的问题 ——
+            // 现在默认按截图**逐块采样**,自动决定每一处该用深色还是浅色。
+            let r = ui
+                .checkbox(
+                    &mut look.overlay_auto,
+                    "键位自动对比(按截图明暗自动选深浅)",
+                )
+                .on_hover_text(
+                    "采样每个键位/摇杆底下的画面明暗,自动决定那一处用深色还是浅色,\n\
+                     并给圈描一圈反相外套、给文字垫一层半透明衬底 ——\n\
+                     这是制图学 halo 与字幕衬底那套成熟做法,亮块暗块上都能看清。\n\
+                     关掉后改用下面的固定档位(与旧版一致)。",
+                );
+            if r.changed() {
+                edit = true;
+            }
             let r = ui
                 .add(
                     egui::Slider::new(
                         &mut look.overlay_tone,
                         theme::TONE_MIN..=theme::TONE_MAX,
                     )
-                    .text("键位显示亮度"),
+                    .text("键位显示亮度(微调)"),
                 )
                 .on_hover_text(
-                    "调整截图上键位/摇杆响应范围圈与标注的明暗:\n\
-                     往左=加深(适合明亮的游戏画面),往右=变浅(适合昏暗画面),0=默认。\n\
+                    "在自动对比的基础上做微调:\n\
+                     往左=整体加深(适合明亮的游戏画面),往右=整体变浅(适合昏暗画面),0=不偏。\n\
                      只改明暗、不改色相:点按绿/长按橙/永久摇杆青/临时摇杆品红照样分得清,\n\
-                     摇杆的圆环 + 圆心小圈 + 方向标注也原样保留。",
+                     摇杆的圆环 + 圆心小圈 + 方向标注也原样保留。\n\
+                     关掉上面的[自动对比]后,这个滑块就是唯一依据(0 = 与旧版一致)。",
                 );
             if r.drag_started() || r.gained_focus() {
                 edit = true;
@@ -4348,14 +4525,57 @@ impl PadApp {
                             self.waiting_key = Some(KeySlot::NewBind);
                             self.log("已取点,请按下要绑定的按键");
                         }
+                    } else if let Some(i) = self.wheel_at(px, py) {
+                        // 点到某个摇杆的响应圈:弹出/收起它的方向键信息卡
+                        // (画布上只留"摇杆N",细节按需查看)
+                        self.wheel_info = if self.wheel_info == Some(i) {
+                            None
+                        } else {
+                            Some(i)
+                        };
                     } else {
+                        // 点到空白处:收起信息卡,并照旧报一次坐标
+                        self.wheel_info = None;
                         self.log(format!("截图坐标: ({px}, {py})"));
                     }
                 }
             }
         }
     }
+
+    /// 命中测试:截图坐标 (px, py) 落在哪个摇杆的响应圈里(没有则 None)。
+    ///
+    /// 命中半径取"该摇杆的半径"与一个最小手感半径(24px)的较大者 ——
+    /// 用户可能把摇杆调得很小,但"点一下看键位"这个动作不该要求点得那么准。
+    /// 多个摇杆重叠时取**最后绘制**的那个(与看到的上下层一致)。
+    fn wheel_at(&self, px: i32, py: i32) -> Option<usize> {
+        let (profile, space) = {
+            let g = self.shared.lock().unwrap();
+            (
+                g.profile.clone(),
+                g.control
+                    .as_ref()
+                    .map(|c| (c.screen_w, c.screen_h))
+                    .unwrap_or((1080, 2400)),
+            )
+        };
+        let space = self.screen_size().unwrap_or(space);
+        let m = profile.mapper(space);
+        let (fx, fy) = (px as f32, py as f32);
+        let mut hit = None;
+        for (i, w) in profile.wheels.iter().enumerate() {
+            let (cx, cy) = (m.x(w.cx) as f32, m.y(w.cy) as f32);
+            let r = m.len(w.radius).max(WHEEL_CLICK_MIN_RADIUS);
+            if (fx - cx).hypot(fy - cy) <= r {
+                hit = Some(i);
+            }
+        }
+        hit
+    }
 }
+
+/// "点一下摇杆看键位"的最小命中半径(截图像素):摇杆调得很小时也点得中
+const WHEEL_CLICK_MIN_RADIUS: f32 = 24.0;
 
 /// 配置目录:profile.json / look.json / settings.json 三者同处一地,
 /// 便于一起备份、清理或整体搬走。
@@ -4714,6 +4934,101 @@ fn swipe_controls(
     changed
 }
 
+/// 摇杆信息卡:画布上点开某个摇杆时,在它旁边列出四个方向对应的键位。
+///
+/// 为什么做成"点开才显示":那一长串方向键/启用键一直压在海报一样的游戏画面上,
+/// 既挡视野又读不清(用户附了截图)。现在画布上只留"摇杆N",细节按需弹出。
+/// 卡片整体垫一层衬底 + 描边字,所以压在亮块或暗块上都读得清;
+/// 右边放不下就翻到左边,保证不会被画布边缘裁掉。
+#[allow(clippy::too_many_arguments)]
+fn draw_wheel_card(
+    painter: &egui::Painter,
+    th: &Theme,
+    canvas: egui::Rect,
+    w: &Wheel,
+    wi: usize,
+    center: egui::Pos2,
+    radius: f32,
+    tone: f32,
+) {
+    use egui::{Align2, FontId, Stroke};
+    let ink = theme::tone_text(tone);
+    let title = format!(
+        "{}{}",
+        if w.temp.is_some() { "临时摇杆" } else { "摇杆" },
+        wi + 1
+    );
+    let mut lines: Vec<(String, egui::Color32)> = vec![
+        (format!("上 {}", key_name(w.up)), ink),
+        (format!("下 {}", key_name(w.down)), ink),
+        (format!("左 {}", key_name(w.left)), ink),
+        (format!("右 {}", key_name(w.right)), ink),
+    ];
+    if let Some(t) = &w.temp {
+        let mode = match t.mode {
+            TempMode::Hold => "按住启用",
+            TempMode::Toggle => "再按切换",
+        };
+        lines.push((format!("启用 {} · {mode}", key_name(t.key)), ink));
+    }
+
+    let font = FontId::proportional(theme::size::LABEL_FONT);
+    // 先量一遍:卡片宽度取最长一行,行高由字体给
+    let galleys: Vec<std::sync::Arc<egui::Galley>> = lines
+        .iter()
+        .map(|(s, c)| painter.layout_no_wrap(s.clone(), font.clone(), *c))
+        .collect();
+    let title_galley = painter.layout_no_wrap(title.clone(), font.clone(), ink);
+    let line_h = galleys
+        .iter()
+        .map(|g| g.size().y)
+        .fold(title_galley.size().y, f32::max)
+        + 2.0;
+    let text_w = galleys
+        .iter()
+        .map(|g| g.size().x)
+        .fold(title_galley.size().x, f32::max);
+
+    let pad = egui::vec2(8.0, 6.0);
+    let size = egui::vec2(text_w, line_h * (galleys.len() + 1) as f32) + pad * 2.0;
+    // 默认放右边;右边不够就放左边;再不够就贴着画布内边
+    let mut min = egui::pos2(center.x + radius + 12.0, center.y - size.y * 0.5);
+    if min.x + size.x > canvas.max.x - 4.0 {
+        min.x = center.x - radius - 12.0 - size.x;
+    }
+    min.x = min.x.clamp(canvas.min.x + 4.0, (canvas.max.x - size.x - 4.0).max(canvas.min.x + 4.0));
+    min.y = min.y.clamp(canvas.min.y + 4.0, (canvas.max.y - size.y - 4.0).max(canvas.min.y + 4.0));
+    let card = egui::Rect::from_min_size(min, size);
+
+    // 衬底 + 一圈摇杆语义色的边,和画布上的圈一眼对应
+    let edge = theme::tone_color(
+        if w.temp.is_some() { th.wheel_temp } else { th.wheel_perm },
+        tone,
+    );
+    painter.rect_filled(card, 4.0, theme::plate(ink));
+    painter.rect_stroke(
+        card,
+        4.0,
+        Stroke::new(1.5, edge),
+        egui::StrokeKind::Inside,
+    );
+
+    let mut y = card.min.y + pad.y;
+    theme::paint_text(
+        painter,
+        egui::pos2(card.min.x + pad.x, y),
+        Align2::LEFT_TOP,
+        &title,
+        font.clone(),
+        edge,
+    );
+    y += line_h;
+    for g in galleys {
+        painter.galley(egui::pos2(card.min.x + pad.x, y), g, ink);
+        y += line_h;
+    }
+}
+
 /// 在截图上绘制滑动轨迹示意:边界实色、内部半透明,尽量不遮挡截图内容。
 /// 入参为像素坐标(调用方负责从配置的相对坐标换算);`tone` 是键位显示亮度档位。
 fn draw_swipe_track<F: Fn(i32, i32) -> egui::Pos2>(
@@ -4737,8 +5052,12 @@ fn draw_swipe_track<F: Fn(i32, i32) -> egui::Pos2>(
     }
     let (edge_color, fill) = theme::tone_ring_fill(th.swipe, theme::with_alpha(th.swipe, 40), tone);
     let edge = Stroke::new(theme::size::KEY_STROKE, edge_color);
+    // 与键位圈同一套可读性处理:先垫一圈反相"外套"再画本色,
+    // 于是轨迹压在亮块/暗块上都还有一圈边界可辨(制图学 halo 的做法)。
+    let coat = theme::casing(edge_color);
     match path {
         SwipePath::Line => {
+            painter.add(egui::Shape::line(pts.clone(), Stroke::new(13.5, coat)));
             painter.add(egui::Shape::line(pts.clone(), Stroke::new(10.0, fill)));
             painter.add(egui::Shape::line(pts.clone(), edge));
         }
@@ -4746,6 +5065,12 @@ fn draw_swipe_track<F: Fn(i32, i32) -> egui::Pos2>(
             let a = to_screen(start.0, start.1);
             let b = to_screen(end.0, end.1);
             let rect = egui::Rect::from_two_pos(a, b);
+            painter.rect_stroke(
+                rect,
+                0.0,
+                Stroke::new(theme::size::KEY_STROKE + 2.5, coat),
+                egui::StrokeKind::Outside,
+            );
             painter.rect_filled(rect, 0.0, fill);
             painter.rect_stroke(rect, 0.0, edge, egui::StrokeKind::Inside);
         }
@@ -4754,11 +5079,17 @@ fn draw_swipe_track<F: Fn(i32, i32) -> egui::Pos2>(
                 let c = to_screen(cx as i32, cy as i32);
                 let r_screen = r * scale;
                 painter.circle_filled(c, r_screen, fill);
+                painter.circle_stroke(
+                    c,
+                    r_screen,
+                    Stroke::new(theme::size::KEY_STROKE + 2.5, coat),
+                );
                 painter.circle_stroke(c, r_screen, edge);
             }
         }
     }
     let p0 = pts[0];
+    painter.circle_stroke(p0, 15.0, Stroke::new(3.0, coat));
     painter.circle_stroke(p0, 12.0, edge);
     theme::paint_label(
         painter,
@@ -4795,6 +5126,42 @@ fn draw_easing_preview(ui: &mut egui::Ui, e: Easing) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 亮度网格:自动对比全靠它,索引越界/退化尺寸绝不能 panic
+    /// (它每帧、每个标注都要被查一次,一旦 panic 就是整个界面崩掉)。
+    #[test]
+    fn luma_grid_samples_safely() {
+        // 左半黑、右半白的小图:检查左右采样确实不同
+        let (w, h) = (8usize, 4usize);
+        let mut px = Vec::new();
+        for _y in 0..h {
+            for x in 0..w {
+                px.push(if x < w / 2 {
+                    egui::Color32::BLACK
+                } else {
+                    egui::Color32::WHITE
+                });
+            }
+        }
+        let img = egui::ColorImage::new([w, h], px);
+        let grid = LumaGrid::new(&img).expect("合法尺寸应能建立网格");
+        assert!(grid.around(1, 1) < 0.2, "左半应判定为暗");
+        assert!(grid.around(6, 1) > 0.8, "右半应判定为亮");
+        // 暗处要变浅、亮处要加深(与 theme::auto_tone 的方向一致)
+        assert!(theme::auto_tone(grid.around(1, 1), 0.0) > 0.0);
+        assert!(theme::auto_tone(grid.around(6, 1), 0.0) < 0.0);
+
+        // 越界/负坐标:夹住而不是 panic
+        let _ = grid.around(-100, -100);
+        let _ = grid.around(9999, 9999);
+        // 极端小图
+        let tiny = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
+        let g2 = LumaGrid::new(&tiny).expect("1x1 也应可用");
+        assert!(g2.around(0, 0) > 0.8);
+        // 尺寸非法 -> None(调用方退回手动档位),绝不 panic
+        let bad = egui::ColorImage::new([0, 0], Vec::new());
+        assert!(LumaGrid::new(&bad).is_none());
+    }
 
     /// 回归:"设置好 scrcpy 目录后,再次启动依旧找不到 scrcpy"。
     ///

@@ -270,8 +270,14 @@ pub struct Look {
     pub panel_alpha: u8,
     /// 键位浮层(键位/摇杆的响应范围圈与标注)的显示亮度档位,见 [`tone_color`]。
     /// 0 = 默认,与旧版观感逐一致;>0 变浅、<0 加深。老配置没有这个字段,缺省 0。
+    /// 默认情况下它是"微调":实际档位 = 自动对比(按截图采样)+ 本值。
     #[serde(default)]
     pub overlay_tone: f32,
+    /// 是否按截图**自动对比**(采样标注底下的明暗,自动决定用深色还是浅色)。
+    /// 老配置没有这个字段,缺省 true —— 用户反馈"背景一亮就看不清键位",
+    /// 自动对比正是为此;想回到"固定配色"可以关掉它。
+    #[serde(default = "default_true")]
+    pub overlay_auto: bool,
 }
 
 fn default_bg_dim() -> u8 {
@@ -284,6 +290,11 @@ fn default_panel_alpha() -> u8 {
     150
 }
 
+/// serde 缺省:老配置里没有"自动对比"字段时按开启处理
+fn default_true() -> bool {
+    true
+}
+
 impl Default for Look {
     fn default() -> Self {
         Self {
@@ -294,6 +305,7 @@ impl Default for Look {
             bg_dim: default_bg_dim(),
             panel_alpha: default_panel_alpha(),
             overlay_tone: 0.0,
+            overlay_auto: true,
         }
     }
 }
@@ -388,20 +400,28 @@ pub fn with_alpha(c: Color32, a: u8) -> Color32 {
 // 那两个常量已无调用点,故删除 —— 免得以后又有人取到"永远白色"的颜色,
 // 让亮度档位在某一处失效。
 
-// ============================ 浮层显示亮度 ============================
+// ============================ 浮层可读性 ============================
 //
-// 用户诉求:"我的键位设置显示在画布上,有些时候背景可能很亮,看不清键位"
-// —— 需要一档能加深、也能变浅的"键位显示亮度",作用在键位与摇杆的响应范围圈上。
+// 用户诉求:"背景可能很亮,看不清键位"(附了截图:圆圈与文字压在花哨的游戏画面上)。
 //
-// 尺度(这个"度"由这里定死,界面只给一个滑块):
-//   * 只改**明度**、不改色相:拉到端点也只向白/黑混合 TONE_MIX(60%),
-//     于是"点按绿 / 长按橙 / 永久摇杆青 / 临时摇杆品红"这套语义色在任意档位
-//     依然分得清 —— 摇杆看上去仍然是个摇杆,不会糊成一坨纯白或纯黑。
-//   * 填充的透明度跟着一起走:变浅时更透(免得在暗背景上糊成亮块),
-//     加深时更实(让圈住的区域在亮背景上更明确)。上下限都留有余地,
-//     绝不会把截图彻底盖住 —— 圈里的内容始终能看见。
-//   * 标注文字另配对比描边(见 [`paint_label`]),因此加深到纯黑字、
-//     变浅到纯白字都仍然可读。
+// 只给一个"调亮度"的滑块解决不了这个问题 —— 画面上有亮块也有暗块,
+// 同一个档位在亮块上太浅、在暗块上又太深。查了这类"叠加在任意画面上的标注"
+// 的成熟做法,通用的是三招,本程序三招全用:
+//
+//   ① **描边/外套(halo / casing)**:先画一圈对比色的粗线,再画本色。
+//      制图学给等高线、地名加 halo,正是为了让线条在任意底图上都看得见
+//      (ICC 2013《Guidelines for Consistently Readable Topographic Vectors
+//      and Labels with Toggling Backgrounds》);字幕行业同理 —— Netflix 的
+//      Timed Text Style Guide 明确要求字幕带描边/阴影,或者加半透明底色块。
+//      原理:人眼对**局部对比度**敏感,而不是对绝对亮度敏感 ——
+//      标注与背景亮度接近时,加一圈反相描边就能把可读性拉回来。
+//   ② **衬底(scrim)**:文字下面垫一块半透明色块,把对比度"局部锁定"住,
+//      这是字幕与直播 HUD 最常用的一招。
+//   ③ **自动对比**:按标注底下的实际明暗,决定这一块用深色还是浅色。
+//      本程序恰好有手机截图,可以直接采样 —— 比一般 HUD 更有条件这么做。
+//
+// 手动的"键位显示亮度"滑块保留,但降级为**微调**:在自动结果上叠加偏移。
+// 自动对比负责"看得清",滑块负责"顺眼"。
 
 /// 亮度档位的取值范围(界面滑块也用这一对常量,避免两处各写一遍)
 pub const TONE_MIN: f32 = -1.0;
@@ -413,6 +433,9 @@ const TONE_MIX: f32 = 0.6;
 /// 填充透明度的缩放幅度(变浅 ×(1-0.35) / 加深 ×(1+0.35))
 const TONE_ALPHA_SWING: f32 = 0.35;
 
+/// 判定"这是浅色"的亮度阈值(0..255)
+const LUMA_LIGHT: f32 = 140.0;
+
 /// 把任意输入(含手工编辑的 json)收敛到合法档位
 pub fn clamp_tone(t: f32) -> f32 {
     if t.is_finite() {
@@ -420,6 +443,23 @@ pub fn clamp_tone(t: f32) -> f32 {
     } else {
         0.0
     }
+}
+
+/// 由「背景亮度(0..1)+ 手动微调」算出这一块该用的有效档位。
+///
+/// 背景越亮 -> 越往"加深"走(负);背景越暗 -> 越往"变浅"走(正);
+/// 中间调 -> 接近 0(用本色)。系数 2.2 让"明显偏亮/偏暗"就能吃到接近端点的档位,
+/// 保证自动对比真的起作用,而不是隔靴搔痒。
+pub fn auto_tone(bg_luma: f32, manual: f32) -> f32 {
+    let luma = if bg_luma.is_finite() { bg_luma.clamp(0.0, 1.0) } else { 0.5 };
+    let auto = ((0.5 - luma) * 2.2).clamp(TONE_MIN, TONE_MAX);
+    clamp_tone(auto + clamp_tone(manual))
+}
+
+/// 一个颜色的感知亮度(0..255)
+pub fn luma(c: Color32) -> f32 {
+    let [r, g, b, _] = c.to_srgba_unmultiplied();
+    0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32
 }
 
 /// 按亮度档位调整一个浮层颜色:正值变浅(向白),负值加深(向黑),色相保持不变。
@@ -444,7 +484,7 @@ pub fn tone_alpha(a: u8, tone: f32) -> u8 {
 }
 
 /// 浮层标注文字的颜色:加深档用近黑字、其余用纯白字。
-/// 两者都配 [`paint_label`] 的对比描边,所以无论背景明暗都能读出来。
+/// 两者都配 [`paint_label`] 的描边与衬底,所以无论背景明暗都能读出来。
 pub fn tone_text(tone: f32) -> Color32 {
     if clamp_tone(tone) < -0.02 {
         Color32::from_rgb(16, 16, 16)
@@ -471,12 +511,49 @@ pub fn tone_ring_fill(ring: Color32, fill: Color32, tone: f32) -> (Color32, Colo
     (tone_color(ring, t), tone_color(fill, t))
 }
 
-/// 绘制浮层标注文字:先按四个方向各画一层**对比色**描边,再画正文。
+/// 与描边色配对的"外套色":亮线配暗外套、暗线配亮外套。
+/// 画法:先用它画一圈更粗的线,再把本色线画在上面 —— 于是线条在任意底图上都有
+/// 一圈反相边界(制图学的 halo / 字幕的描边,见本节开头)。
+pub fn casing(ink: Color32) -> Color32 {
+    if luma(ink) > LUMA_LIGHT {
+        Color32::from_black_alpha(200)
+    } else {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 205)
+    }
+}
+
+/// 文字衬底(scrim)的颜色:浅字配深底、深字配浅底
+pub fn plate(ink: Color32) -> Color32 {
+    if luma(ink) > LUMA_LIGHT {
+        Color32::from_black_alpha(170)
+    } else {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 185)
+    }
+}
+
+/// 只画文字:先按四个方向各画一层**反相**描边,再画正文(不垫衬底)。
+/// 用于已经有整块衬底的场合(例如摇杆信息卡)。
+pub fn paint_text(
+    painter: &egui::Painter,
+    pos: egui::Pos2,
+    align: egui::Align2,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+) {
+    let halo = casing(color);
+    for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+        painter.text(pos + egui::vec2(dx, dy), align, text, font.clone(), halo);
+    }
+    painter.text(pos, align, text, font, color);
+}
+
+/// 画一条带衬底的浮层标注(键位名、摇杆名、锚点名等)。
 ///
-/// 为什么需要:背景图/游戏画面可能很亮,纯白文字会直接糊进背景里
-/// (用户反馈"看不清键位")。描边色按正文色的亮度自动取反
-/// (亮字配暗描边、暗字配亮描边),于是"键位显示亮度"可以放心加深/变浅,
-/// 而标注始终读得出来。
+/// 三招齐上:①按文字亮度取反的半透明衬底把对比度局部锁定;
+/// ②字缘一圈反相描边;③颜色本身已经过自动对比(调用方算好 tone)。
+/// 尺寸用 `layout_no_wrap` 精确量出来,衬底只比文字大一点点,
+/// 尽量少遮挡截图内容(用户明确要求"不影响截图内容的识别")。
 pub fn paint_label(
     painter: &egui::Painter,
     pos: egui::Pos2,
@@ -485,23 +562,11 @@ pub fn paint_label(
     font: egui::FontId,
     color: Color32,
 ) {
-    let [r, g, b, _] = color.to_srgba_unmultiplied();
-    let luma = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
-    let halo = if luma > 140.0 {
-        Color32::from_black_alpha(180)
-    } else {
-        Color32::from_rgba_unmultiplied(255, 255, 255, 180)
-    };
-    for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
-        painter.text(
-            pos + egui::vec2(dx, dy),
-            align,
-            text,
-            font.clone(),
-            halo,
-        );
-    }
-    painter.text(pos, align, text, font, color);
+    let main = painter.layout_no_wrap(text.to_owned(), font.clone(), color);
+    let size = main.size();
+    let rect = align.anchor_size(pos, size);
+    painter.rect_filled(rect.expand(3.0), 3.0, plate(color));
+    paint_text(painter, rect.center(), egui::Align2::CENTER_CENTER, text, font, color);
 }
 
 #[cfg(test)]
@@ -573,5 +638,42 @@ mod tests {
             fg > 60 && fg > fr && fg > fb,
             "加深档的填充仍应是可辨认的绿色,而不是被二次预乘压成灰: ({fr},{fg},{fb})"
         );
+    }
+
+    /// 自动对比:背景越亮越要加深、越暗越要变浅;中间调接近本色;
+    /// 手动微调是在自动结果上**叠加**偏移(而不是取代它)。
+    #[test]
+    fn auto_tone_follows_background_luminance() {
+        // 明亮背景(0.85)-> 明显加深
+        let bright = auto_tone(0.85, 0.0);
+        assert!(bright < -0.5, "亮背景应明显加深,实际 {bright}");
+        // 昏暗背景(0.15)-> 明显变浅
+        let dark = auto_tone(0.15, 0.0);
+        assert!(dark > 0.5, "暗背景应明显变浅,实际 {dark}");
+        // 中间调 -> 接近本色
+        assert!(auto_tone(0.5, 0.0).abs() < 0.05);
+        // 手动微调叠加在自动结果上,并收敛在合法区间
+        assert!(auto_tone(0.85, 0.5) > bright);
+        assert_eq!(auto_tone(0.0, 1.0), TONE_MAX);
+        assert_eq!(auto_tone(1.0, -1.0), TONE_MIN);
+        // 非法输入不 panic、按中性处理
+        assert!(auto_tone(f32::NAN, 0.0).abs() < 0.05);
+    }
+
+    /// 描边外套与文字衬底都必须**与本体反相**:亮线配暗外套、暗字配浅衬底。
+    /// 这是"halo / scrim"能起作用的前提 —— 同相就等于没加。
+    #[test]
+    fn casing_and_plate_are_opposite_to_ink() {
+        let light_ink = Color32::WHITE;
+        let dark_ink = Color32::from_rgb(16, 16, 16);
+        // 亮本体 -> 暗外套 / 暗衬底
+        assert!(luma(casing(light_ink)) < 80.0);
+        assert!(luma(plate(light_ink)) < 80.0);
+        // 暗本体 -> 亮外套 / 亮衬底
+        assert!(luma(casing(dark_ink)) > 200.0);
+        assert!(luma(plate(dark_ink)) > 200.0);
+        // 衬底必须是半透明的(不能把截图糊死)
+        assert!(plate(light_ink).a() < 255 && plate(dark_ink).a() < 255);
+        assert!(casing(light_ink).a() < 255 && casing(dark_ink).a() < 255);
     }
 }

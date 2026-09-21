@@ -24,7 +24,7 @@
 use crate::capture::CaptureEvent;
 use crate::control::ControlClient;
 use crate::keymap::{
-    Action, Aim, KeyBind, Mapper, Profile, RecenterMode, TempMode, Wheel, easing_apply,
+    Action, Aim, KeyBind, Mapper, Profile, RecenterMode, TempMode, Wheel, easing_apply, key_name,
     swipe_points,
 };
 use std::collections::HashSet;
@@ -310,7 +310,32 @@ fn wheel_pointers(wheels: &[WheelState]) -> usize {
 /// 记一次"因为触点池满而放弃按下"
 fn refuse(live: &mut EngineLive, code: u16) {
     live.refused += 1;
-    live.last_refused = code;
+    if code != 0 {
+        live.last_refused = code;
+    }
+}
+
+/// 往界面日志里留一句话(引擎线程没有日志所有权,只能放进 [`Shared::notices`])。
+///
+/// 参数取 `&mut Vec<String>` 而不是 `&mut Shared`:调用点上常常同时借着
+/// `shared.control`/`shared.profile`,整结构可变借用会打架,而"借一个字段"
+/// 借用检查器是允许的。
+fn notify(notices: &mut Vec<String>, msg: impl Into<String>) {
+    // 上限很小:这只是"给你一句解释",不是日志系统(真正的日志在界面侧)
+    if notices.len() < 16 {
+        notices.push(msg.into());
+    }
+}
+
+/// 物理按键的"上升沿":这一次事件是不是这个键**刚被按下**(而不是自动重复)。
+///
+/// 为什么必须区分:Windows 的按键自动重复会以 KeyPress 反复上报(rdev 不区分),
+/// 长按 F8 半秒就能来十几次 —— 如果每次事件都翻转映射开关,
+/// 用户看到的就是"按了 F8 却没反应 / 状态跟自己以为的不一样,
+/// 必须再关一次开一次才恢复",而且没有任何日志可查。
+/// 需要"按一下翻一次"的地方(总开关键、切换模式的启用键)统统只认上升沿。
+fn rising_edge(pressed: bool, was_down: bool) -> bool {
+    pressed && !was_down
 }
 
 /// 抬起当前所有普通绑定触点与系统键(状态重建/结构变化前调用)。
@@ -669,6 +694,20 @@ pub struct Shared {
     /// 用户抱怨过"普通按键按下无反应,原因不明" —— 有了它,界面就能直接
     /// 说出"此刻占了几个触点、刚才哪个键因为挤不进去被放弃了"。
     pub live: EngineLive,
+    /// 引擎侧要写进界面日志的一句话(界面每帧取走)。
+    ///
+    /// 为什么需要:总开关键是在引擎线程里处理的,以前**不打日志** ——
+    /// 于是"映射到底开没开、刚才是谁把它关了"在界面上完全看不出来,
+    /// 用户只能靠反复按 F8 试(反馈过"按键不反应,关一次开一次才好")。
+    /// 现在凡是会改变映射状态/丢弃输入的事件,都在这里留一句可追溯的话。
+    pub notices: Vec<String>,
+    /// 请求界面重新确认一次"当前触摸坐标空间"(引擎发现长时间没按键后又开始输入时置位)。
+    ///
+    /// 为什么:用户在别的窗口待了一会儿(手机可能转屏/换了方向),回到 scrcpy 窗口后
+    /// 如果坐标空间还是旧的,注入的触点会落在错误的位置 —— 表现同样是"按键不反应",
+    /// 而"关一次开一次映射"恰好会触发一次重新确认,于是看起来像开关的问题。
+    /// 现在引擎自己会在"空闲后第一次按键"时请求一次,不必让用户手动关开。
+    pub space_recheck: bool,
     /// 顶栏[映射:开/关]按钮请求引擎执行一次"关闭映射"的收尾。
     ///
     /// 为什么需要它:关闭映射时必须抬起所有仍按着的触点(否则手机上会一直按着,
@@ -796,6 +835,16 @@ pub fn run(
     let mut alt_down = false;
     // 顶栏按钮请求的收尾是否已经执行过(用于识别请求的上升沿)
     let mut toolbar_release_prev = false;
+    // "触点池已满"这类解释性日志的节流时刻(避免刷屏)
+    let mut last_refuse_note: Option<Instant> = None;
+    // 待写进界面日志的一句话。
+    // 为什么先攒着:处理事件时常常正借着 `shared.control`/`shared.profile`,
+    // 而 MutexGuard 不能再整结构可变借用一次;所以在循环顶部统一落账,
+    // 那里正好已经有锁(每 4~16ms 必过一次,不会让消息卡住)。
+    let mut pending_notice: Option<String> = None;
+    // 空闲后重新确认坐标空间(见 Shared::space_recheck)
+    let mut pending_space_recheck = false;
+    let mut last_key_at: Option<Instant> = None;
 
     loop {
         // 处理到期的计划动作。
@@ -912,6 +961,15 @@ pub fn run(
             // 触点占用是"此刻"的量:轮盘/瞄准的状态可能刚被上面的维护改动过
             live.pointers = fingers.count + wheel_pointers(&wheels) + usize::from(aim.down);
             s.live = live;
+            // 循环顶部统一把待写的一句话落进通知队列(见 pending_notice 的说明)
+            if let Some(msg) = pending_notice.take() {
+                notify(&mut s.notices, msg);
+            }
+            // 空闲后又开始按键:请界面重新确认一次坐标空间(手机可能转过屏)
+            if pending_space_recheck {
+                pending_space_recheck = false;
+                s.space_recheck = true;
+            }
         }
 
         // 等待下一个事件。有未到期的计划动作时,精确等到最早那个到期为止,
@@ -1008,14 +1066,39 @@ pub fn run(
         }
 
         // 物理按键镜像:所有按键事件先落到这里。它是"某个物理键此刻是否真的按着"
-        // 的唯一可信依据 —— 归属切换(临时摇杆启用/停用、配置改动)时的对账全靠它。
+        // 的唯一可信依据 —— 归属切换(临时摇杆启用/停用、配置改动)时的对账全靠它;
+        // 同时它给出"上升沿",让总开关键与切换模式的启用键不被自动重复连翻。
+        let fresh_press = rising_edge(ev.pressed, held.has(ev.code));
         held.set(ev.code, ev.pressed);
 
-        // 总开关键:任何时候都生效
-        if ev.code == toggle_key && ev.pressed {
+        // 空闲(≥3 秒没有任何按键)之后的第一批按键:顺手请界面重新确认一次坐标空间。
+        // 用户常见操作就是"切到别的窗口待一会儿再回来打" —— 这期间手机可能已经转屏,
+        // 而坐标空间只在开映射/截图/连接时才更新。不确认的话触点会落在错的地方,
+        // 表现同样是"按键不反应",还很难查(以前只能靠关一次开一次映射来碰运气)。
+        {
+            let idle = last_key_at
+                .map(|t| t.elapsed() >= Duration::from_secs(3))
+                .unwrap_or(false);
+            last_key_at = Some(Instant::now());
+            if idle {
+                pending_space_recheck = true;
+            }
+        }
+
+        // 总开关键:任何时候都生效,但只在**按下的那一瞬间**翻转一次
+        if ev.code == toggle_key && fresh_press {
             let mut g = shared.lock().unwrap();
             g.enabled = !g.enabled;
             let now_enabled = g.enabled;
+            let src = format!("总开关键 {}", key_name(ev.code));
+            notify(
+                &mut g.notices,
+                if now_enabled {
+                    format!("映射已开启({src})")
+                } else {
+                    format!("映射已关闭并抬起全部触点({src})")
+                },
+            );
             if !now_enabled {
                 // 关闭时释放所有按下中的触点与系统键,并停用全部临时轮盘
                 // (与顶栏按钮共用同一份实现,两条路径行为必须完全一致)
@@ -1106,6 +1189,7 @@ pub fn run(
         // 用户随时可能在开打中增删键位/摇杆。结构一变,索引就整体位移 ——
         // 先把在按的触点全部抬起来,再按新配置重建,绝不会漏下一个触点;
         // 重建后立刻对账一次,于是对玩家来说"改配置"是无感的。
+        let held_before = fingers.count + wheel_pointers(&wheels);
         let restructured = sync_structures(
             ctl,
             &m,
@@ -1118,6 +1202,10 @@ pub fn run(
             &held,
         );
         if restructured {
+            if held_before > 0 {
+                pending_notice =
+                    Some("配置已改动: 先抬起正在按着的触点,再按新配置重建(不会卡键)".to_string());
+            }
             let extra = usize::from(aim.down);
             reconcile_binds(
                 ctl,
@@ -1149,11 +1237,12 @@ pub fn run(
             if ev.code != t.key {
                 continue;
             }
-            // 目标状态:长按模式 = 按住期间生效;切换模式 = 只在按下那一刻翻转
+            // 目标状态:长按模式 = 按住期间生效;切换模式 = **只在按下的那一瞬间**翻转
+            // (同样只认上升沿:否则按住切换键不放,自动重复会把它来回翻转)
             let want_active = match t.mode {
                 TempMode::Hold => ev.pressed,
                 TempMode::Toggle => {
-                    if ev.pressed {
+                    if fresh_press {
                         !wheels[j].active
                     } else {
                         wheels[j].active
@@ -1235,6 +1324,7 @@ pub fn run(
         // 挤不进去的按下在这里被明确拒绝并计入诊断 —— 而不是发出去被服务端
         // 悄悄丢掉(那正是"按下没反应、原因不明"的来源)
         let reserved = wheel_pointers(&wheels) + usize::from(aim.down);
+        let mut refused_note: Option<u16> = None;
         for (idx, bind) in profile.binds.iter().enumerate() {
             if bind.key != ev.code {
                 continue;
@@ -1258,6 +1348,7 @@ pub fn run(
                                 ctl.touch_down(pid, px, py);
                             } else {
                                 refuse(&mut live, bind.key);
+                                refused_note = Some(bind.key);
                             }
                         }
                     } else if ev.pressed {
@@ -1278,6 +1369,7 @@ pub fn run(
                             ));
                         } else {
                             refuse(&mut live, bind.key);
+                                refused_note = Some(bind.key);
                         }
                     }
                     // 松开不在此处理,统一由定时抬起收尾
@@ -1291,6 +1383,7 @@ pub fn run(
                             // 已经按着(钩子自动重复)不算"被拒",只有挤不进触点池才算
                             if !fingers.is_down(idx) {
                                 refuse(&mut live, bind.key);
+                                refused_note = Some(bind.key);
                             }
                         }
                     } else if fingers.release(idx) {
@@ -1331,6 +1424,7 @@ pub fn run(
                             }
                         } else {
                             refuse(&mut live, bind.key);
+                                refused_note = Some(bind.key);
                         }
                     }
                 }
@@ -1348,6 +1442,20 @@ pub fn run(
             }
         }
         live.pointers = fingers.count + reserved;
+        // 触点池满导致的"按了没反应",必须给用户一句能看懂的解释(每秒最多一条)
+        if let Some(k) = refused_note {
+            let due = last_refuse_note
+                .map(|t: Instant| t.elapsed() >= Duration::from_secs(1))
+                .unwrap_or(true);
+            if due {
+                last_refuse_note = Some(Instant::now());
+                pending_notice = Some(format!(
+                    "触点池已满(设备端最多同时 {} 个触点),{} 的这次按下被放弃;松掉几个正在按的键即可",
+                    DEVICE_MAX_POINTERS,
+                    key_name(k)
+                ));
+            }
+        }
     }
 }
 
@@ -1613,8 +1721,7 @@ mod tests {
 
     /// Ctrl+Alt:一次组合只切换一次,松开后再按才会再次触发
     #[test]
-    fn ctrl_alt_chord_fires_once_per_press() {
-        // 只按 Ctrl:不触发
+    fn ctrl_alt_chord_fires_once_per_press() {        // 只按 Ctrl:不触发
         assert!(!ctrl_alt_chord(KEY_LEFTCTRL, true, true, false));
         // 在按住 Ctrl 的基础上按下 Alt:触发
         assert!(ctrl_alt_chord(KEY_LEFTALT, true, true, true));
@@ -1628,6 +1735,25 @@ mod tests {
         // 右键的 Ctrl / Alt 同样识别
         assert!(ctrl_alt_chord(KEY_RIGHTCTRL, true, true, true));
         assert!(ctrl_alt_chord(KEY_RIGHTALT, true, true, true));
+    }
+
+    /// 回归(用户实测):"按下 F8 却没反应 / 状态跟自己以为的不一样,
+    /// 必须再关一次开一次才恢复"。
+    ///
+    /// 根因是 Windows 的按键自动重复会被 rdev 报成一串 KeyPress,
+    /// 而旧代码对每个事件都翻转一次映射开关 —— 长按 F8 半秒就翻十几次。
+    /// 判定必须只认"上升沿"(刚按下的那一次)。
+    #[test]
+    fn rising_edge_ignores_key_auto_repeat() {
+        // 首次按下 -> 上升沿,翻一次
+        assert!(rising_edge(true, false));
+        // 自动重复(键仍按着)-> 不是上升沿,绝不能再翻
+        assert!(!rising_edge(true, true));
+        assert!(!rising_edge(true, true));
+        // 松开
+        assert!(!rising_edge(false, true));
+        // 再按下 -> 又是上升沿
+        assert!(rising_edge(true, false));
     }
 
     /// 交还鼠标后瞄准不生效
