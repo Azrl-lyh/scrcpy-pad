@@ -17,49 +17,65 @@ impl FileDialogHandle {
     }
 }
 
-fn spawn_dialog(save: bool, default_name: Option<String>) -> FileDialogHandle {
+/// 对话框形态
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// 打开一个已有文件
+    Open,
+    /// 另存为
+    Save,
+    /// 选择文件夹(选 scrcpy 所在目录用)
+    Folder,
+}
+
+/// 打开"选择文件"对话框
+pub fn pick_file() -> FileDialogHandle {
+    spawn_dialog(Mode::Open, None)
+}
+
+/// 打开"选择文件夹"对话框
+pub fn pick_folder() -> FileDialogHandle {
+    spawn_dialog(Mode::Folder, None)
+}
+
+/// 打开"另存为"对话框,default_name 为预填文件名
+pub fn save_file(default_name: &str) -> FileDialogHandle {
+    spawn_dialog(Mode::Save, Some(default_name.to_string()))
+}
+
+fn spawn_dialog(mode: Mode, default_name: Option<String>) -> FileDialogHandle {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
-        let r = run_dialog(save, default_name);
+        let r = run_dialog(mode, default_name);
         let _ = tx.send(r);
     });
     FileDialogHandle { rx }
 }
 
-/// 打开"选择文件"对话框
-pub fn pick_file() -> FileDialogHandle {
-    spawn_dialog(false, None)
-}
-
-/// 打开"另存为"对话框,default_name 为预填文件名
-pub fn save_file(default_name: &str) -> FileDialogHandle {
-    spawn_dialog(true, Some(default_name.to_string()))
-}
-
 #[cfg(windows)]
-fn run_dialog(save: bool, default_name: Option<String>) -> Option<PathBuf> {
+fn run_dialog(mode: Mode, default_name: Option<String>) -> Option<PathBuf> {
     let mut dlg = rfd::FileDialog::new();
     if let Some(n) = &default_name {
         dlg = dlg.set_file_name(n);
     }
-    if save {
-        dlg.save_file()
-    } else {
-        dlg.pick_file()
+    match mode {
+        Mode::Save => dlg.save_file(),
+        Mode::Folder => dlg.pick_folder(),
+        Mode::Open => dlg.pick_file(),
     }
 }
 
 #[cfg(target_os = "linux")]
-fn run_dialog(save: bool, default_name: Option<String>) -> Option<PathBuf> {
+fn run_dialog(mode: Mode, default_name: Option<String>) -> Option<PathBuf> {
     pollster::block_on(async {
         let mut dlg = rfd::AsyncFileDialog::new();
         if let Some(n) = &default_name {
             dlg = dlg.set_file_name(n);
         }
-        if save {
-            dlg.save_file().await.map(|h| h.path().to_path_buf())
-        } else {
-            dlg.pick_file().await.map(|h| h.path().to_path_buf())
+        match mode {
+            Mode::Save => dlg.save_file().await.map(|h| h.path().to_path_buf()),
+            Mode::Folder => dlg.pick_folder().await.map(|h| h.path().to_path_buf()),
+            Mode::Open => dlg.pick_file().await.map(|h| h.path().to_path_buf()),
         }
     })
 }

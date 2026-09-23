@@ -4,7 +4,10 @@ mod capture;
 mod control;
 mod engine;
 mod filedialog;
+mod help;
 mod keymap;
+mod settings;
+mod theme;
 
 fn main() -> eframe::Result<()> {
     if std::env::args().any(|a| a == "--selftest") {
@@ -81,6 +84,26 @@ fn selftest() {
     }
     #[cfg(windows)]
     check("键盘捕获(rdev)", true, "(Windows 无需特殊权限)");
+
+    // 1b. 鼠标设备(FPS 瞄准依赖相对位移,须能被读到)
+    #[cfg(target_os = "linux")]
+    {
+        let mice = evdev::enumerate()
+            .filter(|(_, d)| {
+                d.supported_relative_axes()
+                    .map(|a| {
+                        a.contains(evdev::RelativeAxisCode::REL_X)
+                            && a.contains(evdev::RelativeAxisCode::REL_Y)
+                    })
+                    .unwrap_or(false)
+            })
+            .count();
+        check(
+            "鼠标设备(REL_X/REL_Y)",
+            mice > 0,
+            &format!("{mice} 个{}", if mice == 0 { " → FPS 瞄准不可用" } else { "" }),
+        );
+    }
 
     // 2. scrcpy 定位与版本
     let exe = adb::find_scrcpy();

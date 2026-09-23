@@ -1,6 +1,6 @@
 [package]
 name = "scrcpy-pad"
-version = "0.1.2"
+version = "0.1.4"
 edition = "2024"
 description = "A keyboard-mapping game console layered on top of scrcpy (virtual joystick, tap/hold/swipe injection)"
 license = "MIT"
@@ -13,7 +13,9 @@ anyhow = "1.0.104"
 directories = "6.0.0"
 eframe = { version = "0.36.1", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 egui = "0.36.1"
-image = { version = "0.25.10", default-features = false, features = ["png"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+# 使用说明窗口的 markdown 解析(轻量纯 Rust CommonMark 解析器,只取解析结果自行渲染到 egui)
+pulldown-cmark = { version = "0.13", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 
@@ -24,10 +26,15 @@ evdev = "0.13.2"
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 pollster = "0.4"
 
-# Windows: rdev 低级键盘钩子(无需管理员权限) + 原生文件对话框
+# Windows: rdev 低级键盘/鼠标钩子(无需管理员权限) + 原生文件对话框
+# windows-sys 仅用于 FPS 鼠标捕获:SetCursorPos 回中、ShowCursor 隐藏光标
 [target.'cfg(windows)'.dependencies]
 rdev = "0.5.3"
 rfd = { version = "0.15", default-features = false }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 lto = "thin"
