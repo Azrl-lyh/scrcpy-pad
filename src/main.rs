@@ -4,6 +4,7 @@ mod capture;
 mod control;
 mod engine;
 mod filedialog;
+mod help;
 mod keymap;
 mod settings;
 mod theme;

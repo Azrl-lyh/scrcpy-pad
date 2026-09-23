@@ -1,6 +1,6 @@
 [package]
 name = "scrcpy-pad"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "A keyboard-mapping game console layered on top of scrcpy (virtual joystick, tap/hold/swipe injection)"
 license = "MIT"
@@ -14,6 +14,8 @@ directories = "6.0.0"
 eframe = { version = "0.36.1", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 egui = "0.36.1"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+# 使用说明窗口的 markdown 解析(轻量纯 Rust CommonMark 解析器,只取解析结果自行渲染到 egui)
+pulldown-cmark = { version = "0.13", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 

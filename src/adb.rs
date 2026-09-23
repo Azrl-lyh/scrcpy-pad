@@ -568,6 +568,30 @@ pub fn launch_scrcpy(exe: &str, serial: &str, extra_args: &str) -> Result<Child>
         .context("启动 scrcpy 失败")
 }
 
+/// 让设备重新走一遍 audio policy,把音频转发"叫醒"。
+///
+/// 现象:不少机器(小米/HyperOS 等)在 scrcpy 刚连上时,音频转发拿到的是静音,
+/// 用户在手机上随便按一下音量键,声音立刻就有了 —— 因为音量变化会让系统重新
+/// 配置音频输出,捕获流这才真正接通。这里用一次"加一档 + 减一档"把同样的动作
+/// 自动做掉:净音量不变,但能触发同一条 audio policy 更新路径。
+///
+/// 用的是 `input keyevent`,和用户手动按键走的是同一条系统按键分发路径
+/// (小米需要打开"USB 调试(安全设置)"才能注入,与触摸注入的权限要求一致)。
+pub fn nudge_audio(serial: &str) -> Result<()> {
+    // 24 = KEYCODE_VOLUME_UP,25 = KEYCODE_VOLUME_DOWN
+    for code in ["24", "25"] {
+        let out = adb_cmd(Some(serial))
+            .args(["shell", "input", "keyevent", code])
+            .output()
+            .context("执行 adb shell input keyevent 失败")?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            bail!("音量键注入被拒绝: {}", err.trim());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

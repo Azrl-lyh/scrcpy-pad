@@ -27,6 +27,10 @@ const LICENSE_TEXT: &str = include_str!("../LICENSE");
 /// scrcpy 启动参数的初始(无预设)值
 const BASE_SCRCPY_ARGS: &str = "--stay-awake";
 
+/// 新增键位时的动作类型选项,顺序与 `Draft::kind` 一致。
+/// 滑动 / 系统键仍在开发中,名字上直接标出来。
+const KIND_NAMES: [&str; 4] = ["点按", "长按", "滑动（开发中）", "系统键（开发中）"];
+
 /// 坐标编辑框的取值范围:**允许负值、允许超出屏幕**。
 /// 键位本来就允许落在画面外(比如横屏的布局在竖屏下显示、截图尺寸与布局方向不同),
 /// 这里不做越界"纠正",免得程序擅自改动用户调好的坐标。
@@ -225,6 +229,17 @@ enum CoordSlot {
     NewCircleAngle,
     /// FPS 瞄准锚点
     AimAnchor,
+}
+
+/// 正在"修改响应范围"的目标。键位的响应圈和轮盘的半径用的是同一套交互
+/// (`Ctrl++` / `Ctrl+-` 缩放、在截图上拖动),所以合并成一个状态,
+/// 天然保证同一时刻只有一个目标。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ResizeTarget {
+    /// 键位的圆形响应范围
+    Bind(usize),
+    /// 轮盘的半径
+    Wheel(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -453,8 +468,8 @@ pub struct PadApp {
 
     waiting_key: Option<KeySlot>,
     picking: Option<CoordSlot>,
-    /// 正在修改响应范围的键位索引(None=未修改);进入后该键位圆圈显示为黄色
-    resizing: Option<usize>,
+    /// 正在修改响应范围的目标(键位圈或轮盘半径);进入后目标显示为黄色
+    resizing: Option<ResizeTarget>,
     /// 正在编辑滑动曲线参数的键位(弹窗)
     easing_edit: Option<EasingEditTarget>,
     /// 新增键位草稿是否进行中(决定预览圆圈/轨迹是否显示,并允许取消)
@@ -463,6 +478,8 @@ pub struct PadApp {
     /// 截图的局部亮度网格(浮层自动对比用);没截图时为 None
     shot_lum: Option<LumaGrid>,
     shot_rx: Option<Receiver<Result<egui::ColorImage, String>>>,
+    /// 音频唤醒(注入音量键)任务的回执;None = 没有进行中的唤醒
+    audio_rx: Option<Receiver<String>>,
     overlay_filter: OverlayFilter,
     /// 在画布上点开的摇杆(显示它的四个方向键);None = 未点开
     wheel_info: Option<usize>,
@@ -473,6 +490,10 @@ pub struct PadApp {
     grab_enabled: bool,
 
     about_open: bool,
+    /// 使用说明窗口是否打开
+    help_open: bool,
+    /// 使用说明(markdown 渲染 + 章节索引)
+    help: crate::help::HelpWindow,
     /// 许可证窗口是否打开
     license_open: bool,
     /// scrcpy 参数助手窗口状态(None=未打开;每次打开重建默认参数)
@@ -538,7 +559,11 @@ fn install_cjk_font(ctx: &egui::Context) {
             .or_default()
             .push("cjk".into());
         ctx.set_fonts(fonts);
-        eprintln!("[font] 已加载中文字体: {path}");
+        // 字体加载情况默认不往控制台输出(release 里不留这行)。要做多语言适配
+        // 调试时再把下面两行注释放开:它能直接告诉你当前命中的是哪个字体文件、
+        // 或者根本没有可用字体(界面汉字会变方块)。
+        // eprintln!("[font] 已加载中文字体: {path}");
+        let _ = path;
     } else {
         eprintln!("[font] 未找到中文字体,界面汉字可能显示为方块");
     }
@@ -843,6 +868,7 @@ impl PadApp {
             shot: None,
             shot_lum: None,
             shot_rx: None,
+            audio_rx: None,
             overlay_filter: OverlayFilter::All,
             wheel_info: None,
             draft: DraftBind::default(),
@@ -850,6 +876,8 @@ impl PadApp {
             profile_path,
             grab_enabled: false,
             about_open: false,
+            help_open: false,
+            help: crate::help::HelpWindow::new(),
             license_open: false,
             args_helper: None,
             dialog: None,
@@ -996,6 +1024,43 @@ impl PadApp {
                         .map_err(|e| format!("解码截图失败: {e}"))
                 });
             let _ = tx.send(r);
+        });
+    }
+
+    /// 唤醒设备音频转发。
+    ///
+    /// 有些机器(小米/HyperOS 等)scrcpy 刚连上时音频流是"哑"的,必须在手机上按一下
+    /// 音量键才出声。这里在 scrcpy 启动后延迟注入一次音量 +1/-1(净变化为 0),
+    /// 复现用户手动按键触发的 audio policy 更新。
+    fn wake_audio(&mut self) {
+        if self
+            .scrcpy_args
+            .split_whitespace()
+            .any(|a| a == "--no-audio")
+        {
+            return;
+        }
+        if self.audio_rx.is_some() {
+            return;
+        }
+        let serial = self.serial();
+        if serial.is_empty() {
+            return;
+        }
+        let (tx, rx) = channel();
+        self.audio_rx = Some(rx);
+        self.log("正在唤醒设备音频转发...");
+        std::thread::spawn(move || {
+            // 分两次:音频流本身要一两秒才起来,第一次可能扑空;两次的净音量都是 0
+            let mut last = Ok(());
+            for wait in [2u64, 3] {
+                std::thread::sleep(Duration::from_secs(wait));
+                last = adb::nudge_audio(&serial);
+            }
+            let _ = tx.send(match last {
+                Ok(()) => "已唤醒设备音频转发(音量键 +1/-1,净变化为 0)".to_string(),
+                Err(e) => format!("音频唤醒失败: {e}"),
+            });
         });
     }
 
@@ -1221,6 +1286,44 @@ impl PadApp {
         }
     }
 
+    /// 切回程序默认的配置文件(`config_dir/profile.json`,即首次运行时程序自己
+    /// 创建的那份)并加载它的内容。文件被删掉时会按出厂默认重新写一份,所以这个
+    /// 按钮总能回到"最初那份配置"。
+    fn load_default_profile(&mut self) {
+        let path = profile_path();
+        let prof = if path.exists() {
+            match read_profile_at(&path) {
+                Ok(p) => p,
+                // 文件在但读不出来(损坏/手改坏了)时不覆盖它,只报告
+                Err(e) => {
+                    self.log(format!("默认配置读取失败: {e}"));
+                    return;
+                }
+            }
+        } else {
+            match write_default_profile(&path) {
+                Ok(_) => Profile::default(),
+                Err(e) => {
+                    self.log(format!("默认配置不可用: {e}"));
+                    return;
+                }
+            }
+        };
+        self.profile_path = path.clone();
+        self.apply_profile_switch(prof);
+        // 先取数、释放锁,再 log:避免 format! 参数里两次 lock 死锁
+        let (nb, nw) = {
+            let g = self.shared.lock().unwrap();
+            (g.profile.binds.len(), g.profile.wheels.len())
+        };
+        self.log(format!(
+            "已选用默认配置: {} ({} 按键 / {} 轮盘)",
+            path.display(),
+            nb,
+            nw
+        ));
+    }
+
     /// 切换当前配置文件后整体替换配置内容;
     /// 撤销/重做栈指向旧文件数据,与当前上下文无关,一并清空避免误操作
     fn apply_profile_switch(&mut self, p: Profile) {
@@ -1244,8 +1347,17 @@ impl PadApp {
     fn begin_resize(&mut self, i: usize) {
         self.push_undo();
         self.picking = None;
-        self.resizing = Some(i);
+        self.resizing = Some(ResizeTarget::Bind(i));
         self.log("响应范围修改中: 用 Ctrl++ / Ctrl+- 或拖动圆圈调整");
+    }
+
+    /// 进入轮盘的"改响应范围"(半径)。与键位同一套交互:改范围期间
+    /// `Ctrl++ / Ctrl+-` 调圆圈、也可直接在截图上拖动。
+    fn begin_resize_wheel(&mut self, i: usize) {
+        self.push_undo();
+        self.picking = None;
+        self.resizing = Some(ResizeTarget::Wheel(i));
+        self.log("轮盘半径修改中: 用 Ctrl++ / Ctrl+- 或拖动圆圈调整");
     }
 
     /// 取消新增草稿:清除取点等待、等待按键与草稿圆圈/轨迹
@@ -1680,7 +1792,7 @@ impl eframe::App for PadApp {
         // 那个快捷键会先被 egui 吃掉,导致按下去界面变大、圆圈却纹丝不动。
         // 只有不在修改范围时才把它还给 egui。
         ctx.options_mut(|o| o.zoom_with_keyboard = self.resizing.is_none());
-        if let Some(i) = self.resizing {
+        if let Some(target) = self.resizing {
             let (zoom_in, zoom_out) = ctx.input(|input| {
                 let ctrl = input.modifiers.ctrl;
                 (
@@ -1697,14 +1809,26 @@ impl eframe::App for PadApp {
                     1.0 / crate::keymap::RADIUS_ZOOM_FACTOR
                 };
                 let mut g = self.shared.lock().unwrap();
-                if let Some(b) = g.profile.binds.get_mut(i) {
-                    match &mut b.action {
-                        Action::Tap { radius, .. } | Action::Hold { radius, .. } => {
-                            // 乘性缩放(每步按固定比例),符合自然的缩放手感;
-                            // 除浮点精度外不设上下限,仅防止缩到 0
-                            *radius = crate::keymap::zoom_radius(*radius, factor);
+                match target {
+                    ResizeTarget::Bind(i) => {
+                        if let Some(b) = g.profile.binds.get_mut(i) {
+                            match &mut b.action {
+                                Action::Tap { radius, .. } | Action::Hold { radius, .. } => {
+                                    // 乘性缩放(每步按固定比例),符合自然的缩放手感;
+                                    // 除浮点精度外不设上下限,仅防止缩到 0
+                                    *radius = crate::keymap::zoom_radius(*radius, factor);
+                                }
+                                _ => {}
+                            }
                         }
-                        _ => {}
+                    }
+                    // 轮盘半径同样是乘性缩放(与键位圈手感一致),
+                    // 只保证不缩到 0;轮盘半径不等于键位圈那个"默认半径",
+                    // 所以不走键位圈的"接近默认值就精确复位"。
+                    ResizeTarget::Wheel(i) => {
+                        if let Some(w) = g.profile.wheels.get_mut(i) {
+                            w.radius = (w.radius * factor).max(0.01);
+                        }
                     }
                 }
             }
@@ -1728,6 +1852,12 @@ impl eframe::App for PadApp {
                     }
                     Err(e) => self.log(format!("连接失败: {e}")),
                 }
+            }
+        }
+        if let Some(rx) = &self.audio_rx {
+            if let Ok(msg) = rx.try_recv() {
+                self.audio_rx = None;
+                self.log(msg);
             }
         }
         if let Some(rx) = &self.shot_rx {
@@ -2041,7 +2171,11 @@ impl eframe::App for PadApp {
                     self.resync();
                     match adb::launch_scrcpy(&self.scrcpy_path, &self.serial(), &self.scrcpy_args)
                     {
-                        Ok(_) => self.log("scrcpy 已启动"),
+                        Ok(_) => {
+                            self.log("scrcpy 已启动");
+                            // 部分机型音频转发起步慢,自动补一次音量键唤醒
+                            self.wake_audio();
+                        }
                         Err(e) => self.log(format!("启动失败: {e:#}")),
                     }
                 }
@@ -2105,144 +2239,13 @@ impl eframe::App for PadApp {
                 .id_salt("left_cfg")
                 .max_height(cfg_max_h)
                 .show(ui, |ui| {
-                    egui::CollapsingHeader::new("使用说明")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            ui.label(
-                        "1. 手机开 USB 调试并连接\n\
-                         2. 顶栏选设备 → [连接控制]\n\
-                         3. [启动 scrcpy] 出画面\n\
-                         4. 右侧添加键位/轮盘,截图取点\n\
-                         5. 按总开关键(默认F8)开映射\n\
-                         \n\
-                         添加键位:点[添加]后立即进入取点,\n\
-                         在截图上点一下,再按下要绑的键;\n\
-                         点[添加]入列表后这次操作就结束了,\n\
-                         不会还停在取点状态(要改再点[取点]);\n\
-                         取点/改键/改范围互斥,以最后一次为准;\n\
-                         还没绑键时点[取消取点]可取消(圆圈消失)\n\
-                         \n\
-                         键位文件:保存配置/另存为/选用配置/\n\
-                         新建配置;[检测当前 json] 校验当前\n\
-                         配置文件的格式(不合法会指出问题)\n\
-                         \n\
-                         鼠标按键也能绑定(左/右/中键):\n\
-                         键位捕获时直接按鼠标键即可\n\
-                         \n\
-                         动作:点按/长按/滑动/系统键\n\
-                         点按时长=0 表示按住不松手,\n\
-                         再按一次同一键才抬起\n\
-                         长短按可用[转长按]按钮互切\n\
-                         \n\
-                         响应范围:点[修改响应范围]后\n\
-                         该圆圈变黄,Ctrl++ / Ctrl+- 缩放\n\
-                         (修改期间 Ctrl+/- 只调圆圈,不缩放\n\
-                         界面),也可直接在截图上拖动;\n\
-                         点[完成]退出(整段修改算一步撤销)\n\
-                         \n\
-                         滑动:取起点/取终点分别设置,\n\
-                         可选曲线(加速/减速/钟形/贝塞尔)\n\
-                         与轨迹(条形/方形/圆形);\n\
-                         曲线参数在[设置...]中调整并预览\n\
-                         \n\
-                         轮盘:永久轮盘始终生效;\n\
-                         设置[启用键]后变临时轮盘\n\
-                         (长按启用 / 再按切换),\n\
-                         启用期间方向键归摇杆;\n\
-                         松开[启用键]的瞬间,还按着的键立刻\n\
-                         恢复成普通功能(不必松手再按一次),\n\
-                         启用期间按着的方向键也会立刻推动摇杆;\n\
-                         [添加轮盘]新建的摇杆半径固定 150px,\n\
-                         并自动落在不与已有摇杆重叠的位置\n\
-                         \n\
-                         画布上的摇杆只标「摇杆N」;\n\
-                         想看某个摇杆的方向键,直接在截图上\n\
-                         点一下那个摇杆的圈,旁边会弹出信息卡\n\
-                         (四个方向 + 启用键与模式),再点一下收起;\n\
-                         点空白处也会收起\n\
-                         \n\
-                         轮盘影响范围:决定方向键按下后手指\n\
-                         实际被推多远(= 半径 × 系数);界面上\n\
-                         的圈仍是半径,两者不同时会多画一圈\n\
-                         橙色虚线显示真实推出距离\n\
-                         \n\
-                         键位看得清吗([外观]里):\n\
-                         默认开启[键位自动对比] —— 按截图每个\n\
-                         键位/摇杆底下的明暗,自动决定那一处用\n\
-                         深色还是浅色;每个圈还描一圈反相外套、\n\
-                         每个标注垫一层半透明衬底(制图学的光晕\n\
-                         与字幕衬底那套做法),亮块暗块上都看得清\n\
-                         [键位显示亮度]是在自动结果上的微调;\n\
-                         关掉自动对比后它就等同旧版的固定档位\n\
-                         \n\
-                         图层:截图上方[显示]可只看\n\
-                         键位/轮盘/永久/临时/锚点(FPS)\n\
-                         \n\
-                         FPS 鼠标瞄准(默认收起):\n\
-                         鼠标位移→手指拖动,用于转视角\n\
-                         ① 展开面板勾选[启用鼠标瞄准]\n\
-                         ② [取锚点]取视角区中央的空白处\n\
-                         ③ 开映射(默认F8)后移动鼠标即转视角\n\
-                         灵敏度/反转Y/归中(静止·阈值·不归中)\n\
-                         可调;可绑[按住才瞄准](如鼠标右键开镜),\n\
-                         也可[瞄准时捕获鼠标](隐藏系统光标);\n\
-                         开打后 Ctrl+Alt 把鼠标交还系统,再按收回\n\
-                         面板顶部会自检并显示当前触摸坐标空间\n\
-                         \n\
-                         scrcpy 管理:可以直接指定 scrcpy 所在\n\
-                         **目录**(最省事,填一个就够),[自动寻找\n\
-                         全部]/[测试并刷新]也可;\n\
-                         勾选[记住路径]后 scrcpy 目录/路径、\n\
-                         server/adb 与启动参数存进配置目录的\n\
-                         settings.json,重启后直接生效,不必\n\
-                         重新寻找([打开配置目录]可查看);\n\
-                         路径被搬走也不会丢:程序会记住它的\n\
-                         所在目录,下次启动在那附近重新找回;\n\
-                         scrcpy参数旁的[...]是常用参数助手\n\
-                         (含中文说明与 GitHub 链接);\n\
-                         [启动预设]可选 2K/4K/1K/720P 与音频开关\n\
-                         \n\
-                         引擎状态(左栏):显示此刻占用的触点数\n\
-                         (设备端最多 10 个,键位/摇杆/瞄准共用)\n\
-                         与「因为挤不进去而被放弃的按下次数」。\n\
-                         若这个数不为 0,那一次按下会被设备丢掉\n\
-                         (表现为按了没反应),此时少按几个键即可\n\
-                         映射的每一次开关(总开关键 / 顶栏按钮)\n\
-                         都会写进日志 —— 遇到「按键不反应」时,\n\
-                         先看日志里映射是不是被误关了\n\
-                         \n\
-                         快捷键(键位捕获/取点/打字时不生效):\n\
-                         Ctrl+Z 撤销 ⟳重做用 Ctrl+Y\n\
-                         Ctrl+S 保存配置\n\
-                         Ctrl+Shift+S 另存为\n\
-                         F5 刷新设备\n\
-                         \n\
-                         其它:顶栏[关于]内可查看许可证;\n\
-                         左栏[保存日志]导出设备与环境信息;\n\
-                         左栏上部的配置区可滚动,日志固定\n\
-                         在底部并能单独滚动,互不遮挡\n\
-                         \n\
-                         外观(左栏[外观],默认收起):\n\
-                         配色可选深色/浅色/Nord/Catppuccin,\n\
-                         密度可选紧凑/标准/宽松;\n\
-                         可设置背景图片(铺满/完整/平铺)\n\
-                         与暗化遮罩、面板不透明度;\n\
-                         [键位自动对比]与[键位显示亮度]单独调\n\
-                         截图上键位圈与摇杆圈的清晰度(见上文);\n\
-                         外观随配置保存,[选用配置]会一并切换;\n\
-                         另外还会自动缓存到程序目录(与键位\n\
-                         配置同目录的 look.json),重启后保持\n\
-                         上次设置,不必每次重新调\n\
-                         \n\
-                         坐标一律按比例保存:\n\
-                         换分辨率或换手机后键位自动对齐,\n\
-                         旧配置在首次连接时自动升级(日志可见)\n\
-                         配置里的 format_version 即格式版本\n\
-                         键位允许落在画面之外,程序不做越界\n\
-                         纠正;竖屏截图时也不会拿竖屏尺寸去\n\
-                         换算横屏的布局(那会把键位算坏)",
-                            );
-                        });
+                    if ui
+                        .button("使用说明")
+                        .on_hover_text("打开使用说明(独立窗口:左侧章节索引,右侧图文与示例)")
+                        .clicked()
+                    {
+                        self.help_open = true;
+                    }
                     ui.separator();
                     if let Some(err) = &self.capture_err {
                         ui.colored_label(self.theme().danger, "输入捕获不可用:");
@@ -2263,8 +2266,9 @@ impl eframe::App for PadApp {
                             self.reload_profile_from_current();
                         }
                     });
-                    // 键位文件重定向:指定任意目录/文件名为当前键位(可无文件则新建)
-                    ui.horizontal(|ui| {
+                    // 键位文件重定向:指定任意目录/文件名为当前键位(可无文件则新建)。
+                    // 用 horizontal_wrapped:左栏可以被拖窄,按钮多了以后换行总比被裁掉好
+                    ui.horizontal_wrapped(|ui| {
                         if ui.button("选用配置...").clicked() {
                             self.dialog = Some(crate::filedialog::pick_file());
                             self.dialog_purpose = DialogPurpose::ChooseProfile;
@@ -2272,6 +2276,15 @@ impl eframe::App for PadApp {
                         if ui.button("新建配置...").clicked() {
                             self.dialog = Some(crate::filedialog::save_file("scrcpy-pad-profile.json"));
                             self.dialog_purpose = DialogPurpose::NewProfile;
+                        }
+                        if ui
+                            .button("默认配置")
+                            .on_hover_text(
+                                "切回程序默认的配置文件(首次运行时自动创建的那份),并加载它的内容",
+                            )
+                            .clicked()
+                        {
+                            self.load_default_profile();
                         }
                         if ui.button("检测当前 json").clicked() {
                             self.check_current_profile();
@@ -2307,7 +2320,7 @@ impl eframe::App for PadApp {
                     }
 
                     ui.separator();
-                    egui::CollapsingHeader::new("外观")
+                    egui::CollapsingHeader::new("外观（开发中）")
                         .default_open(false)
                         .show(ui, |ui| {
                             self.ui_look(ui);
@@ -2572,6 +2585,12 @@ impl eframe::App for PadApp {
                 });
         }
 
+        // ================= 使用说明窗口 =================
+        {
+            let th = self.theme();
+            self.help.show(ctx, &mut self.help_open, &th);
+        }
+
         // ================= 参数助手窗口 =================
         self.ui_args_helper(ctx);
 
@@ -2828,7 +2847,7 @@ impl PadApp {
             self.push_undo();
             self.shared.lock().unwrap().profile.binds.remove(i);
             // 交互态若指向刚删掉的条目就一并收尾,免得残留在失效索引上
-            if self.resizing == Some(i) {
+            if self.resizing == Some(ResizeTarget::Bind(i)) {
                 self.resizing = None;
             }
             self.log("已删除绑定");
@@ -2850,9 +2869,9 @@ impl PadApp {
             }
             let kind_before = self.draft.kind;
             egui::ComboBox::from_id_salt("newkind")
-                .selected_text(["点按", "长按", "滑动", "系统键"][self.draft.kind])
+                .selected_text(KIND_NAMES[self.draft.kind])
                 .show_ui(ui, |ui| {
-                    for (i, n) in ["点按", "长按", "滑动", "系统键"].iter().enumerate() {
+                    for (i, n) in KIND_NAMES.iter().enumerate() {
                         ui.selectable_value(&mut self.draft.kind, i, *n);
                     }
                 });
@@ -3135,6 +3154,19 @@ impl PadApp {
                 {
                     self.begin_pick(CoordSlot::WheelCenter(i));
                 }
+                // 与按键一致的"改响应范围":进入后 Ctrl++/- 调半径,或直接在截图上拖动
+                let resizing_w = self.resizing == Some(ResizeTarget::Wheel(i));
+                if ui
+                    .button(if resizing_w { "完成" } else { "改响应范围" })
+                    .on_hover_text("进入后用 Ctrl++ / Ctrl+- 缩放半径,或直接在截图上拖动圆圈")
+                    .clicked()
+                {
+                    if resizing_w {
+                        self.resizing = None;
+                    } else {
+                        self.begin_resize_wheel(i);
+                    }
+                }
                 if ui.button("删除").clicked() {
                     to_delete = Some(i);
                 }
@@ -3143,6 +3175,9 @@ impl PadApp {
         if let Some(i) = to_delete {
             self.push_undo();
             self.shared.lock().unwrap().profile.wheels.remove(i);
+            if self.resizing == Some(ResizeTarget::Wheel(i)) {
+                self.resizing = None;
+            }
             self.log("已删除轮盘");
         }
         if ui.button("添加轮盘").clicked() {
@@ -3210,7 +3245,7 @@ impl PadApp {
                         let r = m.len(*radius) * scale;
                         let tone = tone_at(px, py);
                         // 修改响应范围中的键位显示黄色;否则点按绿、长按橙
-                        let (ring, fill) = if self.resizing == Some(i) {
+                        let (ring, fill) = if self.resizing == Some(ResizeTarget::Bind(i)) {
                             (th.key_resize, th.key_resize_fill)
                         } else if matches!(b.action, Action::Tap { .. }) {
                             (th.key_tap, th.key_tap_fill)
@@ -3372,6 +3407,8 @@ impl PadApp {
                 let r = m.len(w.radius) * scale;
                 let tone = tone_at(m.x(w.cx), m.y(w.cy));
                 let selected = self.wheel_info == Some(wi);
+                // 正在"改响应范围"(改半径)的这个轮盘:圆环改用黄色,与键位一致
+                let resizing_this = self.resizing == Some(ResizeTarget::Wheel(wi));
                 // 影响范围:触点实际推出的距离,默认与半径一致(scope=1.0)时两者重合,
                 // 此时不再多画一圈,避免与半径圆环糊在一起。
                 let push_r = w.push_px(&m) * scale;
@@ -3386,7 +3423,8 @@ impl PadApp {
                 );
                 if let Some(t) = &w.temp {
                     // 临时轮盘:虚线圆环(摇杆的视觉结构不变,只按亮度档位调明暗)
-                    let color = theme::tone_color(th.wheel_temp, tone);
+                    let base = if resizing_this { th.key_resize } else { th.wheel_temp };
+                    let color = theme::tone_color(base, tone);
                     let n = 48;
                     let pts: Vec<egui::Pos2> = (0..=n)
                         .map(|i| {
@@ -3429,7 +3467,8 @@ impl PadApp {
                     let _ = t;
                 } else {
                     // 永久轮盘:实线圆环
-                    let color = theme::tone_color(th.wheel_perm, tone);
+                    let base = if resizing_this { th.key_resize } else { th.wheel_perm };
+                    let color = theme::tone_color(base, tone);
                     painter.circle_stroke(c, r, Stroke::new(6.0, theme::casing(color)));
                     painter.circle_stroke(c, r, Stroke::new(size::KEY_STROKE, color));
                     if selected {
@@ -4068,7 +4107,7 @@ impl PadApp {
 
     /// FPS 鼠标瞄准设置(默认收起,点标题才展开)
     fn ui_aim(&mut self, ui: &mut egui::Ui, captured: bool) {
-        egui::CollapsingHeader::new("鼠标瞄准(FPS)")
+        egui::CollapsingHeader::new("鼠标瞄准(FPS)（开发中）")
             .default_open(false)
             .show(ui, |ui| {
                 self.ui_aim_body(ui, captured);
@@ -4402,22 +4441,36 @@ impl PadApp {
                     self.cancel_draft();
                     self.log("已取消新增");
                 }
-            } else if let Some(i) = self.resizing {
+            } else if let Some(target) = self.resizing {
                 // 直接显示当前半径(像素),改没改一眼就能看出来
                 let space = self.screen_size().unwrap_or((1080, 2400));
                 let cur_px = {
                     let g = self.shared.lock().unwrap();
                     let m = g.profile.mapper(space);
-                    match g.profile.binds.get(i).map(|b| &b.action) {
-                        Some(Action::Tap { radius, .. })
-                        | Some(Action::Hold { radius, .. }) => m.len(*radius),
-                        _ => 0.0,
+                    match target {
+                        ResizeTarget::Bind(i) => {
+                            match g.profile.binds.get(i).map(|b| &b.action) {
+                                Some(Action::Tap { radius, .. })
+                                | Some(Action::Hold { radius, .. }) => m.len(*radius),
+                                _ => 0.0,
+                            }
+                        }
+                        ResizeTarget::Wheel(i) => g
+                            .profile
+                            .wheels
+                            .get(i)
+                            .map(|w| m.len(w.radius))
+                            .unwrap_or(0.0),
                     }
+                };
+                let what = match target {
+                    ResizeTarget::Bind(_) => "响应范围修改中",
+                    ResizeTarget::Wheel(_) => "轮盘半径修改中",
                 };
                 let th = self.theme();
                 ui.colored_label(
                     th.warn,
-                    format!("响应范围修改中: Ctrl++ / Ctrl+- 缩放,或在截图上拖动(当前 {cur_px:.0}px)"),
+                    format!("{what}: Ctrl++ / Ctrl+- 缩放,或在截图上拖动(当前 {cur_px:.0}px)"),
                 );
                 if ui.button("完成").clicked() {
                     self.resizing = None;
@@ -4474,7 +4527,7 @@ impl PadApp {
             // 这里直接看原始指针状态,而不是 resp.dragged():截图位于双向滚动区内,
             // 拖拽仲裁可能被滚动区吃掉,表现为"拖不动"。只要按下时落在截图上,
             // 按住期间半径就一直跟着指针走(直接点一下也能把半径设到该距离)。
-            if let Some(i) = self.resizing {
+            if let Some(target) = self.resizing {
                 let (down, pos, origin) = ui.input(|inp| {
                     (
                         inp.pointer.primary_down(),
@@ -4487,13 +4540,22 @@ impl PadApp {
                 let hit = rect.expand2(egui::vec2(((avail - rect.width()) / 2.0).max(0.0), 0.0));
                 if down && origin.map(|o| hit.contains(o)).unwrap_or(false) {
                     if let Some(pos) = pos {
+                        // 目标圆心(像素):键位取自己的坐标,轮盘取圆心
                         let (cx, cy) = {
                             let g = self.shared.lock().unwrap();
                             let m = g.profile.mapper((w, h));
-                            match g.profile.binds.get(i).map(|b| &b.action) {
-                                Some(Action::Tap { x, y, .. })
-                                | Some(Action::Hold { x, y, .. }) => m.point(*x, *y),
-                                _ => (0, 0),
+                            match target {
+                                ResizeTarget::Bind(i) => {
+                                    match g.profile.binds.get(i).map(|b| &b.action) {
+                                        Some(Action::Tap { x, y, .. })
+                                        | Some(Action::Hold { x, y, .. }) => m.point(*x, *y),
+                                        _ => (0, 0),
+                                    }
+                                }
+                                ResizeTarget::Wheel(i) => match g.profile.wheels.get(i) {
+                                    Some(wl) => m.point(wl.cx, wl.cy),
+                                    None => (0, 0),
+                                },
                             }
                         };
                         let dx = pos.x - (rect.min.x + cx as f32 * scale);
@@ -4501,13 +4563,23 @@ impl PadApp {
                         let new_r = ((dx * dx + dy * dy).sqrt() / scale).max(0.01);
                         let mut g = self.shared.lock().unwrap();
                         let m = g.profile.mapper((w, h));
-                        if let Some(b) = g.profile.binds.get_mut(i) {
-                            match &mut b.action {
-                                Action::Tap { radius, .. } | Action::Hold { radius, .. } => {
-                                    // 界面按像素拖动,存储换算成相对值
-                                    *radius = m.rel_len(new_r);
+                        match target {
+                            ResizeTarget::Bind(i) => {
+                                if let Some(b) = g.profile.binds.get_mut(i) {
+                                    match &mut b.action {
+                                        Action::Tap { radius, .. }
+                                        | Action::Hold { radius, .. } => {
+                                            // 界面按像素拖动,存储换算成相对值
+                                            *radius = m.rel_len(new_r);
+                                        }
+                                        _ => {}
+                                    }
                                 }
-                                _ => {}
+                            }
+                            ResizeTarget::Wheel(i) => {
+                                if let Some(wl) = g.profile.wheels.get_mut(i) {
+                                    wl.radius = m.rel_len(new_r);
+                                }
                             }
                         }
                     }
