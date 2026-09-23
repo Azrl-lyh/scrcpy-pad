@@ -1049,6 +1049,12 @@ pub fn run(
             )
         };
 
+        // 物理按键镜像:所有按键事件先落到这里。它是"某个物理键此刻是否真的按着"
+        // 的唯一可信依据 —— 归属切换(临时摇杆启用/停用、配置改动)时的对账全靠它;
+        // 同时它给出"上升沿",让总开关键与切换模式的启用键不被自动重复连翻。
+        let fresh_press = rising_edge(ev.pressed, held.has(ev.code));
+        held.set(ev.code, ev.pressed);
+
         // 瞄准门控键(如鼠标右键=开镜)的按下/松开
         if aim_hold_key != 0 && ev.code == aim_hold_key {
             aim.gate_down = ev.pressed;
@@ -1056,20 +1062,16 @@ pub fn run(
 
         // Ctrl+Alt:临时把鼠标交还给系统,再按一次收回。
         // 只在瞄准确实会捕获鼠标时才有意义,避免误触改状态。
+        // 同样只认上升沿:否则 Windows 上按住 Ctrl+Alt 不放,自动重复会把
+        // "交还/收回"来回翻转(与总开关键、切换型启用键同一处理)。
         if is_ctrl(ev.code) {
             ctrl_down = ev.pressed;
         } else if is_alt(ev.code) {
             alt_down = ev.pressed;
         }
-        if aim_captured && ctrl_alt_chord(ev.code, ev.pressed, ctrl_down, alt_down) {
+        if aim_captured && ctrl_alt_chord(ev.code, ev.pressed && fresh_press, ctrl_down, alt_down) {
             aim.released = !aim.released;
         }
-
-        // 物理按键镜像:所有按键事件先落到这里。它是"某个物理键此刻是否真的按着"
-        // 的唯一可信依据 —— 归属切换(临时摇杆启用/停用、配置改动)时的对账全靠它;
-        // 同时它给出"上升沿",让总开关键与切换模式的启用键不被自动重复连翻。
-        let fresh_press = rising_edge(ev.pressed, held.has(ev.code));
-        held.set(ev.code, ev.pressed);
 
         // 空闲(≥3 秒没有任何按键)之后的第一批按键:顺手请界面重新确认一次坐标空间。
         // 用户常见操作就是"切到别的窗口待一会儿再回来打" —— 这期间手机可能已经转屏,
@@ -1339,8 +1341,10 @@ pub fn run(
                 } => {
                     let (px, py) = m.point(*x, *y);
                     if *duration_ms == 0 {
-                        // 按住切换:按下不松手,直到再次按下同一键才抬起
-                        if ev.pressed {
+                        // 按住切换:按下不松手,直到再次按下同一键才抬起。
+                        // 只认**上升沿**:Windows 的自动重复同样以 KeyPress 反复上报
+                        // (rdev 不区分),否则按住不放会让这个开关每秒来回翻转好几次。
+                        if fresh_press {
                             if fingers.is_down(idx) {
                                 ctl.touch_up(pid, px, py);
                                 fingers.release(idx);
@@ -1351,8 +1355,9 @@ pub fn run(
                                 refused_note = Some(bind.key);
                             }
                         }
-                    } else if ev.pressed {
+                    } else if fresh_press {
                         // 点按:按下注入 DOWN,持续 duration_ms(默认 40ms)后定时抬起。
+                        // (同样只认上升沿:否则 Windows 上按住不放 = 每秒重放几十次点按)
                         // 若上一击尚未自动抬起又再次按下(极快连点/组合技排序),
                         // 先立即结束旧触点再开新一轮,保证每次点按都完整触发、不丢键。
                         if fingers.is_down(idx) {
@@ -1391,8 +1396,9 @@ pub fn run(
                     }
                 }
                 Action::Swipe(s) => {
-                    // 按下触发滑动;中途松手不打断,滑到终点由定时抬起清理按下状态
-                    if ev.pressed {
+                    // 按下触发滑动;中途松手不打断,滑到终点由定时抬起清理按下状态。
+                    // 只认上升沿:否则 Windows 上按住不放会把整条滑动轨迹反复重放。
+                    if fresh_press {
                         if fingers.try_down(idx, reserved) {
                             // 相对坐标 -> 像素后再生成轨迹采样点
                             let start_px = m.point(s.start.0, s.start.1);
