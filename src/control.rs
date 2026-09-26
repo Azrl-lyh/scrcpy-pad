@@ -2,10 +2,11 @@
 //! 消息格式参照 scrcpy 源码 app/src/control_msg.c 的 sc_control_msg_serialize()。
 
 use anyhow::{Context, Result};
+use crate::{diag_info, diag_warn};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Sender, channel};
 
 pub const ACTION_DOWN: u8 = 0;
@@ -29,6 +30,17 @@ pub struct ControlClient {
     pub screen_w: u32,
     /// 设备屏幕高
     pub screen_h: u32,
+    /// 写线程**真正用来序列化**的宽高。
+    ///
+    /// 为什么要单独一份:`screen_w/h` 是给引擎算坐标用的普通字段,
+    /// 而写线程在 `move` 走了自己的副本之后再也看不到对它的修改 ——
+    /// 于是会出现"引擎按新尺寸算坐标、消息里却声明旧尺寸"的不一致。
+    /// 当前用 control-only 模式(服务端走原始坐标、不校验尺寸)所以无害,
+    /// 但一旦有人启用视频或 `--new-display`,服务端 `PositionMapper.map()`
+    /// 会因尺寸不符把**每一条**触摸事件丢弃,且不报任何错。
+    /// 用原子量让两者始终一致,避免以后踩这个坑。
+    proto_w: Arc<AtomicU32>,
+    proto_h: Arc<AtomicU32>,
 }
 
 impl ControlClient {
@@ -52,19 +64,31 @@ impl ControlClient {
         stream.set_read_timeout(None).ok();
 
         let connected = Arc::new(AtomicBool::new(true));
+        let proto_w = Arc::new(AtomicU32::new(screen_w));
+        let proto_h = Arc::new(AtomicU32::new(screen_h));
         let (tx, rx) = channel::<ControlCmd>();
 
         // 写线程:把控制消息序列化后写入 socket
         {
             let connected = connected.clone();
+            let proto_w = proto_w.clone();
+            let proto_h = proto_h.clone();
             let mut stream = stream.try_clone()?;
             std::thread::spawn(move || {
-                let w = screen_w as u16;
-                let h = screen_h as u16;
                 while let Ok(cmd) = rx.recv() {
+                    // 每轮都从原子量取一次:坐标空间改变后立刻生效
+                    let w = proto_w.load(Ordering::Relaxed) as u16;
+                    let h = proto_h.load(Ordering::Relaxed) as u16;
                     let buf = serialize(cmd, w, h);
-                    if stream.write_all(&buf).is_err() {
+                    if let Err(e) = stream.write_all(&buf) {
                         connected.store(false, Ordering::Relaxed);
+                        // 写入失败是最容易被忽略的故障:命令全部静默丢弃,
+                        // 用户只看到"按键没反应"。把 errno 留下来。
+                        diag_warn!(
+                            "control",
+                            "控制通道写入失败: {e} (errno {:?}) —— 后续注入命令将全部丢弃",
+                            e.raw_os_error()
+                        );
                         break;
                     }
                 }
@@ -79,8 +103,18 @@ impl ControlClient {
                 let mut buf = [0u8; 4096];
                 loop {
                     match stream.read(&mut buf) {
-                        Ok(0) | Err(_) => {
+                        Ok(0) => {
                             connected.store(false, Ordering::Relaxed);
+                            diag_warn!("control", "控制通道对端关闭(EOF),连接标记为断开");
+                            break;
+                        }
+                        Err(e) => {
+                            connected.store(false, Ordering::Relaxed);
+                            diag_warn!(
+                                "control",
+                                "控制通道读取失败: {e} (errno {:?}),连接标记为断开",
+                                e.raw_os_error()
+                            );
                             break;
                         }
                         Ok(_) => {}
@@ -89,16 +123,33 @@ impl ControlClient {
             });
         }
 
+        diag_info!(
+            "control",
+            "控制通道已建立: 端口 {port},坐标空间 {screen_w}x{screen_h}"
+        );
         Ok(Self {
             tx,
             connected,
             screen_w,
             screen_h,
+            proto_w,
+            proto_h,
         })
     }
 
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
+    }
+
+    /// 更新触摸坐标空间。
+    ///
+    /// 必须走这个方法而不是直接写 `screen_w/h`:后者改不到写线程手里的值,
+    /// 会造成"引擎按新尺寸算坐标、协议里声明旧尺寸"的不一致(见字段注释)。
+    pub fn set_screen(&mut self, w: u32, h: u32) {
+        self.screen_w = w;
+        self.screen_h = h;
+        self.proto_w.store(w, Ordering::Relaxed);
+        self.proto_h.store(h, Ordering::Relaxed);
     }
 
     pub fn send(&self, cmd: ControlCmd) {

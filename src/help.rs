@@ -74,6 +74,12 @@ impl HelpWindow {
                 egui::Panel::left("help_index")
                     .resizable(false)
                     .exact_size(INDEX_WIDTH)
+                    // 索引条的底色跟窗口一致:子面板默认取的是 `panel_fill`
+                    // (主界面那层,背景图开着时更透),压在窗口里会显得比正文更"飘"。
+                    .frame(
+                        egui::Frame::side_top_panel(ui.style())
+                            .fill(ui.visuals().window_fill),
+                    )
                     .show(ui, |ui| {
                         ui.strong("章节");
                         ui.separator();

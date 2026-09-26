@@ -1,10 +1,10 @@
 //! 程序级设置(scrcpy 三件套路径 / 启动参数 / 上次设备)的持久化。
 //!
-//! 为什么单独有一份:键位配置(profile.json)是**可传递、可另存**的用户资产,
+//! 为什么单独有一份:键位配置(profile.yaml)是**可传递、可另存**的用户资产,
 //! 而"我这台电脑上 scrcpy 装在哪"是本机私有的环境信息 —— 两者混在一起,
 //! 用户把配置发给别人时就会带上自己的绝对路径。外观(look.json)同理。
 //!
-//! 落盘位置与 profile.json / look.json 同目录(见 app::config_dir):
+//! 落盘位置与 profile.yaml / look.json 同目录(见 app::config_dir):
 //!   Linux   : ~/.config/scrcpy-pad/settings.json
 //!   Windows : %APPDATA%\scrcpy-pad\config\settings.json
 //!   macOS   : ~/Library/Application Support/dev.scrcpy-pad/settings.json
@@ -44,6 +44,13 @@ pub struct Settings {
     /// 上次使用的设备序列号(重连同一台手机时优先选中)
     #[serde(default)]
     pub selected_serial: String,
+    /// 诊断日志级别(error / warn / info / debug / trace);空 = 用内置默认 info。
+    ///
+    /// 为什么放进 settings.json 而不是只认环境变量:Windows 用户设环境变量很麻烦,
+    /// 而这个开关恰恰是让"问题只在别人机器上出现"时把现场记下来寄回来的唯一手段。
+    /// 环境变量 `SCRCPY_PAD_LOG` 优先于本字段(临时排查用,不必改文件)。
+    #[serde(default)]
+    pub log_level: String,
     /// 最后写入时间(epoch 秒,仅供用户查看,不参与逻辑)
     #[serde(default)]
     pub saved_at: u64,
@@ -64,6 +71,7 @@ impl Default for Settings {
             adb_path: String::new(),
             scrcpy_args: String::new(),
             selected_serial: String::new(),
+            log_level: String::new(),
             saved_at: 0,
         }
     }
@@ -300,7 +308,7 @@ impl SettingsCache {
     }
 }
 
-/// 设置文件路径(与 profile.json / look.json 同目录;无配置目录时退化为程序旁边)
+/// 设置文件路径(与 profile.yaml / look.json 同目录;无配置目录时退化为程序旁边)
 pub fn path() -> PathBuf {
     crate::app::config_dir().join("settings.json")
 }
@@ -364,6 +372,7 @@ mod tests {
             remember_paths: true,
             scrcpy_args: "--stay-awake".into(),
             selected_serial: " ABC123 ".into(),
+            log_level: String::new(),
             saved_at: 0,
         };
         assert!(s.sanitize(), "存在死路径时 sanitize 应报告改动");

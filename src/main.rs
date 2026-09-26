@@ -2,6 +2,7 @@ mod adb;
 mod app;
 mod capture;
 mod control;
+mod diag;
 mod engine;
 mod filedialog;
 mod help;
@@ -10,11 +11,22 @@ mod settings;
 mod theme;
 
 fn main() -> eframe::Result<()> {
+    // 诊断日志必须是**第一件**发生的事:紧接着 PadApp::new 就会开始
+    // 枚举输入设备、读配置、连 adb —— 那些正是最需要留下现场的地方。
+    diag::init();
+    diag::install_panic_hook();
+
     if std::env::args().any(|a| a == "--selftest") {
-        selftest();
-        return Ok(());
+        diag::snapshot_environment();
+        let code = selftest();
+        // 收尾必须放在这里:`selftest` 内部曾经直接 process::exit,
+        // 那样会跳过 shutdown 的"正常退出"标记,于是下一次启动会误报
+        // "上次运行是崩溃或被强杀"。
+        diag::shutdown();
+        std::process::exit(code);
     }
 
+    diag::snapshot_environment();
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1180.0, 760.0])
         .with_min_inner_size([900.0, 600.0]);
@@ -25,11 +37,14 @@ fn main() -> eframe::Result<()> {
         viewport,
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "scrcpy-pad 游戏控制台",
         options,
         Box::new(|cc| Ok(Box::new(app::PadApp::new(cc)))),
-    )
+    );
+    // 正常退出也留一行标记:下次启动靠它判断"上次是不是崩溃/被强杀"
+    diag::shutdown();
+    result
 }
 
 /// 程序图标:编译期直接嵌入二进制,运行时不依赖任何外部图片文件
@@ -57,7 +72,7 @@ fn app_icon() -> Option<egui::IconData> {
 }
 
 /// 无界面自检:验证键盘捕获权限 / adb / scrcpy 定位 / 控制通道 / 协议注入(仅发无害 hover)
-fn selftest() {
+fn selftest() -> i32 {
     let mut failed = false;
     let mut check = |name: &str, ok: bool, detail: &str| {
         println!("[{}] {name} {detail}", if ok { "PASS" } else { "FAIL" });
@@ -83,7 +98,7 @@ fn selftest() {
         );
     }
     #[cfg(windows)]
-    check("键盘捕获(rdev)", true, "(Windows 无需特殊权限)");
+    check("键盘捕获(Windows 低级钩子)", true, "(Windows 无需特殊权限)");
 
     // 1b. 鼠标设备(FPS 瞄准依赖相对位移,须能被读到)
     #[cfg(target_os = "linux")]
@@ -108,14 +123,14 @@ fn selftest() {
     // 2. scrcpy 定位与版本
     let exe = adb::find_scrcpy();
     check("自动寻找 scrcpy", exe.is_some(), "");
-    let Some(exe) = exe else { std::process::exit(1) };
+    let Some(exe) = exe else { return 1; };
     let ver = adb::scrcpy_version_at(&exe.display().to_string());
     check("scrcpy 版本", ver.is_some(), &format!("{ver:?}"));
-    let Some(version) = ver else { std::process::exit(1) };
+    let Some(version) = ver else { return 1; };
 
     let server_file = adb::find_server(Some(&exe));
     check("定位 scrcpy-server", server_file.is_some(), "");
-    let Some(server_file) = server_file else { std::process::exit(1) };
+    let Some(server_file) = server_file else { return 1; };
     let server_path = server_file.display().to_string();
 
     // 3. adb 定位(优先 scrcpy 同目录,对应 Windows 发行包同目录 adb.exe 场景)
@@ -127,27 +142,27 @@ fn selftest() {
         .unwrap_or_else(|| "(仅 PATH)".to_string());
     check("定位 adb", adb_path.is_some(), &adb_detail);
     if adb_path.is_none() {
-        std::process::exit(1);
+        return 1;
     }
 
     // 4. adb 设备
     let devices = adb::list_devices();
     check("adb 设备在线", !devices.is_empty(), &format!("({} 台)", devices.len()));
     if devices.is_empty() {
-        std::process::exit(1);
+        return 1;
     }
     let serial = devices[0].clone();
 
     // 5. 分辨率
     let size = adb::screen_size(&serial);
     check("读取分辨率", size.is_ok(), &format!("{size:?}"));
-    let Ok((w, h)) = size else { std::process::exit(1) };
+    let Ok((w, h)) = size else { return 1; };
 
     // 6. scrcpy-server 控制通道
     let server = adb::start_control_server(&serial, &server_path, &version, 0x1a2b3c4d, 28383);
     let Ok(server) = server else {
         check("启动 control server", false, &format!("{:?}", server.err()));
-        std::process::exit(1);
+        return 1;
     };
     check("启动 control server", true, "");
 
@@ -162,7 +177,7 @@ fn selftest() {
         }
     }
     check("TCP 连接控制通道", client.is_some(), "");
-    let Some(client) = client else { std::process::exit(1) };
+    let Some(client) = client else { return 1; };
 
     // 7. 协议注入(hover 移动,不触碰屏幕内容)
     let mouse = u64::MAX;
@@ -174,5 +189,5 @@ fn selftest() {
     drop(client);
     drop(server);
     println!("{}", if failed { "存在失败项" } else { "全部通过" });
-    std::process::exit(if failed { 1 } else { 0 });
+    if failed { 1 } else { 0 }
 }

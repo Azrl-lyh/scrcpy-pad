@@ -344,7 +344,7 @@ pub fn apply_style(style: &mut egui::Style, look: &Look, bg_active: bool) {
         panel
     };
     visuals.window_fill = if bg_active {
-        with_alpha(window, look.panel_alpha)
+        with_alpha(window, popup_alpha(look.panel_alpha))
     } else {
         window
     };
@@ -393,6 +393,29 @@ pub fn apply_style(style: &mut egui::Style, look: &Look, bg_active: bool) {
 /// 给颜色套一个不透明度
 pub fn with_alpha(c: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+}
+
+/// 弹窗背景的不透明度下限(0.8 × 255)。
+///
+/// 背景图开着时,弹窗(使用说明、scrcpy 参数助手…)原先和主面板用同一个
+/// `panel_alpha`,于是文字压在花哨的游戏画面上很难看清。这里把弹窗的
+/// **透明度**打折(见 [`popup_alpha`]),但最多只压到八成的实心程度 ——
+/// 再实就完全遮盖背景、失去"半透明程序"的味道了。
+const POPUP_MIN_ALPHA: u8 = 204;
+
+/// 弹窗透明度相对程序背景"减少"的比例:0.30 = 减少百分之三十。
+const POPUP_ALPHA_CUT: f32 = 0.30;
+
+/// 由主面板的不透明度推出弹窗的不透明度(只增不减)。
+///
+/// 透明度(1-a)先按 [`POPUP_ALPHA_CUT`] 削减,再受 [`POPUP_MIN_ALPHA`] 封顶:
+/// 例如主面板 a=190(透明度 65) -> 弹窗 a=209 -> 超过上限,取 204。
+/// `a=0` 时结果仍是 [`POPUP_MIN_ALPHA`],但调用方只在背景图生效时才用它,
+/// 那时 `panel_alpha` 本身不会小到那种程度。
+pub fn popup_alpha(a: u8) -> u8 {
+    let a = a as f32;
+    let lifted = a + (255.0 - a) * POPUP_ALPHA_CUT;
+    (lifted.round() as i32).clamp(0, POPUP_MIN_ALPHA as i32) as u8
 }
 
 // 说明:早期这里有 outline_text()/outline_stroke() 两个"恒为白色"的浮层常量。

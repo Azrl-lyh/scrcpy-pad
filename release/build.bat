@@ -18,7 +18,7 @@ set "ROOT=%~dp0.."
 set "OUT=%~dp0windows-x86_64"
 
 rem 读取版本号(取 Cargo.toml 中首个以 version 开头的行)
-for /f "tokens=2 delims= " %%v in ('findstr /b "version" "%ROOT%\Cargo.toml"') do (
+for /f "tokens=3" %%v in ('findstr /b "version" "%ROOT%\Cargo.toml"') do (
     if not defined VER set "VER=%%v"
 )
 set "VER=%VER:"=%"

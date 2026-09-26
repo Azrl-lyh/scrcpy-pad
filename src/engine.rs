@@ -23,9 +23,10 @@
 
 use crate::capture::CaptureEvent;
 use crate::control::ControlClient;
+use crate::diag_warn;
 use crate::keymap::{
-    Action, Aim, KeyBind, Mapper, Profile, RecenterMode, TempMode, Wheel, easing_apply, key_name,
-    swipe_points,
+    Action, Aim, KeyBind, Mapper, Profile, RecenterMode, SwitchKey, TempMode, Wheel, WheelMode, easing_apply,
+    key_name, swipe_points,
 };
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -221,6 +222,9 @@ fn reconcile_binds(
     // 轮盘与瞄准占用的触点(普通绑定自己不占;对账期间它们不变)
     let reserved = wheel_pointers(wheels) + aim_pointers;
     for (idx, bind) in profile.binds.iter().enumerate() {
+        if bind.fps_only {
+            continue;
+        }
         let want = held.has(bind.key) && !key_owned_by_wheel(profile, wheels, bind.key);
         match &bind.action {
             Action::Hold { x, y, .. } => {
@@ -276,7 +280,12 @@ fn reconcile_wheels(
         }
         let engaged = w.temp.is_none() || wheels[j].active;
         for (d, key) in [w.up, w.down, w.left, w.right].iter().enumerate() {
-            wheels[j].pressed[d] = engaged && held.has(*key);
+            let want = engaged && held.has(*key);
+            if want && !wheels[j].pressed[d] {
+                wheels[j].next_seq = wheels[j].next_seq.wrapping_add(1);
+                wheels[j].press_seq[d] = wheels[j].next_seq;
+            }
+            wheels[j].pressed[d] = want;
         }
         // 本轮盘此刻若已经按着,update_wheel 不会再去申请新触点,故不必减掉自己
         let reserved = extra_pointers + wheel_pointers(wheels);
@@ -307,12 +316,27 @@ fn wheel_pointers(wheels: &[WheelState]) -> usize {
     wheels.iter().filter(|w| w.down).count()
 }
 
-/// 记一次"因为触点池满而放弃按下"
+/// 记一次"因为触点池满而放弃按下"。
+///
+/// 除了计数,还要往诊断日志里留一行**带现场数字**的记录:仅凭"被放弃 3 次"
+/// 无法判断是"用户真按了那么多键"还是"某处状态虚高把预算吃光了"。
 fn refuse(live: &mut EngineLive, code: u16) {
     live.refused += 1;
     if code != 0 {
         live.last_refused = code;
     }
+    crate::diag_warn!(
+        "engine",
+        "触点池已满,放弃这次按下: {} (当时占用 {}/{},普通键位并发上限 {})",
+        if code == 0 {
+            "瞄准".to_string()
+        } else {
+            key_name(code)
+        },
+        live.pointers,
+        DEVICE_MAX_POINTERS,
+        MAX_CONCURRENT_KEYS
+    );
 }
 
 /// 往界面日志里留一句话(引擎线程没有日志所有权,只能放进 [`Shared::notices`])。
@@ -329,7 +353,7 @@ fn notify(notices: &mut Vec<String>, msg: impl Into<String>) {
 
 /// 物理按键的"上升沿":这一次事件是不是这个键**刚被按下**(而不是自动重复)。
 ///
-/// 为什么必须区分:Windows 的按键自动重复会以 KeyPress 反复上报(rdev 不区分),
+/// 为什么必须区分:Windows 的按键自动重复会以 KeyPress 反复上报(低级钩子不区分),
 /// 长按 F8 半秒就能来十几次 —— 如果每次事件都翻转映射开关,
 /// 用户看到的就是"按了 F8 却没反应 / 状态跟自己以为的不一样,
 /// 必须再关一次开一次才恢复",而且没有任何日志可查。
@@ -453,7 +477,8 @@ fn binds_signature(binds: &[KeyBind]) -> u64 {
             .wrapping_mul(0x100_0000_01b3)
             .wrapping_add(b.key as u64 + 1)
             .rotate_left(7)
-            .wrapping_add(kind);
+            .wrapping_add(kind)
+            .wrapping_add(if b.fps_only { 0x100 } else { 0 });
     }
     h
 }
@@ -473,6 +498,10 @@ fn wheel_signature(wheels: &[Wheel]) -> u64 {
         for k in [w.up, w.down, w.left, w.right] {
             h = h.wrapping_mul(0x100_0000_01b3).wrapping_add(k as u64 + 1);
         }
+        h = h.wrapping_mul(31).wrapping_add(match w.mode {
+            WheelMode::Classic => 1,
+            WheelMode::Sensitive => 2,
+        });
         match &w.temp {
             None => h = h.wrapping_mul(31).wrapping_add(0x9E37_79B9),
             Some(t) => {
@@ -489,7 +518,6 @@ fn wheel_signature(wheels: &[Wheel]) -> u64 {
 
 
 // ============================ FPS 鼠标瞄准 ============================
-//
 // 手机 FPS 的视角靠"手指在屏幕上拖动"实现,而鼠标给的是相对位移,
 // 因此这里维护一个独立的手指触点:
 //   鼠标位移 -> 累积偏移 -> 落点 = 锚点 + 偏移 -> 注入 touch_move
@@ -510,6 +538,10 @@ pub struct AimLive {
     pub down: bool,
     /// 当前是否满足瞄准生效条件
     pub active: bool,
+    /// FPS 模式是否已由独立按键/界面开启
+    pub mode_active: bool,
+    /// 是否因按住临时退出键而暂停
+    pub suspended: bool,
     /// 已注入的瞄准触点消息数(down/move/up 合计)
     pub sent: u64,
 }
@@ -526,6 +558,10 @@ struct AimState {
     cur: (i32, i32),
     /// 门控键是否按住(hold_key == 0 时忽略)
     gate_down: bool,
+    /// FPS 模式独立开关的锁存状态
+    mode_active: bool,
+    /// 按住临时退出键期间挂起,松开自动恢复
+    suspended: bool,
     /// 用户按 Ctrl+Alt 临时把鼠标交还给系统:此时不瞄准、也不捕获光标
     released: bool,
     /// 最近一次鼠标位移时间(静止归中的依据)
@@ -537,11 +573,12 @@ struct AimState {
 }
 
 /// 瞄准自身是否具备生效条件(是否映射开启由调用方判断)
+fn fps_is_active(aim: &Aim, st: &AimState) -> bool {
+    aim.enabled && aim.anchor_set() && st.mode_active && !st.suspended
+}
+
 fn aim_active(aim: &Aim, st: &AimState) -> bool {
-    aim.enabled
-        && aim.anchor_set()
-        && !st.released
-        && (aim.hold_key == 0 || st.gate_down)
+    fps_is_active(aim, st) && !st.released && (aim.hold_key == 0 || st.gate_down)
 }
 
 /// 在当前位置抬起瞄准触点并清空偏移
@@ -666,8 +703,8 @@ fn aim_on_motion(
 }
 
 /// 定期维护:映射关闭/门控松开 -> 收手;静止归中 -> 回锚点
-fn aim_tick(ctl: &ControlClient, m: &Mapper, aim: &Aim, mapping_enabled: bool, st: &mut AimState) {
-    if !mapping_enabled || !aim_active(aim, st) {
+fn aim_tick(ctl: &ControlClient, m: &Mapper, aim: &Aim, st: &mut AimState) {
+    if !aim_active(aim, st) {
         aim_lift(ctl, st);
         return;
     }
@@ -715,19 +752,86 @@ pub struct Shared {
     /// 做这件事,顶栏按钮直接改 `enabled` —— 于是"用按钮关映射"会把长按触点
     /// 永久留在屏幕上。现在两条路径共用 [`release_all`] 这一份实现。
     pub toolbar_release: bool,
+    /// 全部"按键组合"(方案)。**`active_scheme` 那一份的内容与 [`Self::profile`] 相同**
+    /// —— `profile` 始终是"此刻生效的那套",界面每帧把它同步回来
+    /// (见 [`Shared::stash_active`],由 app 的 `sync_scheme_state` 每帧调用)。
+    ///
+    /// 为什么两处都放:引擎的每个事件路径都在读 `profile`,把它换成"按索引取"
+    /// 要改动上百处调用点,风险远大于收益;而切换动作必须由引擎独占完成
+    /// (只有它拿着触点状态,能保证"先抬起旧组合的触点、再换新车")。
+    pub schemes: Vec<Profile>,
+    /// 切换键表(按下 `key` 即切到 `schemes[target]`)
+    pub switch_keys: Vec<SwitchKey>,
+    /// 当前生效的组合下标
+    pub active_scheme: usize,
 }
 
 pub type SharedState = Arc<Mutex<Shared>>;
 
+/// 带容错的加锁:锁一旦被 panic 中毒,输入与映射**必须**还能继续工作。
+///
+/// 为什么这是必需的:全程序有几十处 `shared.lock()`。只要有**一个**线程在持锁
+/// 期间 panic,这把锁就永久中毒,此后每一处 `.unwrap()` 都会跟着 panic ——
+/// 引擎线程随之死亡,而引擎线程一死,捕获通道的接收端 `Receiver` 被 drop,
+/// 捕获层每一次 `send` 都开始静默失败。用户看到的现象是
+/// "程序窗口还在、界面还能点,但按键彻底没有反应",只能重启。
+///
+/// 中毒之后把内部数据取出来继续用(`into_inner`),至少能保住可用性;
+/// 真正的故障由 panic hook 记进诊断日志(见 `crate::diag`)。
+pub fn lock_shared(s: &SharedState) -> std::sync::MutexGuard<'_, Shared> {
+    s.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Shared {
+    /// 把生效中的 `profile` 收回 `schemes[active_scheme]`(界面改动都写在
+    /// `profile` 上,组合表是存档)。幂等,内容没变就不动。
+    pub fn stash_active(&mut self) {
+        let a = self.active_scheme;
+        if let Some(slot) = self.schemes.get_mut(a) {
+            if *slot != self.profile {
+                *slot = self.profile.clone();
+            }
+        }
+    }
+
+    /// 换到 `idx` 那套组合;返回是否真的换了。
+    ///
+    /// 只管数据、不碰引擎:换组合要先抬起旧触点,而触点状态由引擎线程独占,
+    /// 由它靠结构指纹(`sync_structures`)发现并兜底 —— 手感与"改配置"一致。
+    pub fn select_scheme(&mut self, idx: usize) -> bool {
+        if idx >= self.schemes.len() || idx == self.active_scheme {
+            return false;
+        }
+        self.stash_active();
+        self.active_scheme = idx;
+        self.profile = self.schemes[idx].clone();
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BindLane {
+    Normal,
+    Fps,
+}
+
 #[derive(Debug, Clone)]
 enum SchedAct {
-    Up { pid: u64, x: i32, y: i32 },
+    Up {
+        pid: u64,
+        x: i32,
+        y: i32,
+        lane: BindLane,
+    },
     Move { pid: u64, x: i32, y: i32 },
 }
 
 #[derive(Default, Clone)]
 struct WheelState {
     pressed: [bool; 4], // up down left right
+    /// 方向键最近一次由抬起变按下的序号;灵敏模式用它决定同轴谁覆盖谁。
+    press_seq: [u64; 4],
+    next_seq: u64,
     down: bool,
     last: (i32, i32),
     /// 临时轮盘当前是否处于启用状态(永久轮盘恒为 true)
@@ -744,8 +848,12 @@ struct WheelState {
 /// 因此不会与调用点上对 `Shared` 的借用冲突。
 pub(crate) struct EngineState<'a> {
     fingers: &'a mut Fingers,
+    fps_fingers: &'a mut Fingers,
     wheels: &'a mut Vec<WheelState>,
     active_android_keys: &'a mut HashSet<u16>,
+    fps_active_android_keys: &'a mut HashSet<u16>,
+    /// 是否一并释放 FPS 专用键与瞄准状态。关普通映射时为 false,FPS 模式独立。
+    release_fps: bool,
     aim: &'a mut AimState,
 }
 
@@ -767,7 +875,9 @@ pub(crate) fn release_all(
         Some(c) => {
             let m = shared.profile.mapper(screen);
             // 瞄准触点一并抬起(否则松手后仍按在屏幕上)
-            aim_lift(c, st.aim);
+            if st.release_fps {
+                aim_lift(c, st.aim);
+            }
             // 遍历按下表本身的长度而不是当前绑定数:被删掉的槽位里可能还记着"按着",
             // 漏掉它就是一个永久卡在设备上的触点(触点池会被越用越少)。
             let n = st.fingers.down.len().max(shared.profile.binds.len());
@@ -779,6 +889,15 @@ pub(crate) fn release_all(
             }
             for kc in st.active_android_keys.drain() {
                 c.key(false, kc as u32);
+            }
+            if st.release_fps {
+                release_fps_binds(
+                    c,
+                    &m,
+                    &shared.profile.binds,
+                    st.fps_fingers,
+                    st.fps_active_android_keys,
+                );
             }
             for (j, ws) in st.wheels.iter_mut().enumerate() {
                 if !ws.down {
@@ -799,10 +918,16 @@ pub(crate) fn release_all(
         }
         None => {
             st.active_android_keys.clear();
+            if st.release_fps {
+                st.fps_active_android_keys.clear();
+            }
             aim_release_local(st.aim);
         }
     }
     st.fingers.free_all();
+    if st.release_fps {
+        st.fps_fingers.free_all();
+    }
     for ws in st.wheels.iter_mut() {
         ws.down = false;
         ws.pressed = [false; 4];
@@ -818,11 +943,14 @@ pub fn run(
 ) {
     let mut scheduled: Vec<(Instant, SchedAct)> = Vec::new();
     let mut fingers = Fingers::default();
+    let mut fps_fingers = Fingers::default();
     let mut active_android_keys: HashSet<u16> = HashSet::new();
+    let mut fps_active_android_keys: HashSet<u16> = HashSet::new();
     let mut wheels: Vec<WheelState> = Vec::new();
     // 配置的"结构指纹":绑定表与轮盘表各一份。指纹变化 = 索引会整体位移,
     // 此时必须先把在按的触点全部抬起来再重建状态(见 sync_structures)。
     let mut binds_sig = 0u64;
+    let mut fps_binds_sig = 0u64;
     let mut wheel_sig = 0u64;
     // 物理按键镜像(归属切换对账的唯一依据)
     let mut held = Held::default();
@@ -845,6 +973,10 @@ pub fn run(
     // 空闲后重新确认坐标空间(见 Shared::space_recheck)
     let mut pending_space_recheck = false;
     let mut last_key_at: Option<Instant> = None;
+    // 控制通道上一帧是否可用:用来识别"由断到通"的那一刻(见主循环里重建触点的分支)
+    let mut connected_prev = false;
+    // 通道刚恢复/首次连上:本帧必须强制按物理按键真值重建一遍触点
+    let mut rebuild_now = false;
 
     loop {
         // 处理到期的计划动作。
@@ -865,16 +997,22 @@ pub fn run(
                 }
             }
             if !due.is_empty() {
-                let g = shared.lock().unwrap();
+                let g = lock_shared(&shared);
                 if let Some(c) = g.control.as_ref() {
                     for act in due {
                         match act {
-                            SchedAct::Up { pid, x, y } => {
+                            SchedAct::Up { pid, x, y, lane } => {
                                 c.touch_up(pid, x, y);
                                 // 定时抬起(点按 40ms / 滑动终点):该键本次按下结束,清除按下状态。
                                 // 只处理绑定指针段(1000..2000),避免误动轮盘/瞄准的按下状态。
-                                if (1000..2000).contains(&pid) {
-                                    fingers.release((pid - 1000) as usize);
+                                match lane {
+                                    BindLane::Normal if (1000..2000).contains(&pid) => {
+                                        fingers.release((pid - 1000) as usize);
+                                    }
+                                    BindLane::Fps if (4000..5000).contains(&pid) => {
+                                        fps_fingers.release((pid - 4000) as usize);
+                                    }
+                                    _ => {}
                                 }
                             }
                             SchedAct::Move { pid, x, y } => c.touch_move(pid, x, y),
@@ -887,7 +1025,7 @@ pub fn run(
         // 顶栏[映射:开/关]按钮请求的收尾(上升沿触发一次)。
         // 与总开关键走同一份 release_all,保证"用按钮关映射"也不会在手机上留下按住的触点。
         {
-            let mut g = shared.lock().unwrap();
+            let mut g = lock_shared(&shared);
             if g.toolbar_release && !toolbar_release_prev {
                 g.enabled = false;
                 // 把控制通道临时取出,拿到 `Option<ControlClient>` 的所有权,
@@ -904,8 +1042,11 @@ pub fn run(
                     screen,
                     EngineState {
                         fingers: &mut fingers,
+                        fps_fingers: &mut fps_fingers,
                         wheels: &mut wheels,
                         active_android_keys: &mut active_android_keys,
+                        fps_active_android_keys: &mut fps_active_android_keys,
+                        release_fps: false,
                         aim: &mut aim,
                     },
                 );
@@ -922,7 +1063,7 @@ pub fn run(
         // 完全没必要按 4ms 跑 —— 这正是下面 idle 退避要利用的性质。
         let fast;
         {
-            let mut g = shared.lock().unwrap();
+            let mut g = lock_shared(&shared);
             let s: &mut Shared = &mut g;
             let cfg = s.profile.aim.clone();
             let enabled = s.enabled;
@@ -931,24 +1072,20 @@ pub fn run(
                 .as_ref()
                 .map(|c| c.is_connected())
                 .unwrap_or(false);
-            fast = (enabled && connected) || aim.down;
+            fast = (enabled && connected) || fps_is_active(&cfg, &aim) || aim.down;
             // 仅当映射开启、控制通道在线、瞄准启用且未被 Ctrl+Alt 释放时才捕获光标,
             // 避免出现"光标被冻结但什么都做不了";
             // 绑了"按住才瞄准"时只在按住期间捕获,松手即把光标还给系统
             mouse_grab.store(
-                enabled
-                    && connected
-                    && cfg.enabled
+                connected
                     && cfg.capture_mouse
-                    && cfg.anchor_set()
-                    && (cfg.hold_key == 0 || aim.gate_down)
-                    && !aim.released,
+                    && aim_active(&cfg, &aim),
                 Ordering::Relaxed,
             );
             match s.control.as_ref() {
                 Some(ctl) if connected => {
                     let m = s.profile.mapper((ctl.screen_w, ctl.screen_h));
-                    aim_tick(ctl, &m, &cfg, enabled, &mut aim);
+                    aim_tick(ctl, &m, &cfg, &mut aim);
                 }
                 _ => aim_release_local(&mut aim),
             }
@@ -957,9 +1094,11 @@ pub fn run(
             l.oy = aim.oy;
             l.down = aim.down;
             l.active = aim_active(&cfg, &aim);
+            l.mode_active = aim.mode_active;
+            l.suspended = aim.suspended;
             l.sent = aim.sent;
             // 触点占用是"此刻"的量:轮盘/瞄准的状态可能刚被上面的维护改动过
-            live.pointers = fingers.count + wheel_pointers(&wheels) + usize::from(aim.down);
+            live.pointers = fingers.count + fps_fingers.count + wheel_pointers(&wheels) + usize::from(aim.down);
             s.live = live;
             // 循环顶部统一把待写的一句话落进通知队列(见 pending_notice 的说明)
             if let Some(msg) = pending_notice.take() {
@@ -997,26 +1136,25 @@ pub fn run(
         let ev = match raw {
             CaptureEvent::Button { code, pressed } => CaptureKey { code, pressed },
             CaptureEvent::Motion { dx, dy } => {
-                let mut g = shared.lock().unwrap();
+                let mut g = lock_shared(&shared);
                 let s: &mut Shared = &mut g;
                 s.aim_live.motions += 1;
                 s.aim_live.last_dx = dx;
                 s.aim_live.last_dy = dy;
-                if s.enabled {
-                    // 只克隆瞄准配置(小结构),并临时借出(profile, control)两块互不相干的字段。
-                    // 早期版本此处克隆整个 Profile(含全部键位/轮盘),而鼠标位移是高频事件,
-                    // 每来一个位移就深拷贝一次配置纯属浪费。
-                    let cfg = s.profile.aim.clone();
-                    let (profile, control) = (&s.profile, &s.control);
-                    if let Some(ctl) = control.as_ref() {
-                        if ctl.is_connected() {
-                            let m = profile.mapper((ctl.screen_w, ctl.screen_h));
-                            // 瞄准触点也要占设备端指针池:挤不进去就别落下,
-                            // 记为一次"被拒",免得用户以为瞄准坏了
-                            let reserved = wheel_pointers(&wheels) + fingers.count;
-                            if aim_on_motion(ctl, &m, &cfg, &mut aim, dx, dy, reserved) {
-                                refuse(&mut live, 0);
-                            }
+                // 只克隆瞄准配置(小结构),并临时借出(profile, control)两块互不相干的字段。
+                // 早期版本此处克隆整个 Profile(含全部键位/轮盘),而鼠标位移是高频事件,
+                // 每来一个位移就深拷贝一次配置纯属浪费。
+                let cfg = s.profile.aim.clone();
+                let (profile, control) = (&s.profile, &s.control);
+                if let Some(ctl) = control.as_ref() {
+                    if ctl.is_connected() {
+                        let m = profile.mapper((ctl.screen_w, ctl.screen_h));
+                        // 瞄准触点也要占设备端指针池:挤不进去就别落下,
+                        // 记为一次“被拒”,免得用户以为瞄准坏了
+                        let reserved =
+                            wheel_pointers(&wheels) + fingers.count + fps_fingers.count;
+                        if aim_on_motion(ctl, &m, &cfg, &mut aim, dx, dy, reserved) {
+                            refuse(&mut live, 0);
                         }
                     }
                 }
@@ -1024,6 +1162,9 @@ pub fn run(
                 l.ox = aim.ox;
                 l.oy = aim.oy;
                 l.down = aim.down;
+                l.active = aim_active(&cfg, &aim);
+                l.mode_active = aim.mode_active;
+                l.suspended = aim.suspended;
                 l.sent = aim.sent;
                 s.live = live;
                 continue;
@@ -1039,7 +1180,7 @@ pub fn run(
         }
 
         let (enabled, toggle_key, aim_hold_key, aim_captured) = {
-            let g = shared.lock().unwrap();
+            let g = lock_shared(&shared);
             let aim = &g.profile.aim;
             (
                 g.enabled,
@@ -1064,12 +1205,143 @@ pub fn run(
         // 只在瞄准确实会捕获鼠标时才有意义,避免误触改状态。
         // 同样只认上升沿:否则 Windows 上按住 Ctrl+Alt 不放,自动重复会把
         // "交还/收回"来回翻转(与总开关键、切换型启用键同一处理)。
+        // FPS 模式独立开关与临时挂起。该处理放在总开关之前:即使总开关键位相同,
+        // 两边也只各自翻转一次;如果不同,则 FPS 不依赖普通映射是否开启。
+        let (aim_cfg, aim_toggle_key, aim_suspend_key) = {
+            let g = lock_shared(&shared);
+            let aim = &g.profile.aim;
+            (aim.clone(), aim.toggle_key, aim.suspend_key)
+        };
+        let mut fps_transition = false;
+        let mut fps_consumed = false;
+        if aim_cfg.enabled {
+            if aim_toggle_key != 0 && ev.code == aim_toggle_key {
+                fps_consumed = true;
+                if fresh_press {
+                    if aim_cfg.anchor_set() {
+                        aim.mode_active = !aim.mode_active;
+                        if aim.mode_active {
+                            aim.released = false;
+                        }
+                    } else {
+                        aim.mode_active = false;
+                        pending_notice = Some("FPS 模式未启动:请先设置瞄准锚点".to_string());
+                    }
+                    fps_transition = true;
+                }
+            }
+            let want_suspend = aim_suspend_key != 0 && held.has(aim_suspend_key);
+            if want_suspend != aim.suspended {
+                aim.suspended = want_suspend;
+                fps_transition = true;
+            }
+            if aim_suspend_key != 0 && ev.code == aim_suspend_key {
+                fps_consumed = true;
+            }
+        } else {
+            aim.mode_active = false;
+            aim.suspended = false;
+        }
+
+        let fps_running = fps_is_active(&aim_cfg, &aim);
+        if fps_transition || fps_running {
+            let g = lock_shared(&shared);
+            let screen = g
+                .control
+                .as_ref()
+                .map(|c| (c.screen_w, c.screen_h))
+                .unwrap_or((0, 0));
+            if let Some(ctl) = g.control.as_ref().filter(|c| c.is_connected()) {
+                let m = g.profile.mapper(screen);
+                let sig = fps_binds_signature(&g.profile.binds);
+                if sig != fps_binds_sig {
+                    release_fps_binds(
+                        ctl,
+                        &m,
+                        &g.profile.binds,
+                        &mut fps_fingers,
+                        &mut fps_active_android_keys,
+                    );
+                    fps_fingers.down.clear();
+                    fps_fingers.align(g.profile.binds.len());
+                    fps_binds_sig = sig;
+                    fps_transition = true;
+                }
+                if fps_running {
+                    if fps_transition {
+                        let reserved = fingers.count
+                            + wheel_pointers(&wheels)
+                            + usize::from(aim.down);
+                        reconcile_fps_binds(
+                            ctl,
+                            &m,
+                            &g.profile.binds,
+                            &mut fps_fingers,
+                            &mut fps_active_android_keys,
+                            &held,
+                            reserved,
+                            &mut live,
+                        );
+                    }
+                    let reserved = fingers.count
+                        + wheel_pointers(&wheels)
+                        + usize::from(aim.down);
+                    for (idx, bind) in g.profile.binds.iter().enumerate() {
+                        if !bind.fps_only || bind.key != ev.code {
+                            continue;
+                        }
+                        fps_consumed = true;
+                        if let Some(k) = handle_bind_event(
+                            ctl,
+                            &m,
+                            bind,
+                            idx,
+                            fps_bind_pid(idx),
+                            BindLane::Fps,
+                            fresh_press,
+                            &ev,
+                            &mut fps_fingers,
+                            &mut fps_active_android_keys,
+                            &mut scheduled,
+                            reserved,
+                            &mut live,
+                        ) {
+                            pending_notice = Some(format!("FPS 键位触点池已满: {}", key_name(k)));
+                        }
+                    }
+                } else {
+                    aim_lift(ctl, &mut aim);
+                    release_fps_binds(
+                        ctl,
+                        &m,
+                        &g.profile.binds,
+                        &mut fps_fingers,
+                        &mut fps_active_android_keys,
+                    );
+                }
+            } else {
+                fps_fingers.free_all();
+                fps_active_android_keys.clear();
+                if !fps_running {
+                    aim_release_local(&mut aim);
+                }
+            }
+        }
+
+        live.pointers = fingers.count
+            + fps_fingers.count
+            + wheel_pointers(&wheels)
+            + usize::from(aim.down);
+        if fps_consumed && ev.code != toggle_key {
+            continue;
+        }
+
         if is_ctrl(ev.code) {
             ctrl_down = ev.pressed;
         } else if is_alt(ev.code) {
             alt_down = ev.pressed;
         }
-        if aim_captured && ctrl_alt_chord(ev.code, ev.pressed && fresh_press, ctrl_down, alt_down) {
+        if aim_captured && aim.mode_active && ctrl_alt_chord(ev.code, ev.pressed && fresh_press, ctrl_down, alt_down) {
             aim.released = !aim.released;
         }
 
@@ -1089,7 +1361,7 @@ pub fn run(
 
         // 总开关键:任何时候都生效,但只在**按下的那一瞬间**翻转一次
         if ev.code == toggle_key && fresh_press {
-            let mut g = shared.lock().unwrap();
+            let mut g = lock_shared(&shared);
             g.enabled = !g.enabled;
             let now_enabled = g.enabled;
             let src = format!("总开关键 {}", key_name(ev.code));
@@ -1115,8 +1387,11 @@ pub fn run(
                     screen,
                     EngineState {
                         fingers: &mut fingers,
+                        fps_fingers: &mut fps_fingers,
                         wheels: &mut wheels,
                         active_android_keys: &mut active_android_keys,
+                        fps_active_android_keys: &mut fps_active_android_keys,
+                        release_fps: false,
                         aim: &mut aim,
                     },
                 );
@@ -1140,7 +1415,7 @@ pub fn run(
                             &mut active_android_keys,
                             &held,
                         );
-                        let extra = usize::from(aim.down);
+                        let extra = fps_fingers.count + usize::from(aim.down);
                         reconcile_binds(
                             ctl,
                             &m,
@@ -1158,7 +1433,7 @@ pub fn run(
                             &g.profile,
                             &mut wheels,
                             &held,
-                            fingers.count + usize::from(aim.down),
+                            fingers.count + fps_fingers.count + usize::from(aim.down),
                             &mut live,
                         );
                     }
@@ -1172,11 +1447,112 @@ pub fn run(
             continue;
         }
 
+        // ---- 切换键(按键组合) ----
+        // 位置紧随总开关键:它同样是"功能键",按下不触发任何普通绑定。
+        // 无论映射是否开启都要处理 —— 关着的时候也可以先把组合换好。
+        let switch_target = {
+            let g = lock_shared(&shared);
+            g.switch_keys
+                .iter()
+                .find(|s| s.key == ev.code)
+                .map(|s| s.target)
+        };
+        if let Some(target) = switch_target {
+            // 只有上升沿才真的切:否则按住切换键不放会被自动重复反复切换
+            if fresh_press {
+                apply_scheme_switch(
+                    &shared,
+                    target,
+                    &held,
+                    &mut binds_sig,
+                    &mut wheel_sig,
+                    &mut live,
+                    &mut fingers,
+                    &mut fps_fingers,
+                    &mut wheels,
+                    &mut active_android_keys,
+                    &mut fps_active_android_keys,
+                    &mut aim,
+                );
+            }
+            continue;
+        }
+
         if !enabled {
             continue;
         }
 
-        let g = shared.lock().unwrap();
+        let mut g = lock_shared(&shared);
+        // ---- 控制通道可用性:不可用时必须把本地状态清干净 ----
+        //
+        // 这是"过一会儿按什么都没反应,非得重新按一次总开关键"的**主因**。
+        //
+        // 旧实现在这里直接 `continue`:通道没连上/断开了,事件被静静吃掉,
+        // 而 `fingers`/`wheels`/`aim` 的本地状态原封不动留着。于是
+        // `fingers.count` 一直虚高 —— 它同时是 `MAX_CONCURRENT_KEYS`(8) 与
+        // `DEVICE_MAX_POINTERS`(10) 两道闸门的输入,虚高就会把触点预算
+        // **永久吃掉**,之后每一次按下都被 `refuse` 掉。
+        //
+        // 为什么"按一次总开关键"能治好:总开关键的处理在这个 `continue` **之前**,
+        // 关映射会走 `release_all` → `fingers.free_all()` → `count = 0`。
+        // 用户被迫养成的"重新映射一下"的土办法,反过来说明就是这个机制。
+        //
+        // 注意 ctl 传 None:通道已经不可用,这些 UP 发不出去(欠设备端的抬起
+        // 会在重连后由 `release_all` + 重建对齐),但**本地必须清空**。
+        let conn_ok = g
+            .control
+            .as_ref()
+            .map(|c| c.is_connected())
+            .unwrap_or(false);
+        let dirty = fingers.count > 0
+            || aim.down
+            || !active_android_keys.is_empty()
+            || wheels.iter().any(|w| w.down || w.active);
+        if !conn_ok {
+            if dirty {
+                release_all(
+                    None,
+                    &mut g,
+                    (0, 0),
+                    EngineState {
+                        fingers: &mut fingers,
+                        fps_fingers: &mut fps_fingers,
+                        wheels: &mut wheels,
+                        active_android_keys: &mut active_android_keys,
+                        fps_active_android_keys: &mut fps_active_android_keys,
+                        release_fps: true,
+                        aim: &mut aim,
+                    },
+                );
+                pending_notice = Some(
+                    "控制通道不可用:已清空本地触点状态(重连后按当前按键状态重建)".to_string(),
+                );
+                diag_warn!(
+                    "engine",
+                    "控制通道不可用,清空本地触点状态(此前有未收尾的触点/瞄准/系统键)"
+                );
+            }
+            connected_prev = false;
+            continue;
+        }
+        if !connected_prev {
+            // 通道"由断到通"或是首次连上:设备端此刻是干净的(旧触点随旧 server
+            // 一起消失了),所以本地也必须是干净的,再按物理按键真值重建。
+            // 不做这一步,`fingers` 里那些"本地以为按着、设备端其实没有"的
+            // 幻影触点会一直占着预算。
+            connected_prev = true;
+            fingers.free_all();
+            for w in wheels.iter_mut() {
+                w.down = false;
+                w.pressed = [false; 4];
+                w.active = false;
+            }
+            aim_release_local(&mut aim);
+            active_android_keys.clear();
+            fps_binds_sig = 0;
+            rebuild_now = true;
+            pending_notice = Some("控制通道已连接:已按当前按键状态重建触点".to_string());
+        }
         let Some(ctl) = g.control.as_ref() else {
             continue;
         };
@@ -1203,12 +1579,13 @@ pub fn run(
             &mut active_android_keys,
             &held,
         );
-        if restructured {
-            if held_before > 0 {
+        if restructured || rebuild_now {
+            if restructured && held_before > 0 {
                 pending_notice =
                     Some("配置已改动: 先抬起正在按着的触点,再按新配置重建(不会卡键)".to_string());
             }
-            let extra = usize::from(aim.down);
+            rebuild_now = false;
+            let extra = fps_fingers.count + usize::from(aim.down);
             reconcile_binds(
                 ctl,
                 &m,
@@ -1226,11 +1603,11 @@ pub fn run(
                 profile,
                 &mut wheels,
                 &held,
-                fingers.count + usize::from(aim.down),
+                fingers.count + fps_fingers.count + usize::from(aim.down),
                 &mut live,
             );
         }
-        live.pointers = fingers.count + wheel_pointers(&wheels) + usize::from(aim.down);
+        live.pointers = fingers.count + fps_fingers.count + wheel_pointers(&wheels) + usize::from(aim.down);
 
         // ---- 临时轮盘启用键 ----
         let mut consumed = false;
@@ -1271,7 +1648,7 @@ pub fn run(
                 // 归属刚改变 -> 两个方向都立刻对账一遍。
                 // 停用这一边正是"松开启用键后,原来长按着的键必须继续奏效"的关键:
                 // 那个键还按在手上,普通绑定必须马上补上它的触点。
-                let extra = usize::from(aim.down);
+                let extra = fps_fingers.count + usize::from(aim.down);
                 reconcile_binds(
                     ctl,
                     &m,
@@ -1289,7 +1666,7 @@ pub fn run(
                     profile,
                     &mut wheels,
                     &held,
-                    fingers.count + usize::from(aim.down),
+                    fingers.count + fps_fingers.count + usize::from(aim.down),
                     &mut live,
                 );
             }
@@ -1315,7 +1692,7 @@ pub fn run(
                 profile,
                 &mut wheels,
                 &held,
-                fingers.count + usize::from(aim.down),
+                fingers.count + fps_fingers.count + usize::from(aim.down),
                 &mut live,
             );
             continue;
@@ -1325,129 +1702,31 @@ pub fn run(
         // 与轮盘/瞄准共用同一个设备端触点池:先把它们的占用算出来,
         // 挤不进去的按下在这里被明确拒绝并计入诊断 —— 而不是发出去被服务端
         // 悄悄丢掉(那正是"按下没反应、原因不明"的来源)
-        let reserved = wheel_pointers(&wheels) + usize::from(aim.down);
+        let reserved = wheel_pointers(&wheels) + fps_fingers.count + usize::from(aim.down);
         let mut refused_note: Option<u16> = None;
         for (idx, bind) in profile.binds.iter().enumerate() {
-            if bind.key != ev.code {
+            if bind.fps_only || bind.key != ev.code {
                 continue;
             }
-            let pid = bind_pid(idx);
-            match &bind.action {
-                Action::Tap {
-                    x,
-                    y,
-                    duration_ms,
-                    ..
-                } => {
-                    let (px, py) = m.point(*x, *y);
-                    if *duration_ms == 0 {
-                        // 按住切换:按下不松手,直到再次按下同一键才抬起。
-                        // 只认**上升沿**:Windows 的自动重复同样以 KeyPress 反复上报
-                        // (rdev 不区分),否则按住不放会让这个开关每秒来回翻转好几次。
-                        if fresh_press {
-                            if fingers.is_down(idx) {
-                                ctl.touch_up(pid, px, py);
-                                fingers.release(idx);
-                            } else if fingers.try_down(idx, reserved) {
-                                ctl.touch_down(pid, px, py);
-                            } else {
-                                refuse(&mut live, bind.key);
-                                refused_note = Some(bind.key);
-                            }
-                        }
-                    } else if fresh_press {
-                        // 点按:按下注入 DOWN,持续 duration_ms(默认 40ms)后定时抬起。
-                        // (同样只认上升沿:否则 Windows 上按住不放 = 每秒重放几十次点按)
-                        // 若上一击尚未自动抬起又再次按下(极快连点/组合技排序),
-                        // 先立即结束旧触点再开新一轮,保证每次点按都完整触发、不丢键。
-                        if fingers.is_down(idx) {
-                            cancel_up_for(pid, &mut scheduled);
-                            ctl.touch_up(pid, px, py);
-                            fingers.release(idx);
-                        }
-                        if fingers.try_down(idx, reserved) {
-                            ctl.touch_down(pid, px, py);
-                            scheduled.push((
-                                Instant::now()
-                                    + Duration::from_millis((*duration_ms as u64).max(5)),
-                                SchedAct::Up { pid, x: px, y: py },
-                            ));
-                        } else {
-                            refuse(&mut live, bind.key);
-                                refused_note = Some(bind.key);
-                        }
-                    }
-                    // 松开不在此处理,统一由定时抬起收尾
-                }
-                Action::Hold { x, y, .. } => {
-                    let (px, py) = m.point(*x, *y);
-                    if ev.pressed {
-                        if fingers.try_down(idx, reserved) {
-                            ctl.touch_down(pid, px, py);
-                        } else {
-                            // 已经按着(钩子自动重复)不算"被拒",只有挤不进触点池才算
-                            if !fingers.is_down(idx) {
-                                refuse(&mut live, bind.key);
-                                refused_note = Some(bind.key);
-                            }
-                        }
-                    } else if fingers.release(idx) {
-                        ctl.touch_up(pid, px, py);
-                    }
-                }
-                Action::Swipe(s) => {
-                    // 按下触发滑动;中途松手不打断,滑到终点由定时抬起清理按下状态。
-                    // 只认上升沿:否则 Windows 上按住不放会把整条滑动轨迹反复重放。
-                    if fresh_press {
-                        if fingers.try_down(idx, reserved) {
-                            // 相对坐标 -> 像素后再生成轨迹采样点
-                            let start_px = m.point(s.start.0, s.start.1);
-                            let end_px = m.point(s.end.0, s.end.1);
-                            let points = swipe_points(s.path, start_px, end_px, 64);
-                            if points.len() >= 2 {
-                                let (x0, y0) = points[0];
-                                ctl.touch_down(pid, x0, y0);
-                                let n = points.len();
-                                let start = Instant::now();
-                                let steps = (n - 1) as u64;
-                                for k in 1..n {
-                                    let t = k as f32 / steps as f32;
-                                    // 曲线把时间映射为沿路径的进度,再做弧长插值
-                                    let prog = easing_apply(s.easing, t);
-                                    let (x, y) = point_at_progress(&points, prog);
-                                    let time = start
-                                        + Duration::from_millis(
-                                            (s.duration_ms as u64) * k as u64 / steps,
-                                        );
-                                    scheduled.push((time, SchedAct::Move { pid, x, y }));
-                                }
-                                let (xe, ye) = points[n - 1];
-                                scheduled.push((
-                                    start
-                                        + Duration::from_millis(s.duration_ms as u64 + 20),
-                                    SchedAct::Up { pid, x: xe, y: ye },
-                                ));
-                            }
-                        } else {
-                            refuse(&mut live, bind.key);
-                                refused_note = Some(bind.key);
-                        }
-                    }
-                }
-                Action::AndroidKey { keycode } => {
-                    let kc = *keycode as u16;
-                    if ev.pressed {
-                        // 同键未抬起(钩子自动重复/抖动)时不重复按下
-                        if active_android_keys.insert(kc) {
-                            ctl.key(true, *keycode);
-                        }
-                    } else if active_android_keys.remove(&kc) {
-                        ctl.key(false, *keycode);
-                    }
-                }
+            if let Some(k) = handle_bind_event(
+                ctl,
+                &m,
+                bind,
+                idx,
+                bind_pid(idx),
+                BindLane::Normal,
+                fresh_press,
+                &ev,
+                &mut fingers,
+                &mut active_android_keys,
+                &mut scheduled,
+                reserved,
+                &mut live,
+            ) {
+                refused_note = Some(k);
             }
         }
-        live.pointers = fingers.count + reserved;
+        live.pointers = fingers.count + fps_fingers.count + reserved;
         // 触点池满导致的"按了没反应",必须给用户一句能看懂的解释(每秒最多一条)
         if let Some(k) = refused_note {
             let due = last_refuse_note
@@ -1467,6 +1746,105 @@ pub fn run(
 
 fn bind_pid(idx: usize) -> u64 {
     1000 + idx as u64
+}
+
+/// 把生效中的按键组合换成 `target` 那一套;返回是否真的换了车。
+///
+/// 顺序不能改,三条铁律里第一条(触点绝不能漏抬)全压在这里:
+///   ① 先按**旧**组合把还在按着的触点/系统键/摇杆/瞄准全部抬起来
+///      —— 复用 [`release_all`],与"关映射"是同一份实现;
+///   ② 再换上目标组合,并把结构指纹同步过去,免得下一轮 `sync_structures`
+///      以为"配置被改了"而把刚补上的触点又抬一遍(玩家会感到按住的键抖一下);
+///   ③ 最后按 [`Held`] 里的**物理**按键状态重建一遍:换车瞬间还按在手上的键
+///      在新组合里立刻生效,而不是要松手再按一次(与临时轮盘启用/停用同一处理)。
+#[allow(clippy::too_many_arguments)]
+fn apply_scheme_switch(
+    shared: &SharedState,
+    target: usize,
+    held: &Held,
+    binds_sig: &mut u64,
+    wheel_sig: &mut u64,
+    live: &mut EngineLive,
+    fingers: &mut Fingers,
+    fps_fingers: &mut Fingers,
+    wheels: &mut Vec<WheelState>,
+    active_android_keys: &mut HashSet<u16>,
+    fps_active_android_keys: &mut HashSet<u16>,
+    aim: &mut AimState,
+) -> bool {
+    let mut g = lock_shared(&shared);
+    if target >= g.schemes.len() || target == g.active_scheme {
+        return false;
+    }
+    // 界面上的最新改动可能还只在 `profile` 里(界面帧末才收回组合表),
+    // 换车前先存一次档,免得这一帧刚改的东西随换车一起丢掉。
+    g.stash_active();
+
+    // ---- ① 抬起旧组合留下的一切 ----
+    // 把控制通道临时取出拿到所有权:既能读出屏幕尺寸,又能同时可变借用 `g`
+    // (与总开关键、顶栏按钮两条路径完全一致)。
+    let ctl = g.control.take();
+    let screen = ctl
+        .as_ref()
+        .map(|c| (c.screen_w, c.screen_h))
+        .unwrap_or((0, 0));
+    release_all(
+        ctl.as_ref(),
+        &mut g,
+        screen,
+        EngineState {
+            fingers: &mut *fingers,
+            fps_fingers: &mut *fps_fingers,
+            wheels: &mut *wheels,
+            active_android_keys: &mut *active_android_keys,
+            fps_active_android_keys: &mut *fps_active_android_keys,
+            release_fps: true,
+            aim: &mut *aim,
+        },
+    );
+    g.control = ctl;
+
+    // ---- ② 换车 ----
+    let Some(next) = g.schemes.get(target).cloned() else {
+        return false;
+    };
+    g.profile = next;
+    g.active_scheme = target;
+    aim.mode_active = false;
+    aim.suspended = false;
+    let name = g.profile.name.clone();
+    notify(&mut g.notices, format!("已切换到按键组合「{name}」"));
+
+    // ---- ③ 按物理按键状态重建 ----
+    if let Some(ctl) = g.control.as_ref() {
+        if ctl.is_connected() {
+            let m = g.profile.mapper((ctl.screen_w, ctl.screen_h));
+            *binds_sig = binds_signature(&g.profile.binds);
+            *wheel_sig = wheel_signature(&g.profile.wheels);
+            let extra = fps_fingers.count + usize::from(aim.down);
+            reconcile_binds(
+                ctl,
+                &m,
+                &g.profile,
+                wheels,
+                extra,
+                held,
+                fingers,
+                active_android_keys,
+                live,
+            );
+            reconcile_wheels(
+                ctl,
+                &m,
+                &g.profile,
+                wheels,
+                held,
+                fingers.count + fps_fingers.count + usize::from(aim.down),
+                live,
+            );
+        }
+    }
+    true
 }
 
 /// 取消指定 pid 尚未执行的定时抬起(点按连发抢占旧点击用),
@@ -1577,6 +1955,234 @@ fn release_conflicting_binds(
     }
 }
 
+/// 计算一个轴上的方向值。经典模式保留“同时按反方向会抵消”的旧行为;
+/// 灵敏模式在同一轴的两个方向同时按下时，选择最后按下的那个。
+fn fps_bind_pid(idx: usize) -> u64 {
+    4000 + idx as u64
+}
+
+fn fps_bind_point(binds: &[KeyBind], m: &Mapper, idx: usize) -> (i32, i32) {
+    match binds.get(idx).map(|b| &b.action) {
+        Some(Action::Hold { x, y, .. }) | Some(Action::Tap { x, y, .. }) => m.point(*x, *y),
+        Some(Action::Swipe(s)) => m.point(s.start.0, s.start.1),
+        _ => (0, 0),
+    }
+}
+
+fn fps_binds_signature(binds: &[KeyBind]) -> u64 {
+    binds_signature(
+        &binds
+            .iter()
+            .filter(|b| b.fps_only)
+            .cloned()
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn release_fps_binds(
+    ctl: &ControlClient,
+    m: &Mapper,
+    binds: &[KeyBind],
+    fingers: &mut Fingers,
+    active_android_keys: &mut HashSet<u16>,
+) {
+    let n = fingers.down.len().max(binds.len());
+    for idx in 0..n {
+        if !binds.get(idx).map(|b| b.fps_only).unwrap_or(false) {
+            continue;
+        }
+        if fingers.release(idx) {
+            let (x, y) = fps_bind_point(binds, m, idx);
+            ctl.touch_up(fps_bind_pid(idx), x, y);
+        }
+    }
+    for kc in active_android_keys.drain() {
+        ctl.key(false, kc as u32);
+    }
+    fingers.free_all();
+}
+
+fn reconcile_fps_binds(
+    ctl: &ControlClient,
+    m: &Mapper,
+    binds: &[KeyBind],
+    fingers: &mut Fingers,
+    active_android_keys: &mut HashSet<u16>,
+    held: &Held,
+    reserved: usize,
+    live: &mut EngineLive,
+) {
+    for (idx, bind) in binds.iter().enumerate() {
+        if !bind.fps_only {
+            continue;
+        }
+        let want = held.has(bind.key);
+        match &bind.action {
+            Action::Hold { x, y, .. } => {
+                let (px, py) = m.point(*x, *y);
+                if want {
+                    if !fingers.is_down(idx) {
+                        if fingers.try_down(idx, reserved) {
+                            ctl.touch_down(fps_bind_pid(idx), px, py);
+                        } else {
+                            refuse(live, bind.key);
+                        }
+                    }
+                } else if fingers.release(idx) {
+                    ctl.touch_up(fps_bind_pid(idx), px, py);
+                }
+            }
+            Action::AndroidKey { keycode } => {
+                let kc = *keycode as u16;
+                if want {
+                    if active_android_keys.insert(kc) {
+                        ctl.key(true, *keycode);
+                    }
+                } else if active_android_keys.remove(&kc) {
+                    ctl.key(false, *keycode);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 处理一条普通/FPS 键位事件。两种键位共用同一套动作语义,只有状态表和 pid
+/// 分属不同 lane,避免 FPS 专用键把普通触点的 index 搅乱。
+#[allow(clippy::too_many_arguments)]
+fn handle_bind_event(
+    ctl: &ControlClient,
+    m: &Mapper,
+    bind: &KeyBind,
+    idx: usize,
+    pid: u64,
+    lane: BindLane,
+    fresh_press: bool,
+    ev: &CaptureKey,
+    fingers: &mut Fingers,
+    active_android_keys: &mut HashSet<u16>,
+    scheduled: &mut Vec<(Instant, SchedAct)>,
+    reserved: usize,
+    live: &mut EngineLive,
+) -> Option<u16> {
+    match &bind.action {
+        Action::Tap { x, y, duration_ms, .. } => {
+            let (px, py) = m.point(*x, *y);
+            if *duration_ms == 0 {
+                if fresh_press {
+                    if fingers.is_down(idx) {
+                        ctl.touch_up(pid, px, py);
+                        fingers.release(idx);
+                    } else if fingers.try_down(idx, reserved) {
+                        ctl.touch_down(pid, px, py);
+                    } else {
+                        refuse(live, bind.key);
+                        return Some(bind.key);
+                    }
+                }
+            } else if fresh_press {
+                if fingers.is_down(idx) {
+                    cancel_up_for(pid, scheduled);
+                    ctl.touch_up(pid, px, py);
+                    fingers.release(idx);
+                }
+                if fingers.try_down(idx, reserved) {
+                    ctl.touch_down(pid, px, py);
+                    scheduled.push((
+                        Instant::now() + Duration::from_millis((*duration_ms as u64).max(5)),
+                        SchedAct::Up { pid, x: px, y: py, lane },
+                    ));
+                } else {
+                    refuse(live, bind.key);
+                    return Some(bind.key);
+                }
+            }
+        }
+        Action::Hold { x, y, .. } => {
+            let (px, py) = m.point(*x, *y);
+            if ev.pressed {
+                if fingers.try_down(idx, reserved) {
+                    ctl.touch_down(pid, px, py);
+                } else if !fingers.is_down(idx) {
+                    refuse(live, bind.key);
+                    return Some(bind.key);
+                }
+            } else if fingers.release(idx) {
+                ctl.touch_up(pid, px, py);
+            }
+        }
+        Action::Swipe(s) => {
+            if fresh_press {
+                if fingers.try_down(idx, reserved) {
+                    let start_px = m.point(s.start.0, s.start.1);
+                    let end_px = m.point(s.end.0, s.end.1);
+                    let points = swipe_points(s.path, start_px, end_px, 64);
+                    if points.len() >= 2 {
+                        let (x0, y0) = points[0];
+                        ctl.touch_down(pid, x0, y0);
+                        let n = points.len();
+                        let start = Instant::now();
+                        let steps = (n - 1) as u64;
+                        for k in 1..n {
+                            let t = k as f32 / steps as f32;
+                            let prog = easing_apply(s.easing, t);
+                            let (x, y) = point_at_progress(&points, prog);
+                            let time = start
+                                + Duration::from_millis(
+                                    (s.duration_ms as u64) * k as u64 / steps,
+                                );
+                            scheduled.push((time, SchedAct::Move { pid, x, y }));
+                        }
+                        let (xe, ye) = points[n - 1];
+                        scheduled.push((
+                            start + Duration::from_millis(s.duration_ms as u64 + 20),
+                            SchedAct::Up { pid, x: xe, y: ye, lane },
+                        ));
+                    }
+                } else {
+                    refuse(live, bind.key);
+                    return Some(bind.key);
+                }
+            }
+        }
+        Action::AndroidKey { keycode } => {
+            let kc = *keycode as u16;
+            if ev.pressed {
+                if active_android_keys.insert(kc) {
+                    ctl.key(true, *keycode);
+                }
+            } else if active_android_keys.remove(&kc) {
+                ctl.key(false, *keycode);
+            }
+        }
+    }
+    None
+}
+
+fn wheel_axis_value(
+    mode: WheelMode,
+    neg_down: bool,
+    pos_down: bool,
+    neg_seq: u64,
+    pos_seq: u64,
+) -> i32 {
+    match (neg_down, pos_down) {
+        (false, false) => 0,
+        (true, false) => -1,
+        (false, true) => 1,
+        (true, true) => match mode {
+            WheelMode::Classic => 0,
+            WheelMode::Sensitive => {
+                if pos_seq > neg_seq {
+                    1
+                } else {
+                    -1
+                }
+            }
+        },
+    }
+}
+
 /// 按当前方向状态更新轮盘触点。返回是否因为设备端触点池已满而**放弃**了这次按下
 /// (供调用方计入诊断 —— 这种情况以前会直接把消息发出去、被服务端悄悄丢掉)。
 ///
@@ -1596,8 +2202,20 @@ fn update_wheel(
     // 半径仍是界面上那个圆环的大小,scope 单独放大/缩小"手指实际被推多远",
     // 于是可以让视觉圈与游戏里真实摇杆的判定圈解耦。默认 scope=1.0,与旧版一致。
     let wr = w.push_px(m);
-    let dx = st.pressed[3] as i32 - st.pressed[2] as i32; // right - left
-    let dy = st.pressed[1] as i32 - st.pressed[0] as i32; // down - up
+    let dx = wheel_axis_value(
+        w.mode,
+        st.pressed[2],
+        st.pressed[3],
+        st.press_seq[2],
+        st.press_seq[3],
+    );
+    let dy = wheel_axis_value(
+        w.mode,
+        st.pressed[0],
+        st.pressed[1],
+        st.press_seq[0],
+        st.press_seq[1],
+    );
 
     if dx == 0 && dy == 0 {
         if st.down {
@@ -1705,9 +2323,34 @@ mod tests {
     }
 
     /// 未设锚点不生效;设了门控键则必须先按住
-    #[test]
+#[test]
+    fn sensitive_wheel_uses_last_pressed_direction_per_axis() {
+        assert_eq!(
+            wheel_axis_value(WheelMode::Classic, true, true, 1, 2),
+            0,
+            "经典模式同轴反向必须抵消"
+        );
+        assert_eq!(
+            wheel_axis_value(WheelMode::Sensitive, true, true, 1, 2),
+            1,
+            "灵敏模式应由后按下的方向覆盖"
+        );
+        assert_eq!(
+            wheel_axis_value(WheelMode::Sensitive, true, true, 3, 2),
+            -1,
+            "反向覆盖释放后应恢复仍按着的方向"
+        );
+        assert_eq!(
+            wheel_axis_value(WheelMode::Sensitive, true, false, 1, 0),
+            -1,
+            "只有一个方向时保持普通行为"
+        );
+    }
+
+        #[test]
     fn aim_active_needs_anchor_and_gate() {
         let mut st = AimState::default();
+        st.mode_active = true;
 
         let mut aim = aim_at(0.1, 0.1);
         assert!(aim_active(&aim, &st));
@@ -1746,7 +2389,7 @@ mod tests {
     /// 回归(用户实测):"按下 F8 却没反应 / 状态跟自己以为的不一样,
     /// 必须再关一次开一次才恢复"。
     ///
-    /// 根因是 Windows 的按键自动重复会被 rdev 报成一串 KeyPress,
+    /// 根因是 Windows 的按键自动重复会被低级钩子报成一串 KeyPress,
     /// 而旧代码对每个事件都翻转一次映射开关 —— 长按 F8 半秒就翻十几次。
     /// 判定必须只认"上升沿"(刚按下的那一次)。
     #[test]
@@ -1767,6 +2410,7 @@ mod tests {
     fn released_blocks_aim() {
         let aim = aim_at(0.1, 0.1);
         let mut st = AimState::default();
+        st.mode_active = true;
         assert!(aim_active(&aim, &st));
         st.released = true;
         assert!(!aim_active(&aim, &st));
@@ -1864,6 +2508,7 @@ mod tests {
         let mut p = Profile::default();
         p.binds = vec![
             KeyBind {
+                fps_only: false,
                 key: 37,
                 action: Action::Hold {
                     x: 0.5,
@@ -1872,6 +2517,7 @@ mod tests {
                 },
             },
             KeyBind {
+                fps_only: false,
                 key: 36,
                 action: Action::Hold {
                     x: 0.5,
@@ -1917,6 +2563,7 @@ mod tests {
             cy: 0.5,
             radius: 0.05,
             scope: 1.0,
+            mode: crate::keymap::WheelMode::Classic,
             temp: None,
         });
         assert_ne!(wheel_signature(&p.wheels), w2, "增删轮盘必须触发重建");
@@ -1938,6 +2585,7 @@ mod tests {
                 cy: 0.4,
                 radius: 0.05,
                 scope: 1.0,
+                mode: crate::keymap::WheelMode::Classic,
                 temp: None,
             },
             crate::keymap::Wheel {
@@ -1949,6 +2597,7 @@ mod tests {
                 cy: 0.4,
                 radius: 0.05,
                 scope: 1.0,
+                mode: crate::keymap::WheelMode::Classic,
                 temp: Some(TempWheel {
                     key: 18,
                     mode: TempMode::Hold,
@@ -1983,6 +2632,7 @@ mod tests {
         // 配置:K(37) 是长按绑定;临时摇杆的方向键里也有 K,启用键是 E(18)
         let mut p = Profile::default();
         p.binds = vec![KeyBind {
+            fps_only: false,
             key: 37,
             action: Action::Hold {
                 x: 0.9,
@@ -1999,6 +2649,7 @@ mod tests {
             cy: 0.7,
             radius: 0.05,
             scope: 1.0,
+            mode: crate::keymap::WheelMode::Classic,
             temp: Some(TempWheel {
                 key: 18,
                 mode: TempMode::Hold,

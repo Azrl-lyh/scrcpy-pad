@@ -18,6 +18,9 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 pulldown-cmark = { version = "0.13", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# 键位配置改成 YAML(多套"按键组合"装在一个文件里,字段说明写在文件头注释中)。
+# 用 serde_norway 而不是已归档的 serde_yaml:两者 API 一致,但它是仍在维护的分支。
+serde_norway = "0.9"
 
 # Linux: evdev 全局键盘捕获 + xdg-portal 原生文件对话框
 # (rfd 的 xdg-portal 后端要求配套 async 运行时特性,选 async-std)
@@ -25,15 +28,22 @@ serde_json = "1.0.151"
 evdev = "0.13.2"
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 pollster = "0.4"
+# 诊断日志需要本地时区(与 journalctl 对齐时间线):用 localtime_r。
+# libc 本来就在依赖树里(evdev 要求),所以零额外编译成本。
+libc = "0.2"
 
-# Windows: rdev 低级键盘/鼠标钩子(无需管理员权限) + 原生文件对话框
-# windows-sys 仅用于 FPS 鼠标捕获:SetCursorPos 回中、ShowCursor 隐藏光标
+# Windows: 自己装的低级键盘/鼠标钩子(见 capture.rs 的说明:rdev 在钩子回调里
+# 调 AttachThreadInput/ToUnicodeEx 取一个我们用不到的 key name,会阻塞到超时并
+# 被系统静默丢事件)+ 原生文件对话框 + 少量 Win32 调用
 [target.'cfg(windows)'.dependencies]
-rdev = "0.5.3"
 rfd = { version = "0.15", default-features = false }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_Graphics_Gdi",
 ] }
 
 [profile.release]

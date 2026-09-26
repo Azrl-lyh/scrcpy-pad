@@ -27,10 +27,29 @@ pub fn zoom_radius(radius: f32, factor: f32) -> f32 {
     r
 }
 
-/// 鼠标按键的 evdev 码:两平台统一(Windows 侧由 rdev 映射到同一码空间)。
+/// 鼠标按键的 evdev 码:两平台统一(Windows 侧由低级钩子映射到同一码空间)。
 /// 左键=272、中键=274 未在此列出,因为鼠标按键已可直接当普通键绑定,
 /// 这里只保留瞄准门控最常用的右键。
 pub const BTN_RIGHT: u16 = 273;
+/// 鼠标滚轮的四个方向使用统一码空间的合成键码。
+///
+/// Windows 低级钩子与 Linux evdev 都没有把滚轮当成普通 Key;为了让它能像
+/// 其它鼠标键一样参与“改键”,这里把每个滚轮刻度转成一次瞬时按下+抬起。
+pub const BTN_WHEEL_UP: u16 = 277;
+pub const BTN_WHEEL_DOWN: u16 = 278;
+pub const BTN_WHEEL_LEFT: u16 = 279;
+pub const BTN_WHEEL_RIGHT: u16 = 280;
+
+/// 合成鼠标键码的可读名(跨平台共用)
+pub fn mouse_aux_name(code: u16) -> Option<&'static str> {
+    match code {
+        BTN_WHEEL_UP => Some("BTN_WHEEL_UP"),
+        BTN_WHEEL_DOWN => Some("BTN_WHEEL_DOWN"),
+        BTN_WHEEL_LEFT => Some("BTN_WHEEL_LEFT"),
+        BTN_WHEEL_RIGHT => Some("BTN_WHEEL_RIGHT"),
+        _ => None,
+    }
+}
 
 fn default_tap_duration_ms() -> u32 {
     DEFAULT_TAP_DURATION_MS
@@ -450,9 +469,32 @@ impl<'de> Deserialize<'de> for Swipe {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct KeyBind {
-    /// 统一键码空间(Linux=evdev 码;Windows 由 rdev 映射到同一空间)
     pub key: u16,
     pub action: Action,
+    /// 仅在 FPS 模式开启时生效/显示;普通模式下完全让位。
+    #[serde(default)]
+    pub fps_only: bool,
+}
+
+/// 轮盘方向冲突时的处理方式。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WheelMode {
+    /// 经典方向叠加:左右同按会互相抵消,上下同理。
+    #[default]
+    Classic,
+    /// 灵敏模式:同一轴上最后按下的方向覆盖较早方向;释放覆盖键后,
+    /// 若反方向仍按着则自动恢复。左右与上下分别计算,斜向不冲突。
+    Sensitive,
+}
+
+impl WheelMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            WheelMode::Classic => "经典(标准)",
+            WheelMode::Sensitive => "灵敏(后按覆盖)",
+        }
+    }
 }
 
 /// 临时摇杆的启用模式
@@ -528,6 +570,9 @@ pub struct Wheel {
     pub cx: f32,
     pub cy: f32,
     pub radius: f32,
+    /// 同轴反向键同时按下时的处理模式。缺省为经典,保证老配置行为不变。
+    #[serde(default)]
+    pub mode: WheelMode,
     /// 影响范围系数:触点实际推出的距离 = radius × scope。
     /// 1.0(默认)= 推出距离等于半径;>1 更大幅度、<1 更精细。
     /// 老配置没有这个字段,反序列化后为 1.0,行为与旧版逐一致。
@@ -567,6 +612,7 @@ impl Wheel {
             cy,
             radius: m.rel_len(NEW_WHEEL_RADIUS_PX),
             scope: DEFAULT_WHEEL_SCOPE,
+            mode: WheelMode::Classic,
             temp: None,
         }
     }
@@ -630,7 +676,7 @@ pub fn next_wheel_spot(wheels: &[Wheel]) -> (f32, f32) {
     best
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Profile {
     /// 配置格式版本(1=像素坐标;2=相对坐标,见 [`PROFILE_VERSION`])
     #[serde(default = "default_version")]
@@ -638,6 +684,7 @@ pub struct Profile {
     /// 布局设计时所用的屏幕尺寸(仅供显示参考;相对坐标本身自适应)
     #[serde(default)]
     pub screen: Option<(u32, u32)>,
+    #[serde(default)]
     pub name: String,
     /// 映射总开关的切换键,默认 F8 = 66
     pub toggle_key: u16,
@@ -686,6 +733,8 @@ impl RecenterMode {
 /// - `anchor_*`:手指落下的锚点(相对坐标),拖动从该点开始
 /// - `sensitivity_*`:每 1 个鼠标计数对应的设备像素,越大越灵敏
 /// - `hold_key`:仅当该鼠标键(evdev 码)按住时才瞄准;0 表示始终瞄准
+/// - `toggle_key`:独立启停 FPS 模式;0 表示未绑定
+/// - `suspend_key`:按住时暂时退出 FPS 并把光标还给鼠标;0 表示未绑定
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Aim {
     pub enabled: bool,
@@ -702,8 +751,14 @@ pub struct Aim {
     pub recenter_threshold: i32,
     /// 需要按住才瞄准的鼠标键(evdev 码;0 = 始终瞄准)
     pub hold_key: u16,
-    /// 瞄准期间是否捕获鼠标(隐藏/冻结系统光标)
+    /// 进入 FPS 模式后是否捕获鼠标(隐藏/冻结系统光标)
     pub capture_mouse: bool,
+    /// 进入/退出 FPS 模式的独立切换键(0 = 未绑定,可用界面按钮启停)
+    #[serde(default)]
+    pub toggle_key: u16,
+    /// 按住时暂时退出 FPS 模式并把系统光标还给鼠标(0 = 未绑定)
+    #[serde(default)]
+    pub suspend_key: u16,
 }
 
 impl Default for Aim {
@@ -720,6 +775,8 @@ impl Default for Aim {
             recenter_threshold: 400,
             hold_key: 0,
             capture_mouse: true,
+            toggle_key: 0,
+            suspend_key: 0,
         }
     }
 }
@@ -750,6 +807,7 @@ impl Default for Profile {
                 cy: 0.375,
                 radius: default_wheel_radius(),
                 scope: DEFAULT_WHEEL_SCOPE,
+                mode: WheelMode::Classic,
                 temp: None,
             }],
             aim: Aim::default(),
@@ -774,6 +832,173 @@ impl Profile {
         Mapper::new(self.coord_unit(), space)
     }
 }
+
+/// 切换键:按下物理键 `key`,就把生效中的按键组合换成 `target` 那一套。
+///
+/// 与总开关键、轮盘启用键同属"功能键":按下它不会触发任何普通绑定,
+/// 切换动作由引擎完成(它独占触点状态,能保证先抬起旧组合的触点再换车)。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwitchKey {
+    /// 触发切换的物理键(evdev 码;鼠标键共用同一码空间)
+    pub key: u16,
+    /// 目标组合在 `schemes` 里的下标
+    pub target: usize,
+}
+
+/// 配置文件(YAML)的根:一份文件里装若干套"按键组合",外加把它们串起来的切换键。
+///
+/// 为什么多套组合共用一个文件,而不是一个组合一个文件:切换键要指向"哪一套",
+/// 组合之间还有顺序(下标就是身份)——分开存就得额外维护一张名单和一堆路径,
+/// 而名单本身又会与文件对不上。每套组合的内容与旧的单套配置逐一对应(见 [`Profile`]),
+/// 因此"每套键位的设置与执行行为"与以前完全一致。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConfigFile {
+    /// 配置格式版本(沿用 [`PROFILE_VERSION`])
+    #[serde(default = "current_version")]
+    pub format_version: u32,
+    /// 当前生效的组合下标(启动时按它恢复"上次用的那一套")
+    #[serde(default)]
+    pub active: usize,
+    /// 切换键表
+    #[serde(default)]
+    pub switch_keys: Vec<SwitchKey>,
+    /// 全部按键组合(至少一套)
+    #[serde(default)]
+    pub schemes: Vec<Profile>,
+}
+
+fn current_version() -> u32 {
+    PROFILE_VERSION
+}
+
+impl Default for ConfigFile {
+    fn default() -> Self {
+        Self {
+            format_version: PROFILE_VERSION,
+            active: 0,
+            switch_keys: Vec::new(),
+            schemes: vec![Profile::default()],
+        }
+    }
+}
+
+impl ConfigFile {
+    /// 当前生效的组合(空表或下标越界时退回第一套)
+    pub fn active_profile(&self) -> Option<&Profile> {
+        self.schemes
+            .get(self.active)
+            .or_else(|| self.schemes.first())
+    }
+
+    /// 把越界/无效的内容修回自洽状态,**返回是否发生了改动**。
+    ///
+    /// 用户会手改 YAML,而"指向不存在的组合""两个切换键撞在同一个键上"
+    /// 这类错误不该让程序崩溃或行为诡异 —— 读进来先规整一遍:
+    ///   * 至少有一套组合(空文件按默认补一套);
+    ///   * `active` 越界时钳回 0;
+    ///   * 切换键里 `key == 0`(未设置)或 `target` 越界的条目直接删掉;
+    ///   * 同一个物理键只保留第一条(否则"按一次切到哪一套"取决于实现细节);
+    ///   * 版本号一律按当前格式写死 —— YAML 是全新格式,旧版像素配置在
+    ///     `profile.json` 里、本程序不再读取,因此不存在"需要升级的 YAML"。
+    ///     这一条顺带堵住了"手写 YAML 漏了 format_version,被当成像素坐标"
+    ///     这条最容易毁掉一份布局的路。
+    pub fn normalize(&mut self) -> bool {
+        let mut changed = false;
+        if self.format_version != PROFILE_VERSION {
+            self.format_version = PROFILE_VERSION;
+            changed = true;
+        }
+        if self.schemes.is_empty() {
+            self.schemes.push(Profile::default());
+            changed = true;
+        }
+        for p in self.schemes.iter_mut() {
+            if p.format_version != PROFILE_VERSION {
+                p.format_version = PROFILE_VERSION;
+                changed = true;
+            }
+            if p.name.trim().is_empty() {
+                p.name = "默认配置".to_string();
+                changed = true;
+            }
+        }
+        if self.active >= self.schemes.len() {
+            self.active = 0;
+            changed = true;
+        }
+        let n = self.schemes.len();
+        let before = self.switch_keys.len();
+        let mut seen: Vec<u16> = Vec::with_capacity(before);
+        self.switch_keys.retain(|s| {
+            if s.key == 0 || s.target >= n || seen.contains(&s.key) {
+                return false;
+            }
+            seen.push(s.key);
+            true
+        });
+        if self.switch_keys.len() != before {
+            changed = true;
+        }
+        changed
+    }
+}
+
+/// 写进 YAML 文件头的字段说明。
+///
+/// 为什么是"文件头一段注释"而不是每个字段旁边一行:serde 的 YAML 序列化
+/// (serde_norway,与 serde_yaml 同源)不输出注释,逐字段嵌注释需要自己写一遍
+/// 序列化器 —— 为一份"给人看"的说明不值当。落盘时先写这段说明,再写数据,
+/// 于是用户打开文件就能对照着改。
+pub const YAML_HEADER: &str = r#"# ============================================================================
+# scrcpy-pad 键位配置(按键组合)
+# ----------------------------------------------------------------------------
+# 一份文件里可以放多套"按键组合",每套的内容与行为完全一致,靠切换键在位。
+# 所有坐标都是相对值(0..1),与手机分辨率/横竖屏无关。
+#
+# format_version : 配置格式版本(2 = 相对坐标)。不要手改。
+# active         : 启动时生效的组合下标(0 起)。切换键按下后也会更新它。
+# switch_keys    : 切换键表。按下 key 就把当前组合换成 schemes[target]。
+#   - key        : 物理键的 evdev 码(例:66=F8,67=F9;鼠标左/右/中=272/273/274)
+#     target     : 目标组合下标(0 起)
+# schemes        : 全部按键组合,至少有一套。每套字段如下:
+#   name         : 组合名(界面左侧可改,切换时按它提示)
+#                  每套里另有一份 format_version,由程序自动维护:
+#                  读取时统一按当前格式处理,手改它没有作用。
+#   toggle_key   : 映射总开关的切换键(evdev 码,默认 66=F8)
+#   screen       : 设计这套布局时的屏幕尺寸 [宽, 高](仅作参考,可不填)
+#   binds        : 键位绑定列表
+#     - key      : 物理键(evdev 码;鼠标左/右/中=272/273/274,滚轮=277上/278下/279左/280右)
+#       action   : 动作,取值见下
+#       fps_only : true 时仅在 FPS 模式生效/显示(鼠标技能键建议开启)
+#   wheels       : 虚拟摇杆(轮盘)列表
+#     up/down/left/right : 四个方向的物理键(evdev 码)
+#     cx, cy     : 摇杆中心(相对坐标 0..1)
+#     radius     : 视觉半径(相对屏幕宽度的比例)
+#     scope      : 影响范围倍数(手指实际被推离中心的距离 = radius × scope)
+#     mode       : classic(经典)/sensitive(灵敏,同轴后按覆盖)
+#     temp       : 可选。临时轮盘:key = 启用键(evdev 码),mode = hold|toggle
+#   aim          : 鼠标瞄准(FPS 视角)
+#     enabled / anchor_x / anchor_y : 是否启用 + 手指落下的锚点(相对坐标)
+#     sensitivity_x / sensitivity_y : 每 1 个鼠标计数对应的设备像素
+#     invert_y   : 是否反转纵向
+#     recenter   : 归中策略 idle|threshold|never
+#     recenter_idle_ms / recenter_threshold : 静止归中时长 / 阈值归中的偏移阈值
+#     hold_key   : 仅当该鼠标键按住时才瞄准(evdev 码;0 = 始终瞄准)
+#     capture_mouse : 瞄准时是否冻结/隐藏系统光标
+#     toggle_key : 独立启停 FPS 模式的按键(0 = 未绑定)
+#     suspend_key: 按住暂时退出 FPS 并显示光标的按键(0 = 未绑定)
+#   look         : 外观(配色/密度/背景图),随组合一起保存
+#
+# 动作(action)四种写法(注意类型用 YAML 标签标出,即 !Tap 这种写法;
+# 手改时要连感叹号一起写,否则解析会失败):
+#   !Tap       : 点按。x, y 为落点(相对坐标),duration_ms=0 表示按住不松手
+#                直到再次按下同一键才抬起;radius 为响应范围
+#   !Hold      : 长按。键盘按下即落指、松开即抬指,x, y, radius 同上
+#   !Swipe     : 滑动。start/end 为起终点,duration_ms 为时长,
+#                easing 为缓动,path 为轨迹(取值见界面里的下拉选项)
+#   !AndroidKey: 注入 Android 系统键。keycode 例:4=返回, 3=主页, 187=最近任务
+# ============================================================================
+"#;
 
 /// 这份像素坐标布局是否"装得进"给定坐标空间(所有点都落在画面内)。
 ///
@@ -847,11 +1072,17 @@ pub fn upgrade_profile(profile: &mut Profile, space: (u32, u32)) -> bool {
 /// 键码 -> 可读名称(按平台取各自来源的名称,码空间统一)
 #[cfg(target_os = "linux")]
 pub fn key_name(code: u16) -> String {
+    if let Some(name) = mouse_aux_name(code) {
+        return name.to_string();
+    }
     format!("{:?}", evdev::KeyCode(code))
 }
 
 #[cfg(windows)]
 pub fn key_name(code: u16) -> String {
+    if let Some(name) = mouse_aux_name(code) {
+        return name.to_string();
+    }
     crate::capture::win_key_name(code)
 }
 
@@ -860,6 +1091,22 @@ mod tests {
     use super::*;
 
     /// 回归:响应范围缩放必须真的改变半径(曾经因为复位阈值写成绝对差而完全失效)
+    #[test]
+    fn synthetic_wheel_names_are_stable() {
+        assert_eq!(mouse_aux_name(BTN_WHEEL_UP), Some("BTN_WHEEL_UP"));
+        assert_eq!(mouse_aux_name(BTN_WHEEL_DOWN), Some("BTN_WHEEL_DOWN"));
+        assert_eq!(mouse_aux_name(BTN_WHEEL_LEFT), Some("BTN_WHEEL_LEFT"));
+        assert_eq!(mouse_aux_name(BTN_WHEEL_RIGHT), Some("BTN_WHEEL_RIGHT"));
+    }
+
+    #[test]
+    fn legacy_keybind_defaults_to_global_and_wheel_defaults_to_classic() {
+        let bind: KeyBind = serde_json::from_str(r#"{"key":30,"action":{"Hold":{"x":0.1,"y":0.2,"radius":0.03}}}"#).unwrap();
+        assert!(!bind.fps_only);
+        let wheel: Wheel = serde_json::from_str(r#"{"up":17,"down":31,"left":30,"right":32,"cx":0.1,"cy":0.2,"radius":0.03}"#).unwrap();
+        assert_eq!(wheel.mode, WheelMode::Classic);
+    }
+
     #[test]
     fn zoom_radius_actually_changes() {
         let d = DEFAULT_RADIUS;
@@ -884,6 +1131,7 @@ mod tests {
         let mut p = Profile {
             format_version: 1,
             binds: vec![KeyBind {
+                fps_only: false,
                 key: 37,
                 action: Action::Hold {
                     x: 2462.0,
@@ -921,6 +1169,7 @@ mod tests {
         let mut p = Profile {
             format_version: 1,
             binds: vec![KeyBind {
+                fps_only: false,
                 key: 17,
                 action: Action::Tap {
                     x: 540.0,
@@ -938,6 +1187,7 @@ mod tests {
                 cy: 900.0,
                 radius: 120.0,
                 scope: DEFAULT_WHEEL_SCOPE,
+                mode: WheelMode::Classic,
                 temp: None,
             }],
             ..Profile::default()
@@ -1065,6 +1315,7 @@ mod tests {
             cy: 0.375,
             radius: 0.111,
             scope: 1.5,
+            mode: WheelMode::Classic,
             temp: None,
         };
         let m = Mapper::new(CoordUnit::Rel, (1080, 2400));
@@ -1135,5 +1386,95 @@ mod tests {
             assert!((0.0..=1.0).contains(&cx) && (0.0..=1.0).contains(&cy));
             wheels.push(Wheel::new_default(&m, cx, cy));
         }
+    }
+
+    /// 多套"按键组合"必须能原样过一遍 YAML(序列化 -> 解析),一个字段都不丢。
+    ///
+    /// 这是整套配置的唯一落盘路径,round-trip 出问题就等于用户的键位被悄悄改掉。
+    #[test]
+    fn config_file_round_trips_through_yaml() {
+        let mut doc = ConfigFile {
+            format_version: PROFILE_VERSION,
+            active: 1,
+            switch_keys: vec![
+                SwitchKey { key: 67, target: 0 },
+                SwitchKey { key: 68, target: 1 },
+            ],
+            schemes: vec![Profile::default(), {
+                let mut p = Profile::default();
+                p.name = "按键组合2".into();
+                p.toggle_key = 65; // F7
+                p.binds.push(KeyBind {
+                    fps_only: false,
+                    key: 22, // U
+                    action: Action::Tap {
+                        x: 0.42,
+                        y: 0.31,
+                        duration_ms: 40,
+                        radius: 0.05,
+                    },
+                });
+                p.binds.push(KeyBind {
+                    fps_only: false,
+                    key: 23,
+                    action: Action::AndroidKey { keycode: 4 },
+                });
+                p.wheels[0].temp = Some(TempWheel {
+                    key: 57,
+                    mode: TempMode::Toggle,
+                });
+                p
+            }],
+        };
+        assert!(!doc.normalize(), "内容本来就自洽,不该报告改动");
+
+        let text = serde_norway::to_string(&doc).unwrap();
+        let back: ConfigFile = serde_norway::from_str(&text).unwrap();
+        assert_eq!(back, doc, "YAML round-trip 必须一模一样");
+    }
+
+    /// 文件头那段说明是给人看的注释:带上它一起读必须照样解析成功
+    /// (否则用户改完文件保存,程序反而读不出配置)。
+    #[test]
+    fn yaml_header_comments_are_ignored_by_the_parser() {
+        let doc = ConfigFile::default();
+        let text = format!("{YAML_HEADER}{}", serde_norway::to_string(&doc).unwrap());
+        let back: ConfigFile = serde_norway::from_str(&text).unwrap();
+        assert_eq!(back, doc);
+    }
+
+    /// 手改坏的 YAML 要被规整回自洽状态,而不是让程序崩掉或行为诡异
+    #[test]
+    fn normalize_repairs_out_of_range_switch_keys() {
+        let mut doc = ConfigFile {
+            active: 9, // 越界
+            switch_keys: vec![
+                SwitchKey { key: 0, target: 0 },   // 未设置
+                SwitchKey { key: 67, target: 9 },  // 指向不存在的组合
+                SwitchKey { key: 68, target: 0 },  // 正常
+                SwitchKey { key: 68, target: 1 },  // 同键重复(保留第一条)
+            ],
+            ..ConfigFile::default()
+        };
+        assert!(doc.normalize(), "有越界内容时应报告改动");
+        assert_eq!(doc.active, 0, "active 越界应钳回 0");
+        assert_eq!(
+            doc.switch_keys,
+            vec![SwitchKey { key: 68, target: 0 }],
+            "无效/重复的切换键应被剔除"
+        );
+        assert!(!doc.normalize(), "规整过一次之后就该自洽了");
+
+        // 空组合表也要能自愈(手写文件时很容易删空)
+        let mut empty = ConfigFile {
+            schemes: Vec::new(),
+            ..ConfigFile::default()
+        };
+        assert!(empty.normalize());
+        assert_eq!(empty.schemes.len(), 1, "至少要有一套组合");
+        assert_eq!(
+            empty.active_profile().map(|p| p.name.as_str()),
+            Some("默认配置")
+        );
     }
 }
