@@ -9,6 +9,70 @@
 use egui::{Color32, FontFamily, FontId, TextStyle};
 use serde::{Deserialize, Serialize};
 
+// ============================ 界面风格(主题) ============================
+//
+// "风格"与"配色"是两个维度:
+//   - 配色(Preset):深色/浅色/Nord/Catppuccin,四种配色在所有风格下都保留;
+//   - 风格(UiStyle):整体布局与观感 —— 默认(现有界面)/鸿蒙(卡片式)/可视化(虚拟键盘)。
+//
+// 风格改动牵动整体布局(按键布局、信息展示都会变),无法像配色那样每帧热应用,
+// 因此切换风格需要**关闭再重开 UI**(见 app::request_style_restart / main.rs 的重启循环),
+// 重启后从 look.json 读回上一次的风格 —— "用户上一次设的主题,下次启动还在"。
+
+/// 界面风格(主题)。新增风格时:补枚举 + label + apply_style 里的分支 + 界面选择器。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum UiStyle {
+    /// 默认:现有界面布局(左配置+日志 / 右四标签页)
+    #[default]
+    Default,
+    /// 鸿蒙:仿 harmonyos/ 目录下 HarmonyOS App 的卡片式观感
+    /// (深蓝底 + 圆角卡片 + 天蓝强调,只求"像",不求面面俱到)
+    Harmony,
+    /// 可视化:虚拟键盘/鼠标取键 + 键位亮起的编辑界面
+    Visual,
+}
+
+impl UiStyle {
+    pub fn label(self) -> &'static str {
+        match self {
+            UiStyle::Default => "默认",
+            UiStyle::Harmony => "鸿蒙",
+            UiStyle::Visual => "可视化",
+        }
+    }
+
+    pub const ALL: [UiStyle; 3] = [UiStyle::Default, UiStyle::Harmony, UiStyle::Visual];
+}
+
+/// 鸿蒙风格配色:**照本仓库 `harmonyos-pc`(scrcpy-pad HarmonyOS HDC)那套浅色 UI** ——
+/// 浅灰页面底 + 白色卡片 + 细描边 + 蓝色主色 + 深色正文。
+/// 这不是"默认界面的换色",而是一套独立的界面语言(见 app.rs 的 layout_harmony)。
+pub mod harmony {
+    use egui::Color32;
+
+    /// 页面底(#F4F7FB,浅灰蓝)
+    pub const BG: Color32 = Color32::from_rgb(244, 247, 251);
+    /// 卡片 / 面板底(白)
+    pub const CARD: Color32 = Color32::from_rgb(255, 255, 255);
+    /// 次级控件底(#EEF3F9)
+    pub const BTN: Color32 = Color32::from_rgb(238, 243, 249);
+    /// 输入框底(#ECF1F7)
+    pub const INPUT: Color32 = Color32::from_rgb(236, 241, 247);
+    /// 分隔线 / 细描边(#DEE5EE)
+    pub const LINE: Color32 = Color32::from_rgb(222, 229, 238);
+    /// 正文(#182230) / 次要说明(#69778B)
+    pub const TEXT: Color32 = Color32::from_rgb(24, 34, 48);
+    pub const MUTED: Color32 = Color32::from_rgb(105, 119, 139);
+    /// 主色(#2384FF) / 成功 / 警告 / 危险
+    pub const PRIMARY: Color32 = Color32::from_rgb(35, 132, 255);
+    pub const OK: Color32 = Color32::from_rgb(22, 163, 74);
+    pub const WARN: Color32 = Color32::from_rgb(217, 119, 6);
+    pub const DANGER: Color32 = Color32::from_rgb(220, 38, 38);
+    /// 卡片圆角(14px)与控件圆角(8px)
+    pub const CARD_ROUND: f32 = 14.0;
+    pub const CTRL_ROUND: f32 = 8.0;
+}
+
 /// 浮层/控件常用尺寸(默认档)
 pub mod size {
     /// 键位圆圈描边宽度
@@ -47,6 +111,12 @@ pub struct Theme {
     /// 长按键
     pub key_hold: Color32,
     pub key_hold_fill: Color32,
+    /// 仅 FPS 生效的键(截图浮层使用独立色,与普通点按/长按区分)
+    pub key_fps: Color32,
+    pub key_fps_fill: Color32,
+    /// 宏触发键（与普通键位、FPS 键均使用不同语义色）
+    pub key_macro: Color32,
+    pub key_macro_fill: Color32,
     /// 正在修改响应范围的键
     pub key_resize: Color32,
     pub key_resize_fill: Color32,
@@ -57,6 +127,8 @@ pub struct Theme {
     /// 永久轮盘 / 临时轮盘
     pub wheel_perm: Color32,
     pub wheel_temp: Color32,
+    /// 临时轮盘启用键（与方向键区分，避免误认成同类键位）
+    pub wheel_enable: Color32,
     /// FPS 瞄准锚点
     pub aim: Color32,
 }
@@ -74,12 +146,17 @@ impl Theme {
             key_tap_fill: Color32::from_rgba_unmultiplied(0, 200, 0, 60),
             key_hold: Color32::ORANGE,
             key_hold_fill: Color32::from_rgba_unmultiplied(255, 165, 0, 60),
+            key_fps: Color32::from_rgb(214, 104, 255),
+            key_fps_fill: Color32::from_rgba_unmultiplied(180, 70, 255, 70),
+            key_macro: Color32::from_rgb(90, 210, 190),
+            key_macro_fill: Color32::from_rgba_unmultiplied(90, 210, 190, 70),
             key_resize: Color32::YELLOW,
             key_resize_fill: Color32::from_rgba_unmultiplied(255, 230, 0, 70),
             draft: Color32::YELLOW,
             swipe: Color32::LIGHT_BLUE,
             wheel_perm: Color32::from_rgb(255, 90, 220),
             wheel_temp: Color32::from_rgb(0, 200, 255),
+            wheel_enable: Color32::from_rgb(255, 230, 90),
             aim: Color32::from_rgb(255, 96, 0),
         }
     }
@@ -96,12 +173,17 @@ impl Theme {
             key_tap_fill: Color32::from_rgba_unmultiplied(0, 170, 70, 60),
             key_hold: Color32::from_rgb(200, 110, 0),
             key_hold_fill: Color32::from_rgba_unmultiplied(230, 140, 0, 70),
+            key_fps: Color32::from_rgb(145, 45, 190),
+            key_fps_fill: Color32::from_rgba_unmultiplied(145, 45, 190, 82),
+            key_macro: Color32::from_rgb(0, 135, 120),
+            key_macro_fill: Color32::from_rgba_unmultiplied(0, 135, 120, 82),
             key_resize: Color32::from_rgb(180, 150, 0),
             key_resize_fill: Color32::from_rgba_unmultiplied(220, 190, 0, 80),
             draft: Color32::from_rgb(150, 120, 0),
             swipe: Color32::from_rgb(0, 110, 200),
             wheel_perm: Color32::from_rgb(180, 30, 150),
             wheel_temp: Color32::from_rgb(0, 140, 180),
+            wheel_enable: Color32::from_rgb(175, 125, 0),
             aim: Color32::from_rgb(210, 70, 0),
         }
     }
@@ -118,12 +200,17 @@ impl Theme {
             key_tap_fill: Color32::from_rgba_unmultiplied(163, 190, 140, 64),
             key_hold: Color32::from_rgb(208, 135, 112),
             key_hold_fill: Color32::from_rgba_unmultiplied(208, 135, 112, 64),
+            key_fps: Color32::from_rgb(191, 97, 210),
+            key_fps_fill: Color32::from_rgba_unmultiplied(191, 97, 210, 72),
+            key_macro: Color32::from_rgb(94, 129, 172),
+            key_macro_fill: Color32::from_rgba_unmultiplied(94, 129, 172, 74),
             key_resize: Color32::from_rgb(235, 203, 139),
             key_resize_fill: Color32::from_rgba_unmultiplied(235, 203, 139, 76),
             draft: Color32::from_rgb(235, 203, 139),
             swipe: Color32::from_rgb(136, 192, 208),
             wheel_perm: Color32::from_rgb(180, 142, 173),
             wheel_temp: Color32::from_rgb(143, 188, 187),
+            wheel_enable: Color32::from_rgb(235, 203, 139),
             aim: Color32::from_rgb(208, 135, 112),
         }
     }
@@ -140,12 +227,17 @@ impl Theme {
             key_tap_fill: Color32::from_rgba_unmultiplied(166, 227, 161, 64),
             key_hold: Color32::from_rgb(250, 179, 135),
             key_hold_fill: Color32::from_rgba_unmultiplied(250, 179, 135, 64),
+            key_fps: Color32::from_rgb(203, 166, 247),
+            key_fps_fill: Color32::from_rgba_unmultiplied(203, 166, 247, 72),
+            key_macro: Color32::from_rgb(148, 226, 213),
+            key_macro_fill: Color32::from_rgba_unmultiplied(148, 226, 213, 72),
             key_resize: Color32::from_rgb(249, 226, 175),
             key_resize_fill: Color32::from_rgba_unmultiplied(249, 226, 175, 76),
             draft: Color32::from_rgb(249, 226, 175),
             swipe: Color32::from_rgb(137, 220, 235),
             wheel_perm: Color32::from_rgb(245, 194, 231),
             wheel_temp: Color32::from_rgb(137, 220, 235),
+            wheel_enable: Color32::from_rgb(249, 226, 175),
             aim: Color32::from_rgb(250, 179, 135),
         }
     }
@@ -253,6 +345,10 @@ impl BgFit {
 /// 外观设置(随配置保存;缺省即保持原来的深色观感)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Look {
+    /// 界面风格(默认/鸿蒙/可视化)。切换需重启 UI,见 [`UiStyle`]。
+    /// 老配置没有该字段,缺省 [`UiStyle::Default`] —— 与旧版观感一致。
+    #[serde(default)]
+    pub style: UiStyle,
     #[serde(default)]
     pub preset: Preset,
     #[serde(default)]
@@ -298,6 +394,7 @@ fn default_true() -> bool {
 impl Default for Look {
     fn default() -> Self {
         Self {
+            style: UiStyle::default(),
             preset: Preset::default(),
             density: Density::default(),
             bg_path: String::new(),
@@ -312,7 +409,19 @@ impl Default for Look {
 
 impl Look {
     pub fn theme(&self) -> Theme {
-        self.preset.theme()
+        let mut t = self.preset.theme();
+        if self.style == UiStyle::Harmony {
+            // 鸿蒙风格固定用 HDC 应用那一套语义色(浅色底上的蓝/绿/橙/红),
+            // 否则深色预设的浮层色放在白卡片上会看不清。
+            t.ok = harmony::OK;
+            t.warn = harmony::WARN;
+            t.danger = harmony::DANGER;
+            t.accent = harmony::PRIMARY;
+            t.key_fps = harmony::PRIMARY;
+            t.key_fps_fill = t.key_fps.gamma_multiply(0.35);
+            t.muted = harmony::MUTED;
+        }
+        t
     }
 
     /// 是否配置了背景图
@@ -329,14 +438,30 @@ impl Look {
 /// 把配色 + 几何应用到 egui 样式。
 /// `bg_active` 为真时面板半透明,让背景图透出来(仍受 `panel_alpha` 控制)。
 pub fn apply_style(style: &mut egui::Style, look: &Look, bg_active: bool) {
-    let mut visuals = if look.preset.is_dark() {
-        egui::Visuals::dark()
-    } else {
+    // 鸿蒙风格是**浅色界面**(照 harmonyos-pc 的 HDC UI),不受深色预设影响;
+    // 默认/可视化风格仍按预设选深/浅。
+    let mut visuals = if look.style == UiStyle::Harmony || !look.preset.is_dark() {
         egui::Visuals::light()
+    } else {
+        egui::Visuals::dark()
     };
     let theme = look.theme();
-    let panel = look.preset.panel();
-    let window = look.preset.window();
+
+    // ---- 界面风格:面板/弹窗底色与圆角按风格取值 ----
+    // 默认/可视化:沿用四种配色各自的 panel/window;
+    // 鸿蒙:浅灰页面底 #F4F7FB + 白卡片 #FFFFFF + 8px 控件圆角(照 HDC UI)。
+    // 语义色(键位圈/成功/警告等)由 Look::theme 给出(鸿蒙时固定 HDC 那套)。
+    let (panel, window, round) = match look.style {
+        UiStyle::Harmony => (harmony::BG, harmony::CARD, harmony::CTRL_ROUND),
+        UiStyle::Default | UiStyle::Visual => {
+            let round = if look.density == Density::Compact {
+                2.0
+            } else {
+                4.0
+            };
+            (look.preset.panel(), look.preset.window(), round)
+        }
+    };
 
     visuals.panel_fill = if bg_active {
         with_alpha(panel, look.panel_alpha)
@@ -348,44 +473,88 @@ pub fn apply_style(style: &mut egui::Style, look: &Look, bg_active: bool) {
     } else {
         window
     };
-    visuals.extreme_bg_color = if bg_active {
+    visuals.extreme_bg_color = if look.style == UiStyle::Harmony {
+        // 输入框/可编辑区:比页面底再实一点的浅灰蓝(#ECF1F7)
+        harmony::INPUT
+    } else if bg_active {
         with_alpha(panel, look.panel_alpha)
     } else {
         panel
     };
-    visuals.selection.bg_fill = theme.accent.gamma_multiply(0.45);
-    visuals.hyperlink_color = theme.accent;
-    visuals.widgets.active.bg_fill = theme.accent.gamma_multiply(0.55);
-    visuals.widgets.hovered.bg_fill = theme.accent.gamma_multiply(0.28);
+    // 强调色:鸿蒙固定 HDC 蓝;其余风格用配色的语义强调色
+    let accent = if look.style == UiStyle::Harmony {
+        harmony::PRIMARY
+    } else {
+        theme.accent
+    };
+    visuals.selection.bg_fill = if look.style == UiStyle::Harmony {
+        with_alpha(harmony::PRIMARY, 60)
+    } else {
+        accent.gamma_multiply(0.45)
+    };
+    visuals.hyperlink_color = accent;
+    visuals.widgets.active.bg_fill = accent.gamma_multiply(0.55);
+    visuals.widgets.hovered.bg_fill = accent.gamma_multiply(0.28);
+    if look.style == UiStyle::Harmony {
+        // 照 harmonyos-pc 的 configure_style:近白控件底 + 蓝色悬停/按下 + 深色文字。
+        // 这些值直接对齐 HDC UI,不再"凭感觉调"。
+        visuals.widgets.active.bg_fill = harmony::PRIMARY.gamma_multiply(0.5);
+        visuals.widgets.hovered.bg_fill = harmony::PRIMARY.gamma_multiply(0.15);
+        visuals.widgets.inactive.bg_fill = harmony::BTN;
+        visuals.widgets.inactive.weak_bg_fill = harmony::BTN;
+        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, harmony::TEXT);
+        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, harmony::LINE);
+        visuals.widgets.noninteractive.bg_fill = harmony::CARD;
+        visuals.widgets.noninteractive.weak_bg_fill = harmony::CARD;
+        visuals.override_text_color = Some(harmony::TEXT);
+        visuals.window_stroke = egui::Stroke::new(1.0, harmony::LINE);
+    }
 
     let (row, gap) = look.density.factors();
     style.visuals = visuals;
-    style.spacing.item_spacing = egui::vec2(6.0 * gap, 4.0 * gap);
-    style.spacing.button_padding = egui::vec2(6.0 * gap, 3.0 * row);
-    style.spacing.interact_size.y = 20.0 * row;
-    style.spacing.scroll.bar_width = 8.0 * gap;
-    // 几何:圆角
-    let round = if look.density == Density::Compact { 2.0 } else { 4.0 };
+    if look.style == UiStyle::Harmony {
+        // 保留 HDC UI 的宽松基线，但让“控件密度”真正生效。
+        style.spacing.item_spacing = egui::vec2(9.0 * gap, 8.0 * row);
+        style.spacing.button_padding = egui::vec2(12.0 * gap, 7.0 * row);
+        style.spacing.interact_size.y = 30.0 * row;
+        style.spacing.scroll.bar_width = (7.0 * gap).clamp(5.0, 11.0);
+    } else {
+        style.spacing.item_spacing = egui::vec2(6.0 * gap, 4.0 * gap);
+        style.spacing.button_padding = egui::vec2(6.0 * gap, 3.0 * row);
+        style.spacing.interact_size.y = 20.0 * row;
+        style.spacing.scroll.bar_width = 8.0 * gap;
+    }
+    // 几何:圆角(鸿蒙风格控件统一 8px 圆角,卡片 14px 由 app::harmony_card 画)
     let cr = egui::CornerRadius::from(round);
     style.visuals.widgets.noninteractive.corner_radius = cr;
     style.visuals.widgets.inactive.corner_radius = cr;
     style.visuals.widgets.hovered.corner_radius = cr;
     style.visuals.widgets.active.corner_radius = cr;
     style.visuals.window_corner_radius = egui::CornerRadius::from(round + 2.0);
-    // 字号:按密度整体缩放
-    let base = 14.0 * row;
+    // 字号:按密度整体缩放(鸿蒙固定 1.0)
+    let base = if look.style == UiStyle::Harmony {
+        14.0 * row
+    } else {
+        14.0 * row
+    };
     style.text_styles = [
         (
             TextStyle::Heading,
             FontId::new(base * 1.35, FontFamily::Proportional),
         ),
         (TextStyle::Body, FontId::new(base, FontFamily::Proportional)),
-        (TextStyle::Button, FontId::new(base, FontFamily::Proportional)),
+        (
+            TextStyle::Button,
+            FontId::new(base, FontFamily::Proportional),
+        ),
         (
             TextStyle::Small,
             FontId::new(base * 0.82, FontFamily::Proportional),
         ),
-        (TextStyle::Monospace, FontId::new(base, FontFamily::Monospace)),
+        (
+            TextStyle::Monospace,
+            FontId::new(base, FontFamily::Monospace),
+        ),
     ]
     .into();
 }
@@ -474,7 +643,11 @@ pub fn clamp_tone(t: f32) -> f32 {
 /// 中间调 -> 接近 0(用本色)。系数 2.2 让"明显偏亮/偏暗"就能吃到接近端点的档位,
 /// 保证自动对比真的起作用,而不是隔靴搔痒。
 pub fn auto_tone(bg_luma: f32, manual: f32) -> f32 {
-    let luma = if bg_luma.is_finite() { bg_luma.clamp(0.0, 1.0) } else { 0.5 };
+    let luma = if bg_luma.is_finite() {
+        bg_luma.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
     let auto = ((0.5 - luma) * 2.2).clamp(TONE_MIN, TONE_MAX);
     clamp_tone(auto + clamp_tone(manual))
 }
@@ -496,7 +669,11 @@ pub fn tone_color(c: Color32, tone: f32) -> Color32 {
     let [r, g, b, a] = c.to_srgba_unmultiplied();
     let k = t.abs() * TONE_MIX;
     let target: f32 = if t > 0.0 { 255.0 } else { 0.0 };
-    let mix = |v: u8| (v as f32 + (target - v as f32) * k).round().clamp(0.0, 255.0) as u8;
+    let mix = |v: u8| {
+        (v as f32 + (target - v as f32) * k)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
     Color32::from_rgba_unmultiplied(mix(r), mix(g), mix(b), a)
 }
 
@@ -589,12 +766,126 @@ pub fn paint_label(
     let size = main.size();
     let rect = align.anchor_size(pos, size);
     painter.rect_filled(rect.expand(3.0), 3.0, plate(color));
-    paint_text(painter, rect.center(), egui::Align2::CENTER_CENTER, text, font, color);
+    paint_text(
+        painter,
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        font,
+        color,
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 老配置(没有 style 字段)读入后必须是默认风格 —— 观感与旧版逐一致
+    #[test]
+    fn look_style_defaults_to_default() {
+        let look: Look = serde_json::from_str(r#"{ "preset": "Nord" }"#).unwrap();
+        assert_eq!(look.style, UiStyle::Default);
+        // 新字段能正常序列化/读回(主题记忆依赖它)
+        let mut l2 = look.clone();
+        l2.style = UiStyle::Harmony;
+        let text = serde_json::to_string(&l2).unwrap();
+        let l3: Look = serde_json::from_str(&text).unwrap();
+        assert_eq!(l3.style, UiStyle::Harmony);
+    }
+
+    /// 每一个风格都要能落盘/读回,且名字互不相同、不为空 ——
+    /// "记住上次设的主题"全靠它;漏一个风格就会出现"换了主题,重启又变回去"。
+    #[test]
+    fn every_ui_style_round_trips_with_unique_label() {
+        let mut labels = std::collections::HashSet::new();
+        for s in UiStyle::ALL {
+            let text = serde_json::to_string(&s).unwrap();
+            let back: UiStyle = serde_json::from_str(&text).unwrap();
+            assert_eq!(back, s, "风格 {s:?} 序列化后读回不一致");
+            assert!(!s.label().is_empty());
+            assert!(labels.insert(s.label()), "风格名重复: {}", s.label());
+        }
+        // 三种风格(默认/鸿蒙/可视化)都要在册,新增风格时同步补上
+        assert_eq!(UiStyle::ALL.len(), 3);
+        assert_eq!(UiStyle::default(), UiStyle::Default);
+    }
+
+    /// 鸿蒙风格必须真的把"页面底 / 卡片底 / 控件底 / 圆角"换成 HDC UI 那套浅色值 ——
+    /// "像鸿蒙"的关键就是这几处;改坏了这里第一时间能发现。
+    /// 同时确认:深色预设不会顶掉鸿蒙的浅色界面,两个维度互不干扰。
+    #[test]
+    fn harmony_style_applies_card_geometry() {
+        let mut style = egui::Style::default();
+        apply_style(
+            &mut style,
+            &Look {
+                style: UiStyle::Harmony,
+                ..Default::default()
+            },
+            false,
+        );
+        assert_eq!(style.visuals.panel_fill, harmony::BG);
+        assert_eq!(style.visuals.window_fill, harmony::CARD);
+        assert_eq!(style.visuals.extreme_bg_color, harmony::INPUT);
+        assert_eq!(style.visuals.widgets.inactive.bg_fill, harmony::BTN);
+        assert_eq!(
+            style.visuals.widgets.inactive.corner_radius,
+            egui::CornerRadius::same(harmony::CTRL_ROUND as u8),
+            "鸿蒙风格控件应统一 8px 圆角"
+        );
+
+        // 深色预设 + 鸿蒙风格:仍是浅色界面(鸿蒙是一套完整 UI,不是换色)
+        let mut dark_preset = egui::Style::default();
+        apply_style(
+            &mut dark_preset,
+            &Look {
+                style: UiStyle::Harmony,
+                preset: Preset::Dark,
+                ..Default::default()
+            },
+            false,
+        );
+        assert_eq!(
+            dark_preset.visuals.panel_fill,
+            harmony::BG,
+            "风格决定界面底色,预设不该把它顶掉"
+        );
+        assert_eq!(dark_preset.visuals.widgets.inactive.bg_fill, harmony::BTN);
+    }
+
+    /// 鸿蒙风格下 `Look::theme()` 必须换成 HDC 那套语义色
+    /// (浅色底上用深色预设的浮层色会看不清);默认风格不受影响。
+    #[test]
+    fn harmony_look_uses_hdc_semantics() {
+        let look = Look {
+            style: UiStyle::Harmony,
+            preset: Preset::Dark,
+            ..Default::default()
+        };
+        let t = look.theme();
+        assert_eq!(t.ok, harmony::OK);
+        assert_eq!(t.warn, harmony::WARN);
+        assert_eq!(t.danger, harmony::DANGER);
+        assert_eq!(t.accent, harmony::PRIMARY);
+        assert_eq!(t.muted, harmony::MUTED);
+
+        let d = Look::default().theme();
+        assert_eq!(d.accent, Theme::dark().accent, "默认风格语义色不该被改动");
+    }
+
+    /// 默认风格的几何/面板底必须与旧版一致(4px 圆角 + 预设面板色),
+    /// 避免"主题功能"波及不使用它的老用户。
+    #[test]
+    fn default_style_keeps_legacy_geometry() {
+        let mut style = egui::Style::default();
+        apply_style(&mut style, &Look::default(), false);
+        assert_eq!(style.visuals.panel_fill, Preset::Dark.panel());
+        assert_eq!(
+            style.visuals.widgets.inactive.corner_radius,
+            egui::CornerRadius::same(4)
+        );
+        assert_ne!(style.visuals.panel_fill, harmony::BG);
+    }
 
     /// 老配置(没有 overlay_tone 字段)读入后必须是 0.0 —— 观感与旧版逐一致
     #[test]

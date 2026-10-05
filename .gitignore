@@ -1,3 +1,5 @@
 /target
 *.log
 profile.json
+/target-linux-glibc231/
+/target-rebuild/

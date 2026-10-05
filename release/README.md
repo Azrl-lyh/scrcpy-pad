@@ -7,16 +7,20 @@
 ```
 release/
 ├── build.sh                  Linux/macOS 上的构建脚本
-├── build.bat                 Windows 上的构建脚本
+├── build.ps1                 Windows 总构建脚本(默认 Windows + WSL Linux)
+├── build.bat                 Windows 双击入口(默认 all)
 ├── Makefile                  make 入口(封装 build.sh)
 ├── README.md                 本文件
-├── linux-x86_64/             构建产物:可直接发布的 Linux 包
-├── windows-x86_64/           构建产物:可直接发布的 Windows 包
-├── scrcpy-pad-<版本>-linux-x86_64.tar.gz
-└── scrcpy-pad-<版本>-windows-x86_64.zip
+├── linux-x86_64/             当前版本:可直接发布的 Linux 包
+├── windows-x86_64/           当前版本:可直接发布的 Windows 包
+├── harmonyos-pc/             HarmonyOS PC 端当前发布包与压缩包
+├── harmonyos-companion/      HarmonyOS 辅助端当前发布包与压缩包
+├── history/                  历史版本压缩包归档(不含重复解压目录)
+├── scrcpy-pad-<当前版本>-linux-x86_64.tar.gz
+└── scrcpy-pad-<当前版本>-windows-x86_64.zip
 ```
 
-`linux-x86_64/` 与 `windows-x86_64/` 均为自包含目录，内含可执行文件、`icons/`、`README.md`、`LICENSE` 与启动脚本，压缩包由这两个目录打包而成。
+`linux-x86_64/` 与 `windows-x86_64/` 始终替换为最新构建，均为自包含目录，内含可执行文件、`icons/`、`README.md`、`LICENSE` 与启动脚本；压缩包由这两个目录打包而成。历史版本只保留压缩包，统一放在 `history/`。
 
 ## 构建
 
@@ -44,10 +48,12 @@ make clean
 
 ```bat
 cd release
-build.bat
+build.bat              # 默认同时构建 Windows + Linux
+build.bat windows      # 只构建 Windows
+build.bat linux        # 只构建 Linux
 ```
 
-Windows 主机只能编译 Windows 版；Linux 版请在 Linux 上构建。
+默认 `build.bat` 会先构建 Windows，再通过 WSL 的 `Ubuntu-20.04` 构建 Linux。若机器没有该 WSL 发行版，可用 `build.bat windows` 只构建 Windows；Linux 包仍应在 Linux/WSL 中构建。
 
 ## 交叉编译 Windows 版的依赖
 

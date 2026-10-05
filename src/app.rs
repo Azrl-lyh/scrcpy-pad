@@ -2,19 +2,21 @@ use crate::adb::{self, ControlServer};
 use crate::capture::{Capture, CaptureEvent};
 use crate::control::ControlClient;
 use crate::engine::{Shared, SharedState};
+use crate::keyboard;
 use crate::keymap::{
-    Action, ConfigFile, Easing, KeyBind, Mapper, Profile, RecenterMode, Swipe, SwipePath, SwitchKey,
-    TempMode, TempWheel, Wheel, WheelMode, key_name,
+    Action, ConfigFile, Easing, KeyBind, KeyCombo, MacroAction, MacroInstruction, MacroKeyMode,
+    MacroStep, MacroWheelPart, Mapper, Profile, RecenterMode, Swipe, SwipePath, SwitchDirection,
+    SwitchKey, TempMode, TempWheel, ViewInputMode, Wheel, WheelKind, WheelMode, key_name,
 };
 use crate::settings;
 use crate::settings::{Settings, SettingsCache};
 use crate::theme::{self, BgFit, Density, Preset, Theme};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SCID: u32 = 0x1a2b3c4d;
 const LOCAL_PORT: u16 = 28383;
@@ -38,6 +40,26 @@ const COORD_RANGE: std::ops::RangeInclusive<i32> = -8192..=8192;
 
 /// 撤销栈深度(步数)。整份配置快照,50 步足以覆盖一次调参过程。
 const UNDO_DEPTH: usize = 50;
+
+// ============================ 界面风格切换的重启标志 ============================
+//
+// 风格(默认/鸿蒙/可视化)牵动整体布局,不能像配色那样每帧热应用
+// (见 theme::UiStyle 的说明)。切换流程:
+//   1. ui_look 里的风格选择器改动 -> request_style_restart():
+//      把新风格写进 shared.profile.look 并立即落盘(look.json),
+//      然后置本标志、关闭视口;
+//   2. main.rs 的重启循环里 run_native 返回后调 take_style_restart(),
+//      为真则用新风格重新打开窗口 —— "关一下 UI 再打开,确保完全切换完毕"。
+// 风格存放在 look.json,重启后 PadApp::new 自动读回(L766 的 load_look_cache),
+// 于是"用户上一次设的主题,下次启动还在"。
+
+/// 风格切换请求:窗口关闭后 main.rs 检查它决定是否重开
+static STYLE_RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 取出(并复位)风格切换请求。main.rs 在 run_native 返回后调用。
+pub fn take_style_restart() -> bool {
+    STYLE_RESTART.swap(false, Ordering::SeqCst)
+}
 
 /// 启动参数预设下拉选项
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,9 +225,14 @@ impl ArgHelp {
 enum KeySlot {
     NewBind,
     Bind(usize),
-    WheelDir { wheel: usize, dir: usize }, // dir: 0上 1下 2左 3右
-    WheelEnable(usize),                   // 临时轮盘启用键
+    WheelDir {
+        wheel: usize,
+        dir: usize,
+    }, // dir: 0上 1下 2左 3右
+    WheelEnable(usize), // 临时轮盘启用键
     Toggle,
+    /// 全局鼠标消隐切换键
+    CursorToggle,
     /// FPS 瞄准的门控鼠标键(如右键=开镜)
     AimHold,
     /// FPS 模式独立开关键
@@ -214,6 +241,22 @@ enum KeySlot {
     AimSuspend,
     /// 切换键位(第 i 行:按下该键即切到它指向的那套组合)
     SwitchKey(usize),
+    /// 切换键位的第二个组合键（最多两个）
+    SwitchKeySecond(usize),
+    /// 组合键中的第 `slot` 个物理键
+    ComboKey {
+        combo: usize,
+        slot: usize,
+    },
+    /// 宏页：选择宏的触发键
+    MacroTrigger,
+    /// 宏页：设置宏中某个按键步骤的键码
+    MacroInstructionKey(usize),
+    /// 宏页：设置宏中某个组合键步骤的第 `slot` 个键
+    MacroInstructionComboKey {
+        instruction: usize,
+        slot: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -235,11 +278,221 @@ enum CoordSlot {
     NewCircleAngle,
     /// FPS 瞄准锚点
     AimAnchor,
+    /// 组合键的点按/长按落点
+    ComboPoint(usize),
+    /// 组合键滑动的起点/终点/圆形出发点
+    ComboSwipeStart(usize),
+    ComboSwipeEnd(usize),
+    ComboCircleAngle(usize),
 }
 
 /// 正在"修改响应范围"的目标。键位的响应圈和轮盘的半径用的是同一套交互
 /// (`Ctrl++` / `Ctrl+-` 缩放、在截图上拖动),所以合并成一个状态,
 /// 天然保证同一时刻只有一个目标。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RightTab {
+    #[default]
+    Keys,
+    Macro,
+    Wheels,
+    Fps,
+    Other,
+}
+
+impl RightTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Keys => "键位映射",
+            Self::Macro => "宏",
+            Self::Wheels => "摇杆映射",
+            Self::Fps => "FPS 功能",
+            Self::Other => "其他功能",
+        }
+    }
+}
+
+/// 可视化风格下左栏中部的三张标签页(键位组合 / 外观 / 诊断)。
+/// 与右栏的 RightTab 用同一套"浏览器标签页"式的实现(见中央区标签的画法)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum LeftTab {
+    /// 按键组合 / 切换键位(用户要求的默认页:启动程序时默认是设置键位)
+    #[default]
+    Schemes,
+    /// 外观(配色/风格/背景图)
+    Look,
+    /// 诊断
+    Diag,
+}
+
+impl LeftTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Schemes => "键位组合",
+            Self::Look => "外观",
+            Self::Diag => "诊断",
+        }
+    }
+}
+
+/// 鸿蒙风格的左侧导航页(照 harmonyos-pc 的 HDC UI:图标 + 文字,选中项淡蓝底)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum HPage {
+    /// 连接与设备:设备、连接、启动 scrcpy、三件套路径
+    #[default]
+    Connect,
+    /// 按键映射:配置 + 键位列表 + 组合键
+    Keys,
+    /// 宏
+    Macro,
+    /// 虚拟轮盘
+    Wheels,
+    /// FPS 模式(鼠标瞄准)
+    Fps,
+    /// 外观
+    Look,
+    /// 诊断(自检 + 日志)
+    Diag,
+}
+
+impl HPage {
+    /// (图标, 标题)。图标用字形代替图形资源,不额外引依赖;
+    /// 只挑基础几何/常用符号(U+25A0-25CF 与 ⌨ 在 CJK 字体里都有,不会变方框)。
+    fn icon_title(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Connect => ("●", "连接与设备"),
+            Self::Keys => ("⌨", "按键映射"),
+            Self::Macro => ("▶", "宏"),
+            Self::Wheels => ("◎", "虚拟轮盘"),
+            Self::Fps => ("◇", "FPS 模式"),
+            Self::Look => ("◆", "外观"),
+            Self::Diag => ("■", "诊断"),
+        }
+    }
+
+    const ALL: [HPage; 7] = [
+        Self::Connect,
+        Self::Keys,
+        Self::Macro,
+        Self::Wheels,
+        Self::Fps,
+        Self::Look,
+        Self::Diag,
+    ];
+}
+
+/// 可视化风格:虚拟键盘"显示哪几类已设置的键"的五个勾选。
+/// 键位页与 FPS 页**显示能力完全一样**(共用同一份 `vk_lights` 逻辑),
+/// 只是默认值不同 —— FPS 页默认只显示 FPS 独有的键位
+/// (普通映射 / 组合键 / 摇杆默认不显示,需要时自己勾上)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VkFilters {
+    binds: bool,
+    macros: bool,
+    combos: bool,
+    wheels_perm: bool,
+    wheels_temp: bool,
+    fps: bool,
+}
+
+impl VkFilters {
+    /// 两页默认只显示键位、组合键、永久/临时摇杆；宏、FPS 由用户主动打开。
+    const KEYS_PAGE: Self = Self {
+        binds: true,
+        macros: false,
+        combos: true,
+        wheels_perm: true,
+        wheels_temp: true,
+        fps: false,
+    };
+    const FPS_PAGE: Self = Self {
+        binds: true,
+        macros: false,
+        combos: true,
+        wheels_perm: true,
+        wheels_temp: true,
+        fps: false,
+    };
+
+    /// 下拉多选：点击选项只切换对勾，不关闭下拉。
+    fn ui(&mut self, ui: &mut egui::Ui, id: &str) {
+        egui::ComboBox::from_id_salt(id)
+            .selected_text("显示项目")
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show_ui(ui, |ui| {
+                ui.checkbox(&mut self.binds, "按键映射");
+                ui.checkbox(&mut self.combos, "组合键映射");
+                ui.checkbox(&mut self.wheels_perm, "永久摇杆");
+                ui.checkbox(&mut self.wheels_temp, "临时摇杆");
+                ui.checkbox(&mut self.macros, "宏");
+                ui.checkbox(&mut self.fps, "FPS");
+            });
+    }
+}
+
+/// 取一个颜色的更暗版本(虚拟键盘上做键帽侧壁/裙边用)
+fn darken(c: egui::Color32, sub: u8) -> egui::Color32 {
+    egui::Color32::from_rgb(
+        c.r().saturating_sub(sub),
+        c.g().saturating_sub(sub),
+        c.b().saturating_sub(sub),
+    )
+}
+
+/// 可视化风格下"虚拟键盘中被选中的目标"。
+/// 点击虚拟键盘/鼠标上某个键后,这个键:
+///   - 已被绑定 -> 选中它,下方操作栏显示对应编辑器(与右栏列表同一套控件);
+///   - 空闲 -> 新建草稿并立刻进入截图取点(见 vk_on_key_clicked)。
+/// 选中状态存这里,操作栏据此渲染;再点别的键或点[取消]即切换/退出。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum VkSel {
+    /// 新增草稿(点击空闲键产生)
+    New,
+    /// 第 i 条键位绑定
+    Bind(usize),
+    /// 第 i 条宏绑定（与普通键位编辑区分，展开详细动作）
+    Macro(usize),
+    /// 总开关键 / FPS 三键 / 临时轮盘启用键等待重新分配(点击已绑定的特殊键)
+    Toggle,
+    CursorToggle,
+    AimToggle,
+    AimSuspend,
+    AimHold,
+    /// 摇杆方向键 / 临时轮盘启用键
+    WheelDir {
+        wheel: usize,
+        dir: usize,
+    },
+    WheelEnable(usize),
+    /// 组合键切换键
+    SwitchKey(usize),
+    /// 组合键切换键的第二个键
+    SwitchKeySecond(usize),
+    /// 组合键成员
+    ComboKey {
+        combo: usize,
+        slot: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VkAddKind {
+    Key,
+    Combo,
+    Wheel,
+    Aim,
+}
+
+impl VkAddKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Key => "键位",
+            Self::Combo => "组合键",
+            Self::Wheel => "轮盘",
+            Self::Aim => "准星/瞄准锚点",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ResizeTarget {
     /// 键位的圆形响应范围
@@ -248,35 +501,51 @@ enum ResizeTarget {
     Wheel(usize),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum OverlayFilter {
-    All,
-    Keys,
-    Wheels,
-    PermWheels,
-    TempWheels,
-    /// 仅显示 FPS 瞄准锚点
-    Aim,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OverlayFilter {
+    keys: bool,
+    combos: bool,
+    macros: bool,
+    wheels_perm: bool,
+    wheels_temp: bool,
+    aim: bool,
+}
+
+impl Default for OverlayFilter {
+    fn default() -> Self {
+        Self {
+            keys: true,
+            combos: true,
+            macros: false,
+            wheels_perm: true,
+            wheels_temp: true,
+            aim: false,
+        }
+    }
+}
+
+impl OverlayFilter {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        egui::ComboBox::from_id_salt("overlay_filters")
+            .selected_text("显示项目")
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show_ui(ui, |ui| {
+                ui.checkbox(&mut self.keys, "按键映射");
+                ui.checkbox(&mut self.combos, "组合键映射");
+                ui.checkbox(&mut self.wheels_perm, "永久摇杆");
+                ui.checkbox(&mut self.wheels_temp, "临时摇杆");
+                ui.checkbox(&mut self.macros, "宏");
+                ui.checkbox(&mut self.aim, "FPS 锚点");
+            });
+    }
 }
 
 /// 滑动曲线参数编辑的目标(已有键位或新增草稿)
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum EasingEditTarget {
     Bind(usize),
+    Combo(usize),
     New,
-}
-
-impl OverlayFilter {
-    fn label(&self) -> &'static str {
-        match self {
-            OverlayFilter::All => "全部",
-            OverlayFilter::Keys => "仅键位",
-            OverlayFilter::Wheels => "仅摇杆",
-            OverlayFilter::PermWheels => "永久摇杆",
-            OverlayFilter::TempWheels => "临时摇杆",
-            OverlayFilter::Aim => "锚点(FPS)",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -296,9 +565,135 @@ enum DialogPurpose {
     PickBackground,
 }
 
+#[derive(Clone, Default)]
+struct RemoteDebugInfo {
+    fps: Option<f32>,
+    resolution: Option<(u32, u32)>,
+    updated_at: Option<std::time::SystemTime>,
+    error: Option<String>,
+}
+
+#[derive(Clone)]
+struct DebugOverlayData {
+    show_fps: bool,
+    show_resolution: bool,
+    show_aim: bool,
+    fps: String,
+    resolution: String,
+    aim_motions: u64,
+    aim_last_dx: f32,
+    aim_last_dy: f32,
+    updated: String,
+    error: Option<String>,
+}
+
+struct MacroRecording {
+    steps: Vec<MacroStep>,
+    /// 已经按下但尚未抬起、已经作为步骤记录过的键。捕获层可能重复上报
+    /// KEY_DOWN，这里用来合并自动重复，而不是把它变成连续点击。
+    held: HashSet<u16>,
+    last_event: Instant,
+    /// 最近一条真正写入 steps 的时间；重复 KEY_DOWN 不推进它，因此长按
+    /// 的持续时间会准确落在后续抬起步骤上。
+    last_step_at: Instant,
+    idle_ms: u32,
+}
+
+/// 扩展宏编辑窗口的临时状态；窗口关闭/取消时直接丢弃，不触碰原宏。
+struct MacroVirtualEditor {
+    profile: Profile,
+    selected_key: Option<u16>,
+    source_scheme: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacroInstructionKind {
+    Key,
+    Combo,
+    Wheel,
+    Fps,
+    Click,
+    Swipe,
+    Delay,
+    Macro,
+}
+
+impl MacroInstructionKind {
+    const ALL: [Self; 8] = [
+        Self::Key,
+        Self::Combo,
+        Self::Wheel,
+        Self::Fps,
+        Self::Click,
+        Self::Swipe,
+        Self::Delay,
+        Self::Macro,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Key => "按键",
+            Self::Combo => "组合键",
+            Self::Wheel => "轮盘",
+            Self::Fps => "FPS",
+            Self::Click => "点击",
+            Self::Swipe => "滑动",
+            Self::Delay => "间隔",
+            Self::Macro => "嵌套宏",
+        }
+    }
+
+    fn make(self) -> MacroInstruction {
+        match self {
+            Self::Key => MacroInstruction::Key {
+                code: 0,
+                mode: MacroKeyMode::Tap,
+                duration_ms: crate::keymap::DEFAULT_TAP_DURATION_MS,
+                delay_ms: 0,
+            },
+            Self::Combo => MacroInstruction::Combo {
+                keys: vec![0, 0],
+                duration_ms: crate::keymap::DEFAULT_TAP_DURATION_MS,
+                delay_ms: 0,
+            },
+            Self::Wheel => MacroInstruction::Wheel {
+                wheel: 0,
+                part: MacroWheelPart::Up,
+                duration_ms: crate::keymap::DEFAULT_TAP_DURATION_MS,
+                delay_ms: 0,
+            },
+            Self::Fps => MacroInstruction::Fps {
+                on: true,
+                delay_ms: 0,
+            },
+            Self::Click => MacroInstruction::Click {
+                x: 0.5,
+                y: 0.5,
+                duration_ms: crate::keymap::DEFAULT_TAP_DURATION_MS,
+                delay_ms: 0,
+            },
+            Self::Swipe => MacroInstruction::Swipe {
+                start_x: 0.5,
+                start_y: 0.7,
+                end_x: 0.5,
+                end_y: 0.3,
+                duration_ms: 300,
+                delay_ms: 0,
+            },
+            Self::Delay => MacroInstruction::Delay { ms: 100 },
+            Self::Macro => MacroInstruction::Macro {
+                action: Box::new(MacroAction::default()),
+                delay_ms: 0,
+            },
+        }
+    }
+}
+
 struct DraftBind {
     key: Option<u16>,
     kind: usize, // 0点按 1长按 2滑动 3系统键
+    /// 可视化风格的 FPS 页新建的键:只作为"仅 FPS"键位入配置(键位页则相反)
+    fps_only: bool,
     x: i32,
     y: i32,
     /// 点按/长按的响应范围(像素;草稿是临时状态,入配置时才换算成相对值)
@@ -319,6 +714,7 @@ impl Default for DraftBind {
         Self {
             key: None,
             kind: 0,
+            fps_only: false,
             // 草稿坐标是像素;新建草稿时会按当前屏幕尺寸重置到画面中央
             x: 540,
             y: 1200,
@@ -420,8 +816,12 @@ pub struct PadApp {
     grab_flag: Arc<std::sync::atomic::AtomicBool>,
     /// 鼠标抓取开关(FPS 瞄准期间冻结/隐藏系统光标)
     mouse_grab_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// 独立的全局鼠标消隐开关(不依赖 FPS，可由快捷键或“其他功能”按钮切换)
+    cursor_hide_flag: Arc<std::sync::atomic::AtomicBool>,
     /// 上一帧的鼠标捕获状态,用于状态变化时记录日志
     mouse_captured_prev: bool,
+    /// 上一帧的全局鼠标消隐状态，用于状态变化时记录日志
+    cursor_hidden_prev: bool,
     /// 是否检测到鼠标设备(FPS 瞄准面板用于提示)
     mouse_found_flag: Arc<std::sync::atomic::AtomicBool>,
     /// 上一帧的映射开关状态:由关到开时重新确认当前屏幕方向(坐标空间)
@@ -455,6 +855,8 @@ pub struct PadApp {
     devices: Vec<String>,
     selected: usize,
     scrcpy_args: String,
+    /// scrcpy subprocess stdout/stderr/exit status, shown in the GUI log.
+    scrcpy_status_rx: Option<Receiver<String>>,
     /// scrcpy 可执行文件路径(空 = 使用 PATH 中的 scrcpy)
     scrcpy_path: String,
     /// scrcpy 所在目录(空 = 未指定)。可直接指定目录,三件套由它推导补齐 ——
@@ -485,12 +887,75 @@ pub struct PadApp {
     /// 新增键位草稿是否进行中(决定预览圆圈/轨迹是否显示,并允许取消)
     draft_active: bool,
     shot: Option<(egui::TextureHandle, u32, u32)>,
-    /// 截图的局部亮度网格(浮层自动对比用);没截图时为 None
+    /// 截图局部亮度网格(浮层自动对比用);没截图时为 None
     shot_lum: Option<LumaGrid>,
     shot_rx: Option<Receiver<Result<egui::ColorImage, String>>>,
+    /// Screenshot preview zoom multiplier (1.0 = fit preview).
+    shot_zoom: f32,
+    /// 是否仍使用按窗口尺寸计算的自动初始缩放；手动 +/- 后关闭，重置时恢复。
+    shot_zoom_auto: bool,
     /// 音频唤醒(注入音量键)任务的回执;None = 没有进行中的唤醒
     audio_rx: Option<Receiver<String>>,
     overlay_filter: OverlayFilter,
+    /// Right-hand content tab. Keys is selected by default.
+    right_tab: RightTab,
+    /// 可视化风格:左栏中部三标签页(键位组合/外观/诊断)的当前页
+    left_tab: LeftTab,
+    /// **界面风格(主题)**。界面级设置,不随"按键组合切换"改变 ——
+    /// 组合切换会用 YAML 里的 look 整体替换 profile(老 YAML 没有 style 字段),
+    /// 所以这里单独存一份,并每帧回写共享配置(见 `stamp_style`)。
+    style: theme::UiStyle,
+    /// 鸿蒙风格:左侧导航当前页(照 harmonyos-pc 的 HDC UI 重新排布)
+    h_page: HPage,
+    /// 可视化风格:虚拟键盘上方五个显示开关(键位页与 FPS 页各一套,
+    /// 两页的**显示能力完全一样**,只是默认值不同:见 VkFilters)
+    vk_filters: VkFilters,
+    vk_fps_filters: VkFilters,
+    /// 可视化风格:当前在键盘下方操作栏里编辑的目标(见 VkSel)
+    vk_sel: Option<VkSel>,
+    /// 宏录制器（开发中）。
+    macro_recording: Option<MacroRecording>,
+    /// 宏页：当前录制/待添加的宏步骤。
+    macro_page_steps: Vec<MacroStep>,
+    /// 宏页：设置宏的语义操作序列。
+    macro_page_instructions: Vec<MacroInstruction>,
+    /// 宏页：扩展宏的虚拟键位层；None = 普通宏。
+    macro_page_virtual_profile: Option<Profile>,
+    /// 扩展宏设置窗口的临时副本；取消/点 X 直接丢弃。
+    macro_virtual_editor: Option<MacroVirtualEditor>,
+    /// 设置宏“接下来添加什么”的下拉选择。
+    macro_instruction_kind: MacroInstructionKind,
+    /// 宏页：用户为下一个宏选择的触发键。
+    macro_page_key: Option<u16>,
+    /// 宏页：新宏是否仅 FPS 生效。
+    macro_page_fps_only: bool,
+    /// 宏页：空闲自动停止时间。
+    macro_idle_ms: u32,
+    /// 宏页：是否展开显示原始录制事件（默认只显示结果摘要）。
+    macro_show_events: bool,
+    /// 已录宏列表中展开的宏索引。
+    macro_expanded: Option<usize>,
+    /// 当前载入编辑区的是哪一条宏；可视化下列表按钮据此变成“取消编辑”。
+    macro_loaded_index: Option<usize>,
+    /// 新增键位/组合键/轮盘后，下一帧把当前滚动区滚到新增设置处。
+    scroll_to_new: bool,
+    /// 退出清理是否已经执行。eframe 的 on_exit、Drop、主循环兜底可能多路调用。
+    shutdown_done: bool,
+    /// 可视化风格：虚拟键盘当前用于新增哪一类目标。
+    vk_add_kind: VkAddKind,
+    /// 可视化风格：组合键新增时已经选中的物理键（最多两个）。
+    vk_combo_pending: Vec<u16>,
+    /// 可视化键位列表底部的“新增按键映射”行是否展开。
+    vk_bottom_add_active: bool,
+    debug_show_fps: bool,
+    debug_show_resolution: bool,
+    debug_show_aim: bool,
+    log_height: f32,
+    log_window_open: bool,
+    debug_overlay_open: bool,
+    debug_info: RemoteDebugInfo,
+    debug_rx: Option<Receiver<Result<RemoteDebugInfo, String>>>,
+    debug_last_query: Instant,
     /// 在画布上点开的摇杆(显示它的四个方向键);None = 未点开
     wheel_info: Option<usize>,
 
@@ -693,6 +1158,9 @@ impl PadApp {
         install_cjk_font(&cc.egui_ctx);
         let (cap_tx, cap_rx) = channel::<CaptureEvent>();
         let (gui_tx, gui_rx) = channel::<CaptureEvent>();
+        // Repair a stale blank system cursor if a previous process was killed
+        // while cursor capture was active.
+        crate::capture::set_cursor_visible_from_ui(true);
 
         // 配置文件里装的是多套"按键组合",`active` 指向上次用的那一套;
         // 引擎始终只认 `Shared::profile`(= 生效中的那套),组合表放在它旁边。
@@ -709,6 +1177,9 @@ impl PadApp {
         if let Some(slot) = doc.schemes.get_mut(doc.active) {
             *slot = profile.clone();
         }
+        // 界面风格(主题)是**界面级**设置:启动时从外观缓存里取一次,
+        // 之后由 PadApp.style 持有并每帧回写(切换按键组合不会把它带走)。
+        let ui_style = profile.look.style;
 
         let shared: SharedState = Arc::new(std::sync::Mutex::new(Shared {
             profile,
@@ -721,6 +1192,7 @@ impl PadApp {
             toolbar_release: false,
             schemes: doc.schemes.clone(),
             switch_keys: doc.switch_keys.clone(),
+            fast_switch_enabled: doc.fast_switch_enabled,
             active_scheme: doc.active,
         }));
 
@@ -737,6 +1209,10 @@ impl PadApp {
             .as_ref()
             .map(|c| c.mouse_grab.clone())
             .unwrap_or_else(|| Arc::new(false.into()));
+        let cursor_hide_flag = capture
+            .as_ref()
+            .map(|c| c.cursor_hide.clone())
+            .unwrap_or_else(|| Arc::new(false.into()));
         let mouse_found_flag = capture
             .as_ref()
             .map(|c| c.mouse_found.clone())
@@ -746,12 +1222,17 @@ impl PadApp {
         {
             let shared = shared.clone();
             let mouse_grab = mouse_grab_flag.clone();
-            std::thread::spawn(move || crate::engine::run(shared, cap_rx, gui_tx, mouse_grab));
+            let cursor_hide = cursor_hide_flag.clone();
+            std::thread::spawn(move || {
+                // 事件分发主线程:满载机器上必须优先于普通后台任务拿到 CPU。
+                crate::priority::boost(crate::priority::Class::AboveNormal);
+                crate::engine::run(shared, cap_rx, gui_tx, mouse_grab, cursor_hide)
+            });
         }
 
         // 程序级设置(scrcpy 三件套路径等):与 profile.json / look.json 同目录的 settings.json。
         // 有了它,scrcpy 目录即使不在程序同级,重启后也仍然记得,不必每次重新寻找。
-        let mut saved = settings::load().unwrap_or_default();        // 先留一份"文件里原本写了什么":关掉[记住路径]时写回的内容要以它为准,
+        let mut saved = settings::load().unwrap_or_default(); // 先留一份"文件里原本写了什么":关掉[记住路径]时写回的内容要以它为准,
         // 而且落盘判定也必须以磁盘上的真实内容为基准(否则"关掉开关"这一动作
         // 永远写不出去,下次启动又变回"记住")。
         let loaded_raw = saved.clone();
@@ -773,7 +1254,8 @@ impl PadApp {
                 settings::path().display()
             );
         }
-        let saved_args = saved.scrcpy_args.clone();
+        let (saved_args, legacy_mouse_args_removed) =
+            sanitize_saved_scrcpy_args(&saved.scrcpy_args);
         let settings_cache = SettingsCache::new(loaded_raw.clone());
 
         // 自动寻找 scrcpy 与 server:先用上次记住的路径/目录,再自动寻找
@@ -859,6 +1341,8 @@ impl PadApp {
             grab_flag,
             mouse_grab_flag,
             mouse_captured_prev: false,
+            cursor_hide_flag,
+            cursor_hidden_prev: false,
             mouse_found_flag,
             enabled_prev: false,
             space_rx: None,
@@ -881,17 +1365,13 @@ impl PadApp {
             } else {
                 saved_args.clone()
             },
+            scrcpy_status_rx: None,
             scrcpy_path,
             scrcpy_dir: scrcpy_dir_init,
             server_path,
             adb_path: adb_init,
             // 置空使其在首帧自动做一次全套联动补齐
-            suite_synced: (
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-            ),
+            suite_synced: (String::new(), String::new(), String::new(), String::new()),
             applied_suite: None,
             server_version: version,
             test_msg: None,
@@ -905,8 +1385,43 @@ impl PadApp {
             shot: None,
             shot_lum: None,
             shot_rx: None,
+            shot_zoom: 1.0,
+            shot_zoom_auto: true,
             audio_rx: None,
-            overlay_filter: OverlayFilter::All,
+            overlay_filter: OverlayFilter::default(),
+            right_tab: RightTab::Keys,
+            left_tab: LeftTab::default(),
+            style: ui_style,
+            h_page: HPage::default(),
+            vk_filters: VkFilters::KEYS_PAGE,
+            vk_fps_filters: VkFilters::FPS_PAGE,
+            vk_sel: None,
+            macro_recording: None,
+            macro_page_steps: Vec::new(),
+            macro_page_instructions: Vec::new(),
+            macro_page_virtual_profile: None,
+            macro_virtual_editor: None,
+            macro_instruction_kind: MacroInstructionKind::Key,
+            macro_page_key: None,
+            macro_page_fps_only: false,
+            macro_idle_ms: 800,
+            macro_show_events: false,
+            macro_expanded: None,
+            macro_loaded_index: None,
+            scroll_to_new: false,
+            shutdown_done: false,
+            vk_add_kind: VkAddKind::Key,
+            vk_combo_pending: Vec::new(),
+            vk_bottom_add_active: false,
+            debug_show_fps: false,
+            debug_show_resolution: false,
+            debug_show_aim: false,
+            log_height: 170.0,
+            log_window_open: false,
+            debug_overlay_open: false,
+            debug_info: RemoteDebugInfo::default(),
+            debug_rx: None,
+            debug_last_query: Instant::now(),
             wheel_info: None,
             draft: DraftBind::default(),
             logs: VecDeque::new(),
@@ -930,6 +1445,9 @@ impl PadApp {
         };
         app.log("就绪。顺序: 连接手机 -> [连接控制] -> [启动 scrcpy] -> 按总开关键开启映射");
         app.log(found_msg);
+        if legacy_mouse_args_removed {
+            app.log("已清除旧配置中的 --mouse=uhid/aoa：该模式会让 scrcpy 捕获鼠标并干扰键盘，已改为默认 SDK 鼠标模式");
+        }
         if remembered.remember_paths && remembered.has_any_path() {
             app.log(format!(
                 "已读取记住的路径({}),改动会自动保存;不想记住可在左栏取消勾选",
@@ -938,9 +1456,8 @@ impl PadApp {
         }
         match &startup_adb {
             Some(p) => app.log(format!("adb: {}", p.display())),
-            None => app.log(
-                "未找到 adb(设备列表将为空): 请将 adb.exe 所在目录加入 PATH,或在左栏手动指定",
-            ),
+            None => app
+                .log("未找到 adb(设备列表将为空): 请将 adb.exe 所在目录加入 PATH,或在左栏手动指定"),
         }
         // 记住的设备:若仍在线,直接选中它,省得每次重连都要在下拉里挑
         if !remembered.selected_serial.trim().is_empty() {
@@ -950,7 +1467,10 @@ impl PadApp {
                 .position(|d| d == remembered.selected_serial.trim())
             {
                 app.selected = i;
-                app.log(format!("已选中上次使用的设备: {}", remembered.selected_serial));
+                app.log(format!(
+                    "已选中上次使用的设备: {}",
+                    remembered.selected_serial
+                ));
             }
         }
         let _ = cc;
@@ -976,7 +1496,10 @@ impl PadApp {
             Some(v) if srv_ok => {
                 self.server_version = v.clone();
                 self.test_msg = Some((true, format!("scrcpy {v} · server 就绪")));
-                self.log(format!("scrcpy 测试通过: 版本 {v},server: {}", self.server_path));
+                self.log(format!(
+                    "scrcpy 测试通过: 版本 {v},server: {}",
+                    self.server_path
+                ));
             }
             Some(v) => {
                 self.server_version = v.clone();
@@ -1051,6 +1574,96 @@ impl PadApp {
         self.log("已断开控制通道");
     }
 
+    /// 当前是否有可取消的后台任务或交互操作。
+    fn pending_task_label(&self) -> Option<&'static str> {
+        if self.connect_rx.is_some() {
+            Some("连接")
+        } else if self.shot_rx.is_some() {
+            Some("截图")
+        } else if self.debug_rx.is_some() {
+            Some("调试刷新")
+        } else if self.space_rx.is_some() {
+            Some("坐标刷新")
+        } else if self.audio_rx.is_some() {
+            Some("音频唤醒")
+        } else if self.loginfo_rx.is_some() {
+            Some("日志收集")
+        } else if self.macro_recording.is_some() {
+            Some("宏录制")
+        } else if self.picking.is_some() {
+            Some("取点")
+        } else if self.waiting_key.is_some() {
+            Some("按键捕获")
+        } else if self.resizing.is_some() {
+            Some("范围修改")
+        } else if self.easing_edit.is_some() {
+            Some("曲线编辑")
+        } else {
+            None
+        }
+    }
+
+    /// 取消所有等待中的任务/交互。已经启动的外部进程不会因为取消按钮被强杀；
+    /// 尚未完成、结果还没回收的任务会丢弃回执，避免 UI 永远卡在“进行中”。
+    fn cancel_pending_tasks(&mut self) {
+        let label = self.pending_task_label().unwrap_or("当前任务");
+        self.connect_rx = None;
+        self.shot_rx = None;
+        self.debug_rx = None;
+        self.space_rx = None;
+        self.audio_rx = None;
+        self.loginfo_rx = None;
+        self.macro_recording = None;
+        self.picking = None;
+        self.waiting_key = None;
+        self.resizing = None;
+        self.easing_edit = None;
+        self.draft_active = false;
+        self.draft.key = None;
+        self.log(format!("已取消{label}"));
+    }
+    /// 幂等退出清理：窗口关闭、eframe on_exit 和 Drop 任一路径都会调用。
+    /// 先断控制通道，再释放 server / 输入捕获，最后恢复系统光标。
+    fn shutdown(&mut self) {
+        if self.shutdown_done {
+            return;
+        }
+        self.shutdown_done = true;
+        if let Ok(mut g) = self.shared.lock() {
+            g.enabled = false;
+            g.control = None;
+        }
+        self.server = None;
+        self.connect_rx = None;
+        self.scrcpy_status_rx = None;
+        self.debug_rx = None;
+        self.shot_rx = None;
+        self.audio_rx = None;
+        self.loginfo_rx = None;
+        self.cursor_hide_flag.store(false, Ordering::Relaxed);
+        self._capture = None;
+        crate::capture::set_cursor_visible_from_ui(true);
+        crate::diag_info!("lifecycle", "PadApp 退出清理完成");
+        crate::diag::flush();
+    }
+
+    /// scrcpy 启动前把自动追加的参数写回可见参数框。
+    /// 只有虚拟手柄模式需要禁用 scrcpy 自带输入；触摸拖动模式不再自动添加 --mouse=uhid。
+    fn prepare_scrcpy_args(&mut self) -> String {
+        let mode = self.shared.lock().unwrap().profile.aim.input_mode;
+        let before = self.scrcpy_args.trim().to_string();
+        self.scrcpy_args = prepare_scrcpy_args_with_mode(&self.scrcpy_args, mode);
+        if self.scrcpy_args != before {
+            crate::diag_info!(
+                "scrcpy",
+                "auto args: mode={:?}, before={:?}, after={:?}",
+                mode,
+                before,
+                self.scrcpy_args
+            );
+        }
+        self.scrcpy_args.trim().to_string()
+    }
     fn take_screenshot(&mut self) {
         let serial = self.serial();
         if serial.is_empty() {
@@ -1131,31 +1744,37 @@ impl PadApp {
                 }
                 KeySlot::WheelDir { wheel, dir } => {
                     if let Some(w) = g.profile.wheels.get_mut(wheel) {
-                        match dir {
-                            0 => w.up = code,
-                            1 => w.down = code,
-                            2 => w.left = code,
-                            _ => w.right = code,
+                        if w.kind == WheelKind::Standard {
+                            match dir {
+                                0 => w.up = code,
+                                1 => w.down = code,
+                                2 => w.left = code,
+                                _ => w.right = code,
+                            }
+                        } else if let Some(d) = w.directions.get_mut(dir) {
+                            d.key = code;
                         }
                     }
                 }
                 KeySlot::WheelEnable(i) => {
                     if let Some(w) = g.profile.wheels.get_mut(i) {
-                        let mode = w
-                            .temp
-                            .as_ref()
-                            .map(|t| t.mode)
-                            .unwrap_or(TempMode::Hold);
+                        let mode = w.temp.as_ref().map(|t| t.mode).unwrap_or(TempMode::Hold);
                         w.temp = Some(TempWheel { key: code, mode });
                     }
                 }
                 KeySlot::Toggle => g.profile.toggle_key = code,
+                KeySlot::CursorToggle => g.profile.cursor_toggle_key = code,
                 KeySlot::AimHold => g.profile.aim.hold_key = code,
                 KeySlot::AimToggle => g.profile.aim.toggle_key = code,
                 KeySlot::AimSuspend => g.profile.aim.suspend_key = code,
                 KeySlot::SwitchKey(i) => {
                     if let Some(s) = g.switch_keys.get_mut(i) {
                         s.key = code;
+                        if s.keys.len() > 1 {
+                            s.keys[0] = code;
+                        } else {
+                            s.keys = vec![code];
+                        }
                     }
                     // 同一个物理键挂两行没有意义(引擎只会认第一行),
                     // 这里顺手把其余同名行清空为"未绑定",免得看着像生效了其实没有。
@@ -1165,6 +1784,48 @@ impl PadApp {
                         }
                     }
                     switch_key_touched = true;
+                }
+                KeySlot::SwitchKeySecond(i) => {
+                    if let Some(s) = g.switch_keys.get_mut(i) {
+                        if s.keys.is_empty() {
+                            s.keys.push(s.key);
+                        }
+                        if s.keys.len() < 2 {
+                            s.keys.push(code);
+                        } else {
+                            s.keys[1] = code;
+                        }
+                    }
+                }
+                KeySlot::ComboKey { combo, slot } => {
+                    if let Some(combo) = g.profile.combos.get_mut(combo) {
+                        if slot < combo.keys.len() {
+                            combo.keys[slot] = code;
+                        } else {
+                            combo.keys.push(code);
+                        }
+                    }
+                }
+                KeySlot::MacroTrigger => self.macro_page_key = Some(code),
+                KeySlot::MacroInstructionKey(index) => {
+                    if let Some(MacroInstruction::Key {
+                        code: instruction_code,
+                        ..
+                    }) = self.macro_page_instructions.get_mut(index)
+                    {
+                        *instruction_code = code;
+                    }
+                }
+                KeySlot::MacroInstructionComboKey { instruction, slot } => {
+                    if let Some(MacroInstruction::Combo { keys, .. }) =
+                        self.macro_page_instructions.get_mut(instruction)
+                    {
+                        if slot < keys.len() {
+                            keys[slot] = code;
+                        } else {
+                            keys.push(code);
+                        }
+                    }
                 }
             }
         }
@@ -1188,8 +1849,8 @@ impl PadApp {
                 }
                 CoordSlot::Bind(i) => {
                     if let Some(b) = g.profile.binds.get_mut(i) {
-                        if let Action::Tap { x: ax, y: ay, .. } | Action::Hold { x: ax, y: ay, .. } =
-                            &mut b.action
+                        if let Action::Tap { x: ax, y: ay, .. }
+                        | Action::Hold { x: ax, y: ay, .. } = &mut b.action
                         {
                             *ax = m.rel_x(x);
                             *ay = m.rel_y(y);
@@ -1237,6 +1898,39 @@ impl PadApp {
                         y,
                     );
                 }
+                CoordSlot::ComboPoint(i) => {
+                    if let Some(combo) = g.profile.combos.get_mut(i) {
+                        if let Action::Tap { x: ax, y: ay, .. }
+                        | Action::Hold { x: ax, y: ay, .. } = &mut combo.action
+                        {
+                            *ax = m.rel_x(x);
+                            *ay = m.rel_y(y);
+                        }
+                    }
+                }
+                CoordSlot::ComboSwipeStart(i) => {
+                    if let Some(combo) = g.profile.combos.get_mut(i) {
+                        if let Action::Swipe(s) = &mut combo.action {
+                            s.start = (m.rel_x(x), m.rel_y(y));
+                        }
+                    }
+                }
+                CoordSlot::ComboSwipeEnd(i) => {
+                    if let Some(combo) = g.profile.combos.get_mut(i) {
+                        if let Action::Swipe(s) = &mut combo.action {
+                            s.end = (m.rel_x(x), m.rel_y(y));
+                        }
+                    }
+                }
+                CoordSlot::ComboCircleAngle(i) => {
+                    if let Some(combo) = g.profile.combos.get_mut(i) {
+                        if let Action::Swipe(s) = &mut combo.action {
+                            let sp = m.point(s.start.0, s.start.1);
+                            let ep = m.point(s.end.0, s.end.1);
+                            set_circle_angle(&mut s.path, sp, ep, x, y);
+                        }
+                    }
+                }
                 CoordSlot::AimAnchor => {
                     g.profile.aim.anchor_x = m.rel_x(x);
                     g.profile.aim.anchor_y = m.rel_y(y);
@@ -1250,13 +1944,20 @@ impl PadApp {
     fn build_log_content(&self, info: &adb::DeviceInfo) -> String {
         let mut s = String::new();
         s.push_str("scrcpy-pad 运行日志\n");
-        s.push_str(&format!("保存时间: {}\n", fmt_timestamp(std::time::SystemTime::now())));
+        s.push_str(&format!(
+            "保存时间: {}\n",
+            fmt_timestamp(std::time::SystemTime::now())
+        ));
         s.push_str(&format!("程序版本: {}\n", env!("CARGO_PKG_VERSION")));
         s.push_str(&format!("主机环境: {}\n", info.host_os));
         s.push_str(&format!(
             "scrcpy: {} ({})\n",
             info.scrcpy,
-            if self.scrcpy_path.is_empty() { "PATH" } else { &self.scrcpy_path }
+            if self.scrcpy_path.is_empty() {
+                "PATH"
+            } else {
+                &self.scrcpy_path
+            }
         ));
         s.push_str(&format!("server: {}\n", self.server_path));
         s.push('\n');
@@ -1280,6 +1981,26 @@ impl PadApp {
             code.map(key_name).unwrap_or_else(|| "未绑定".into())
         };
         ui.add(egui::Button::new(label).min_size(egui::vec2(110.0, 0.0)))
+    }
+
+    /// "浏览器标签页"式的方形标签按钮(不立体、大小不变)。
+    /// 右栏四标签页与可视化风格的操作栏按钮统一用它,观感一致。
+    ///
+    /// 未选中态以前是完全透明、无描边，只靠文字颜色暗示可点击；现在用
+    /// 强调色做低透明度底色 + 半透明描边，既与背景有区分，又不会像实心
+    /// 按钮一样抢视觉。底色/边框都只改变 alpha，暗色与浅色主题共用一套做法。
+    fn tab_button(ui: &mut egui::Ui, label: &str, selected: bool, accent: egui::Color32) -> bool {
+        let (fill_alpha, border_alpha) = if selected { (72, 224) } else { (26, 128) };
+        let fill = theme::with_alpha(accent, fill_alpha);
+        let stroke = egui::Stroke::new(1.0, theme::with_alpha(accent, border_alpha));
+        ui.add(
+            egui::Button::new(egui::RichText::new(label).strong())
+                .fill(fill)
+                .stroke(stroke)
+                .corner_radius(3.0)
+                .min_size(egui::vec2(72.0, 24.0)),
+        )
+        .clicked()
     }
 
     // ===================== 撤销 / 重做 =====================
@@ -1332,6 +2053,7 @@ impl PadApp {
             format_version: g.profile.format_version,
             active: g.active_scheme,
             switch_keys: g.switch_keys.clone(),
+            fast_switch_enabled: g.fast_switch_enabled,
             schemes: g.schemes.clone(),
         }
     }
@@ -1369,6 +2091,7 @@ impl PadApp {
         let mut g = self.shared.lock().unwrap();
         g.schemes = doc.schemes.clone();
         g.switch_keys = doc.switch_keys.clone();
+        g.fast_switch_enabled = doc.fast_switch_enabled;
         g.active_scheme = doc.active.min(doc.schemes.len().saturating_sub(1));
         g.profile = doc.active_profile().cloned().unwrap_or_default();
     }
@@ -1480,7 +2203,10 @@ impl PadApp {
                 self.install_config(&doc);
                 self.scheme_saved = doc.active;
                 self.scheme_dirty = false;
-                self.log(format!("配置已重新加载(可撤销): {}", self.profile_path.display()));
+                self.log(format!(
+                    "配置已重新加载(可撤销): {}",
+                    self.profile_path.display()
+                ));
                 // 已知屏幕尺寸时,顺手把旧格式配置升级为相对坐标(与[选用配置]行为一致)
                 if let Some((w, h)) = self.screen_size() {
                     self.sync_display_space(w, h);
@@ -1573,6 +2299,8 @@ impl PadApp {
             self.waiting_key = None;
         }
         self.draft.key = None;
+        self.macro_recording = None;
+        self.vk_combo_pending.clear();
         self.draft_active = false;
     }
 
@@ -1581,7 +2309,9 @@ impl PadApp {
         match read_profile_at(&self.profile_path) {
             Ok(doc) => {
                 let ap = doc.active_profile();
-                let (nb, nw) = ap.map(|p| (p.binds.len(), p.wheels.len())).unwrap_or((0, 0));
+                let (nb, nw) = ap
+                    .map(|p| (p.binds.len(), p.wheels.len()))
+                    .unwrap_or((0, 0));
                 self.log(format!(
                     "检测通过: {} 是合法配置 ({} 套组合 / 当前这套 {} 按键 / {} 轮盘)",
                     self.profile_path.display(),
@@ -1626,17 +2356,26 @@ impl PadApp {
             StartPreset::Fhd1080 => self.set_res_preset(1080),
             StartPreset::Hd720 => self.set_res_preset(720),
             StartPreset::NoAudio => {
-                if self.scrcpy_args.split_whitespace().any(|a| a == "--no-audio") {
+                if self
+                    .scrcpy_args
+                    .split_whitespace()
+                    .any(|a| a == "--no-audio")
+                {
                     self.log("参数已含 --no-audio,无需重复");
                 } else {
                     let base = self.scrcpy_args.trim();
-                    self.scrcpy_args =
-                        format!("{base} --no-audio").split_whitespace().collect::<Vec<_>>().join(" ");
+                    self.scrcpy_args = format!("{base} --no-audio")
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     self.log("已追加 --no-audio(不使用音频输出)");
                 }
             }
             StartPreset::WithAudio => {
-                let had = self.scrcpy_args.split_whitespace().any(|a| a == "--no-audio");
+                let had = self
+                    .scrcpy_args
+                    .split_whitespace()
+                    .any(|a| a == "--no-audio");
                 self.scrcpy_args = self
                     .scrcpy_args
                     .split_whitespace()
@@ -1682,12 +2421,7 @@ impl PadApp {
 
     /// 手动改动路径的按钮(浏览/自动寻找/输入失焦)调用:强制下一帧做一次完整联动
     fn resync(&mut self) {
-        self.suite_synced = (
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-        );
+        self.suite_synced = (String::new(), String::new(), String::new(), String::new());
         self.sync_suite();
     }
 
@@ -1782,7 +2516,8 @@ impl PadApp {
             adb::set_adb_bin(effective.as_deref());
             match &effective {
                 Some(p) => self.log(format!("adb: {}", p.display())),
-                None => self.log("未找到 adb(设备列表将为空): 请将 adb.exe 所在目录加入 PATH,或手动指定"),
+                None => self
+                    .log("未找到 adb(设备列表将为空): 请将 adb.exe 所在目录加入 PATH,或手动指定"),
             }
             self.refresh_devices();
         }
@@ -1944,7 +2679,10 @@ impl PadApp {
         let (connected, live, capture_err) = {
             let g = self.shared.lock().unwrap();
             (
-                g.control.as_ref().map(|c| c.is_connected()).unwrap_or(false),
+                g.control
+                    .as_ref()
+                    .map(|c| c.is_connected())
+                    .unwrap_or(false),
                 g.live,
                 self.capture_err.clone(),
             )
@@ -2044,8 +2782,7 @@ impl PadApp {
                 .on_hover_text("把这行路径发给作者,或先自己打开看看")
                 .clicked()
             {
-                ui.ctx()
-                    .copy_text(log_path.display().to_string());
+                ui.ctx().copy_text(log_path.display().to_string());
                 self.log(format!("已复制日志路径: {}", log_path.display()));
             }
             if ui
@@ -2084,7 +2821,9 @@ impl PadApp {
                     // 必须用 monospace 且禁止换行:日志是按列对齐的,折行后没法看
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(self.diag_preview.as_str()).monospace().small(),
+                            egui::RichText::new(self.diag_preview.as_str())
+                                .monospace()
+                                .small(),
                         )
                         .wrap(),
                     );
@@ -2144,10 +2883,8 @@ impl PadApp {
         out.push_str("\n===== 诊断日志全文 =====\n");
         out.push_str(&crate::diag::tail(usize::MAX));
 
-        let path = crate::diag::path().with_file_name(format!(
-            "diagnostics-report-{}.txt",
-            timestamp_compact()
-        ));
+        let path = crate::diag::path()
+            .with_file_name(format!("diagnostics-report-{}.txt", timestamp_compact()));
         match std::fs::write(&path, out) {
             Ok(_) => {
                 crate::diag::flush();
@@ -2159,11 +2896,41 @@ impl PadApp {
 }
 
 impl eframe::App for PadApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.shutdown();
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
+        self.poll_debug_rx();
+        self.maybe_refresh_debug_info();
+
+        let mut scrcpy_messages = Vec::new();
+        let mut scrcpy_rx_done = false;
+        if let Some(rx) = self.scrcpy_status_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(message) => scrcpy_messages.push(message),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        scrcpy_rx_done = true;
+                        break;
+                    }
+                }
+            }
+        }
+        for message in scrcpy_messages {
+            self.log(message);
+        }
+        if scrcpy_rx_done {
+            self.scrcpy_status_rx = None;
+        }
 
         // ---- 外观:配色/密度/背景图(每帧应用,改动立即生效) ----
+        // 先把界面风格盖回共享配置:切换按键组合会用 YAML 里的 look 整体替换
+        // profile(老 YAML 没有 style 字段),不盖回来就会"一切变回默认"。
+        self.stamp_style();
         let look = self.look();
         ctx.all_styles_mut(|style| theme::apply_style(style, &look, look.has_bg()));
         self.paint_background(ctx, &look);
@@ -2174,7 +2941,8 @@ impl eframe::App for PadApp {
 
         // ---- 全局快捷键: 撤销/重做/保存/另存为/刷新设备 ----
         // 键位捕获或取点进行中、正在输入文本时不拦截,保证 Ctrl+Z 等可作为待绑定键
-        if self.waiting_key.is_none() && self.picking.is_none() && !ctx.egui_wants_keyboard_input() {
+        if self.waiting_key.is_none() && self.picking.is_none() && !ctx.egui_wants_keyboard_input()
+        {
             let (k_undo, k_redo, k_save, k_save_as, k_refresh) = ctx.input(|i| {
                 let ctrl = i.modifiers.ctrl;
                 let shift = i.modifiers.shift;
@@ -2239,9 +3007,8 @@ impl eframe::App for PadApp {
             let (zoom_in, zoom_out) = ctx.input(|input| {
                 let ctrl = input.modifiers.ctrl;
                 (
-                    ctrl
-                        && (input.key_pressed(egui::Key::Plus)
-                            || input.key_pressed(egui::Key::Equals)),
+                    ctrl && (input.key_pressed(egui::Key::Plus)
+                        || input.key_pressed(egui::Key::Equals)),
                     ctrl && input.key_pressed(egui::Key::Minus),
                 )
             });
@@ -2313,6 +3080,8 @@ impl eframe::App for PadApp {
                         self.shot_lum = LumaGrid::new(&img);
                         let tex = ctx.load_texture("screenshot", img, Default::default());
                         self.shot = Some((tex, w, h));
+                        self.shot_zoom_auto = true;
+                        self.shot_zoom = 1.0;
                         self.wheel_info = None; // 换了截图,之前点开的摇杆信息卡作废
                         self.log(format!("截图成功 {w}x{h},点击图像可取点"));
                         self.sync_display_space(w, h);
@@ -2374,10 +3143,8 @@ impl eframe::App for PadApp {
                         let text = render_config(&self.config_doc());
                         match text {
                             Ok(text) => match std::fs::write(&p, text) {
-                                Ok(_) => self.log(format!(
-                                    "配置已另存到 {}(可直接分享该文件)",
-                                    p.display()
-                                )),
+                                Ok(_) => self
+                                    .log(format!("配置已另存到 {}(可直接分享该文件)", p.display())),
                                 Err(e) => self.log(format!("另存失败: {e}")),
                             },
                             Err(e) => self.log(format!("序列化失败: {e}")),
@@ -2423,7 +3190,8 @@ impl eframe::App for PadApp {
                             let look = &mut g.profile.look;
                             look.bg_path = path.clone();
                             let visible = f32::from(255 - look.panel_alpha) / 255.0
-                                * f32::from(255 - look.bg_dim) / 255.0;
+                                * f32::from(255 - look.bg_dim)
+                                / 255.0;
                             if visible < 0.20 {
                                 if look.panel_alpha > 150 {
                                     adjusted
@@ -2465,12 +3233,29 @@ impl eframe::App for PadApp {
             }
         }
 
-        // ---- 按键事件(绑定捕获用;键盘与鼠标按键共用码空间) ----
+        // ---- 按键事件(绑定捕获 / 宏录制用;键盘与鼠标按键共用码空间) ----
+        let mut gui_events = Vec::new();
         while let Ok(ev) = self.gui_rx.try_recv() {
+            gui_events.push(ev);
+        }
+        for ev in gui_events {
+            if let Some(rec) = self.macro_recording.as_mut() {
+                if let CaptureEvent::Button { code, pressed } = ev {
+                    Self::record_macro_button(rec, code, pressed, Instant::now());
+                }
+                continue;
+            }
             if let (Some(slot), Some(code)) = (self.waiting_key, ev.pressed_code()) {
                 self.waiting_key = None;
                 self.assign_key(slot, code);
             }
+        }
+        if self
+            .macro_recording
+            .as_ref()
+            .is_some_and(|rec| rec.last_event.elapsed().as_millis() >= rec.idle_ms as u128)
+        {
+            self.finish_macro_recording();
         }
 
         // ---- 引擎侧的解释性消息(映射开关、触点池满、配置重建等)写进日志 ----
@@ -2524,12 +3309,25 @@ impl eframe::App for PadApp {
         }
         // 鼠标是否已被捕获(引擎写入),仅用于界面显示;状态变化时记一条日志
         let mouse_captured = self.mouse_grab_flag.load(Ordering::Relaxed);
+        let cursor_hidden = mouse_captured || self.cursor_hide_flag.load(Ordering::Relaxed);
         if mouse_captured != self.mouse_captured_prev {
             self.mouse_captured_prev = mouse_captured;
+            // ShowCursor 必须在持有可见窗口的 GUI 线程调用；后台捕获线程只负责
+            // 回中与 SetCursor(NULL)。这里做状态切换，帧末每帧再补一次隐藏。
+            crate::capture::set_cursor_visible_from_ui(!mouse_captured);
             self.log(if mouse_captured {
                 "鼠标已捕获: 视角由鼠标控制(按 Ctrl+Alt 可交还给系统)"
             } else {
                 "鼠标已交还给系统(按 Ctrl+Alt 可收回)"
+            });
+        }
+        if cursor_hidden != self.cursor_hidden_prev {
+            self.cursor_hidden_prev = cursor_hidden;
+            crate::capture::set_cursor_visible_from_ui(!cursor_hidden);
+            self.log(if cursor_hidden {
+                "系统鼠标已隐藏"
+            } else {
+                "系统鼠标已恢复显示"
             });
         }
 
@@ -2554,463 +3352,285 @@ impl eframe::App for PadApp {
             }
         }
 
-        // ================= 顶栏 =================
-        egui::Panel::top("top").show(ui, |ui| {
-            // 仅顶栏生效的细滚动条:非浮动、不随悬停加粗,避免盖住内容
-            let top_scroll_style = {
-                let mut thin = ui.style().as_ref().clone();
-                thin.spacing.scroll.floating = false;
-                thin.spacing.scroll.bar_width = 4.0;
-                thin.spacing.scroll.handle_min_length = 10.0;
-                thin
-            };
-            ui.set_style(top_scroll_style);
-            let th = self.theme();
-            egui::ScrollArea::horizontal().show(ui, |ui| {
-                ui.horizontal(|ui| {
-                // 撤销/重做(与 Ctrl+Z / Ctrl+Y 等价)
-                if ui.button("⟲ 撤销").clicked() {
-                    self.undo();
-                }
-                if ui.button("⟳ 重做").clicked() {
-                    self.redo();
-                }
-                ui.separator();
-
-                ui.label("设备:");
-                let cur = self.serial();
-                egui::ComboBox::from_id_salt("dev")
-                    .selected_text(if cur.is_empty() { "无设备" } else { &cur })
-                    .show_ui(ui, |ui| {
-                        for (i, d) in self.devices.iter().enumerate() {
-                            ui.selectable_value(&mut self.selected, i, d);
-                        }
-                    });
-                if ui.button("刷新").clicked() {
-                    self.resync();
-                    self.refresh_devices();
-                }
-
-                ui.separator();
-                ui.label("scrcpy参数:");
-                if ui.small_button("...").on_hover_text("打开常用参数助手").clicked() {
-                    self.args_helper = Some(ArgHelp::defaults());
-                }
-                ui.add(egui::TextEdit::singleline(&mut self.scrcpy_args).desired_width(160.0));
-                // 启动预设:分辨率预设先重置为默认再叠加;音频类直接在现有参数上增删
-                let preset_resp = egui::ComboBox::from_id_salt("startpreset")
-                    .selected_text("启动预设")
-                    .show_ui(ui, |ui| {
-                        for p in [
-                            StartPreset::None,
-                            StartPreset::Uhd2k,
-                            StartPreset::Uhd4k,
-                            StartPreset::Fhd1080,
-                            StartPreset::Hd720,
-                            StartPreset::NoAudio,
-                            StartPreset::WithAudio,
-                        ] {
-                            if ui.selectable_label(false, p.label()).clicked() {
-                                self.apply_start_preset(p);
-                            }
-                        }
-                    });
-                preset_resp.response.on_hover_text(
-                    "分辨率预设只是给 scrcpy 传 --max-size(最长边上限)。\n\
-                     scrcpy 只缩小、不放大:设备本身能输出多高,画面上限就是多高。\n\
-                     例如手机屏幕只有 1080p,选 4k 也拿不到 4k。",
-                );
-                if ui.button("启动 scrcpy").clicked() {
-                    // 启动前联动一次:确保 server/adb 路径已就绪(如已手动粘贴 scrcpy 路径)
-                    self.resync();
-                    match adb::launch_scrcpy(&self.scrcpy_path, &self.serial(), &self.scrcpy_args)
-                    {
-                        Ok(_) => {
-                            self.log("scrcpy 已启动");
-                            // 部分机型音频转发起步慢,自动补一次音量键唤醒
-                            self.wake_audio();
-                        }
-                        Err(e) => self.log(format!("启动失败: {e:#}")),
-                    }
-                }
-
-                ui.separator();
-                if connected {
-                    ui.colored_label(th.ok, "● 控制已连接");
-                    if ui.button("断开").clicked() {
-                        self.disconnect();
-                    }
-                } else if self.connect_rx.is_some() {
-                    ui.label("连接中...");
-                } else if ui.button("连接控制").clicked() {
-                    self.connect_control();
-                }
-
-                ui.separator();
-                let tk = self.shared.lock().unwrap().profile.toggle_key;
-                let tkn = key_name(tk).replace("KEY_", "");
-                let txt = if enabled {
-                    format!("映射: 开 ({tkn})")
-                } else {
-                    format!("映射: 关 ({tkn})")
+        // ================= 布局分派 =================
+        // 鸿蒙风格是一套**重新设计**的界面(照 harmonyos-pc 的 HDC UI):
+        // 顶栏 + 左侧导航 + 中央卡片 + 右侧屏幕预览 + 底部状态栏。
+        // 默认/可视化风格保持原来的"顶栏 + 左栏 + 中央标签页"布局。
+        if self.ui_style() == theme::UiStyle::Harmony {
+            self.layout_harmony(ui, connected, enabled, mouse_captured);
+        } else {
+            // ================= 顶栏 =================
+            egui::Panel::top("top").show(ui, |ui| {
+                // 仅顶栏生效的细滚动条:非浮动、不随悬停加粗,避免盖住内容
+                let top_scroll_style = {
+                    let mut thin = ui.style().as_ref().clone();
+                    thin.spacing.scroll.floating = false;
+                    thin.spacing.scroll.bar_width = 4.0;
+                    thin.spacing.scroll.handle_min_length = 10.0;
+                    thin
                 };
-                let color = if enabled { th.ok } else { th.muted };
-                if ui
-                    .add(egui::Button::new(txt).fill(color.gamma_multiply(0.3)))
-                    .clicked()
-                {
-                    // 关闭映射必须走引擎的收尾(抬起所有按住的触点),否则手机上会"卡键"。
-                    // 引擎线程持有触点状态,故这里只置请求位,由引擎在下一轮(≤4ms)执行,
-                    // 与按总开关键关闭时用的是同一份实现(engine::release_all)。
-                    let now = {
-                        let mut g = self.shared.lock().unwrap();
-                        g.enabled = !g.enabled;
-                        if !g.enabled {
-                            g.toolbar_release = true;
+                ui.set_style(top_scroll_style);
+                let th = self.theme();
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        // 撤销/重做(与 Ctrl+Z / Ctrl+Y 等价)
+                        if ui.button("⟲ 撤销").clicked() {
+                            self.undo();
                         }
-                        g.enabled
-                    };
-                    if now {
-                        self.log("映射已开启");
-                    } else {
-                        self.log("映射已关闭: 正在抬起全部触点");
-                    }
-                }
-
-                ui.separator();
-                if ui.button("关于").clicked() {
-                    self.about_open = true;
-                }
-                });
-            });
-        });
-
-        // ================= 左栏 =================
-        egui::Panel::left("left").min_size(250.0).show(ui, |ui| {
-            // 左栏上部:配置区。自身可滚动(内容再多也只占这块,不会把日志顶出屏幕)
-            let cfg_max_h = (ui.available_height() - 150.0).max(120.0);
-            egui::ScrollArea::vertical()
-                .id_salt("left_cfg")
-                .max_height(cfg_max_h)
-                .show(ui, |ui| {
-                    if ui
-                        .button("使用说明")
-                        .on_hover_text("打开使用说明(独立窗口:左侧章节索引,右侧图文与示例)")
-                        .clicked()
-                    {
-                        self.help_open = true;
-                    }
-                    ui.separator();
-                    if let Some(err) = &self.capture_err {
-                        ui.colored_label(self.theme().danger, "输入捕获不可用:");
-                        ui.label(err);
+                        if ui.button("⟳ 重做").clicked() {
+                            self.redo();
+                        }
                         ui.separator();
-                    }
 
-                    ui.heading("配置");
-                    ui.horizontal(|ui| {
-                        if ui.button("保存配置").clicked() {
-                            self.save_profile();
-                        }
-                        if ui.button("另存为...").clicked() {
-                            self.dialog = Some(crate::filedialog::save_file("scrcpy-pad-profile.yaml"));
-                            self.dialog_purpose = DialogPurpose::SaveProfileAs;
-                        }
-                        if ui.button("重新加载").clicked() {
-                            self.reload_profile_from_current();
-                        }
-                    });
-                    // 键位文件重定向:指定任意目录/文件名为当前键位(可无文件则新建)。
-                    // 用 horizontal_wrapped:左栏可以被拖窄,按钮多了以后换行总比被裁掉好
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("选用配置...").clicked() {
-                            self.dialog = Some(crate::filedialog::pick_file());
-                            self.dialog_purpose = DialogPurpose::ChooseProfile;
-                        }
-                        if ui.button("新建配置...").clicked() {
-                            self.dialog = Some(crate::filedialog::save_file("scrcpy-pad-profile.yaml"));
-                            self.dialog_purpose = DialogPurpose::NewProfile;
-                        }
-                        if ui
-                            .button("默认配置")
-                            .on_hover_text(
-                                "切回程序默认的配置文件(首次运行时自动创建的那份),并加载它的内容",
-                            )
-                            .clicked()
-                        {
-                            self.load_default_profile();
-                        }
-                        if ui.button("检测当前 yaml").clicked() {
-                            self.check_current_profile();
-                        }
-                    });
-                    ui.small(format!(
-                        "当前配置文件: {}{}",
-                        self.profile_path.display(),
-                        if self.profile_path == profile_path() {
-                            " (默认)"
-                        } else {
-                            ""
-                        }
-                    ));
-                    if ui.button("保存日志...").clicked() {
-                        let serial = self.serial();
-                        if serial.is_empty() {
-                            self.log("错误: 未选择设备(日志需包含设备信息)");
-                        } else {
-                            let ver = if self.server_version.is_empty() {
-                                adb::scrcpy_version_at(&self.scrcpy_path).unwrap_or_default()
-                            } else {
-                                self.server_version.clone()
-                            };
-                            let (tx, rx) = channel();
-                            self.loginfo_rx = Some(rx);
-                            self.log("正在收集设备信息...");
-                            std::thread::spawn(move || {
-                                let info = adb::device_info(&serial, &ver);
-                                let _ = tx.send(info);
+                        ui.label("设备:");
+                        let cur = self.serial();
+                        egui::ComboBox::from_id_salt("dev")
+                            .selected_text(if cur.is_empty() { "无设备" } else { &cur })
+                            .show_ui(ui, |ui| {
+                                for (i, d) in self.devices.iter().enumerate() {
+                                    ui.selectable_value(&mut self.selected, i, d);
+                                }
                             });
+                        if ui.button("刷新").clicked() {
+                            self.act_refresh_devices();
                         }
-                    }
 
-                    ui.separator();
-                    egui::CollapsingHeader::new("外观（开发中）")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            self.ui_look(ui);
-                        });
+                        ui.separator();
+                        self.ui_scrcpy_launch_row(ui);
 
-                    ui.horizontal(|ui| {
-                        ui.label("总开关键:");
-                        let tk = { self.shared.lock().unwrap().profile.toggle_key };
-                        let waiting = self.waiting_key == Some(KeySlot::Toggle);
-                        if Self::key_button(ui, waiting, Some(tk)).clicked() {
-                            self.waiting_key = Some(KeySlot::Toggle);
+                        ui.separator();
+                        if connected {
+                            ui.colored_label(th.ok, "● 控制已连接");
+                            if ui.button("断开").clicked() {
+                                self.disconnect();
+                            }
+                        } else if self.connect_rx.is_some() {
+                            ui.label("连接中...");
+                        } else if ui.button("连接控制").clicked() {
+                            self.connect_control();
                         }
-                    });
-                    ui.checkbox(
-                        &mut self.grab_enabled,
-                        "映射时屏蔽原键(grab)\n注意:开启后映射期间键盘只对本程序生效",
-                    );
 
-                    ui.separator();
-                    egui::CollapsingHeader::new("按键组合 / 切换键位")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            self.ui_schemes(ui);
-                        });
-
-                    // 引擎运行状态:把"按了没反应"的原因直接摆出来
-                    {
-                        let g = self.shared.lock().unwrap();
-                        let st = g.live;
-                        let th = g.profile.look.theme();
-                        let max = crate::engine::DEVICE_MAX_POINTERS;
-                        let (color, tail) = if st.refused > 0 {
-                            (
-                                th.warn,
-                                format!(
-                                    "(最近被放弃的是 {})",
-                                    if st.last_refused == 0 {
-                                        "瞄准".to_string()
-                                    } else {
-                                        key_name(st.last_refused)
-                                    }
-                                ),
-                            )
+                        ui.separator();
+                        let tk = self.shared.lock().unwrap().profile.toggle_key;
+                        let tkn = key_name(tk).replace("KEY_", "");
+                        let txt = if enabled {
+                            format!("映射: 开 ({tkn})")
                         } else {
-                            (th.muted, String::new())
+                            format!("映射: 关 ({tkn})")
                         };
-                        ui.colored_label(
-                            color,
-                            format!("引擎: 触点 {}/{} · 因触点池满被放弃 {} 次{tail}", st.pointers, max, st.refused),
-                        )
-                        .on_hover_text(
-                            "设备端同时最多认 10 个触点(普通键位 + 摇杆 + 瞄准共用)。\n\
-                             这里显示此刻占用了几个。\n\
-                             若『被放弃』不为 0,说明某一刻同时按住的键比设备能接的还多 ——\n\
-                             那一次按下会被设备直接丢掉(表现为『按了没反应』),日志里也会记。",
-                        );
-                    }
+                        let color = if enabled { th.ok } else { th.muted };
+                        if ui
+                            .add(
+                                egui::Button::new(txt)
+                                    .fill(color.gamma_multiply(0.3))
+                                    .stroke(egui::Stroke::new(1.0, theme::with_alpha(color, 180))),
+                            )
+                            .clicked()
+                        {
+                            // 关闭映射必须走引擎的收尾(抬起所有按住的触点),否则手机上会"卡键"
+                            self.act_toggle_mapping();
+                        }
 
-                    ui.separator();
-                    egui::CollapsingHeader::new("诊断")
-                        .default_open(false)
+                        ui.separator();
+                        if let Some(label) = self.pending_task_label() {
+                            if ui
+                                .add(
+                                    egui::Button::new(format!("取消{label}"))
+                                        .fill(th.danger.gamma_multiply(0.35))
+                                        .stroke(egui::Stroke::new(
+                                            1.0,
+                                            theme::with_alpha(th.danger, 190),
+                                        )),
+                                )
+                                .clicked()
+                            {
+                                self.cancel_pending_tasks();
+                            }
+                        }
+                        if ui.button("关于").clicked() {
+                            self.about_open = true;
+                        }
+                    });
+                });
+            });
+
+            // ================= 左栏 =================
+            egui::Panel::left("left")
+                .min_size(260.0)
+                // 显式给默认宽度并封顶:否则面板会按内容(长路径/多按钮行)自行撑宽,
+                // 把中央的虚拟键盘/键位列表挤到需要横向滚动(视觉验证时发现)。
+                .default_size(340.0)
+                .max_size(430.0)
+                .show(ui, |ui| {
+                    // 日志是真正的可拖动底部面板：和截图取点框同一套 resizable panel。
+                    let log_default = self
+                        .log_height
+                        .clamp(80.0, (ui.available_height() - 160.0).max(80.0));
+                    egui::Panel::bottom("left_log_panel")
+                        .resizable(true)
+                        .default_size(log_default)
+                        .min_size(80.0)
+                        .max_size((ui.available_height() - 120.0).max(80.0))
                         .show(ui, |ui| {
-                            self.ui_diagnostics(ui);
+                            self.ui_log_card(ui, ui.available_height());
                         });
 
-                    ui.separator();
-                    ui.heading("scrcpy 管理");
-                    ui.small(
-                        "官方 Windows 包里 scrcpy.exe、scrcpy-server、adb.exe 三者同目录。\n\
-                         可以直接指定 scrcpy 所在**目录**(最省事),也可以只填其中一个文件,\n\
-                         其余留空会自动补齐。",
-                    );
-                    // scrcpy 目录:用户最自然的用法就是把发行包那个文件夹指给它
-                    ui.horizontal(|ui| {
-                        ui.label("scrcpy 目录");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.scrcpy_dir)
-                                .desired_width(220.0)
-                                .hint_text("例如 D:\\scrcpy-win64-v3.3"),
-                        );
-                        if ui.small_button("浏览目录").clicked() {
-                            self.dialog = Some(crate::filedialog::pick_folder());
-                            self.dialog_purpose = DialogPurpose::ScrcpyDir;
-                        }
-                        if ui
-                            .small_button("应用")
-                            .on_hover_text("按这个目录补齐 scrcpy / server / adb")
-                            .clicked()
-                        {
-                            self.apply_scrcpy_dir();
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button("自动寻找全部").clicked() {
-                            match adb::find_scrcpy() {
-                                Some(p) => {
-                                    self.scrcpy_path = p.display().to_string();
-                                    if let Some(d) = PathBuf::from(&self.scrcpy_path).parent() {
-                                        self.scrcpy_dir = d.display().to_string();
-                                    }
-                                    self.log(format!("已找到 scrcpy: {}", self.scrcpy_path));
-                                    self.resync();
-                                    self.test_scrcpy();
-                                    self.save_settings_now();
-                                }
-                                None => {
-                                    self.log("未找到 scrcpy,请手动指定它所在目录或 scrcpy.exe")
-                                }
+                    // 左栏上部:配置区。自身可滚动(内容再多也只占这块,不会把日志顶出屏幕)
+                    let cfg_max_h = ui.available_height().max(120.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("left_cfg")
+                        .max_height(cfg_max_h)
+                        .show(ui, |ui| {
+                            if ui
+                                .button("使用说明")
+                                .on_hover_text("打开使用说明(独立窗口:左侧章节索引,右侧图文与示例)")
+                                .clicked()
+                            {
+                                self.help_open = true;
                             }
-                        }
-                        if ui.button("测试并刷新").clicked() {
-                            self.resync();
-                            self.test_scrcpy();
-                            // 验证 adb 是否真的可运行(打印版本行),便于诊断
-                            if let Some(exe) = self.effective_adb() {
-                                let exe_s = exe.display().to_string();
-                                match adb::adb_version_at(&exe_s) {
-                                    Some(v) => self.log(format!("adb 版本: {v}")),
-                                    None => {
-                                        self.log(format!("adb 可执行失败,无法读取版本: {exe_s}"))
+                            ui.separator();
+                            if let Some(err) = &self.capture_err {
+                                ui.colored_label(self.theme().danger, "输入捕获不可用:");
+                                ui.label(err);
+                                ui.separator();
+                            }
+
+                            self.ui_profile_config(ui);
+
+                            ui.separator();
+                            // ---- 中段:外观 / 总开关 / 键位组合 / 引擎状态 / 诊断 ----
+                            // 可视化风格:外观、键位组合、诊断变成三张"浏览器标签页"夹在
+                            // 配置与 scrcpy 管理之间(默认选中键位组合);总开关等即时控件仍在标签页之外。
+                            // 默认/鸿蒙风格:维持折叠头(现状不变)。
+                            let visual = self.ui_style() == theme::UiStyle::Visual;
+                            if visual {
+                                let th = self.theme();
+                                ui.horizontal(|ui| {
+                                    for tab in [LeftTab::Schemes, LeftTab::Look, LeftTab::Diag] {
+                                        if Self::tab_button(
+                                            ui,
+                                            tab.label(),
+                                            self.left_tab == tab,
+                                            th.ok,
+                                        ) {
+                                            self.left_tab = tab;
+                                        }
                                     }
+                                });
+                                match self.left_tab {
+                                    LeftTab::Schemes => self.ui_schemes(ui),
+                                    LeftTab::Look => self.ui_look(ui),
+                                    LeftTab::Diag => self.ui_diagnostics(ui),
                                 }
                             } else {
-                                self.log("未找到 adb(可点击上方 [浏览]/[自动] 手动指定)");
+                                egui::CollapsingHeader::new("外观（开发中）")
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        self.ui_look(ui);
+                                    });
                             }
-                            self.refresh_devices();
-                        }
-                    });
-                    // 记住路径:与主题(look.json)一样存在配置目录里,重启后自动沿用
-                    ui.horizontal(|ui| {
-                        if ui
-                            .checkbox(&mut self.remember_paths, "记住路径(下次启动直接用)")
-                            .on_hover_text(
-                                "把 scrcpy / scrcpy-server / adb 路径、scrcpy 目录与启动参数存到\n\
-                                 配置目录的 settings.json,即使 scrcpy 目录不在程序同级,\n\
-                                 重启后也不必重新寻找。关掉它只是『下次启动不再使用』,\n\
-                                 文件里已记住的路径会保留。",
-                            )
-                            .changed()
-                        {
-                            if self.remember_paths {
-                                self.log("已开启记住路径: 本次路径将写入 settings.json");
-                            } else {
-                                self.log("已关闭记住路径: 下次启动不再使用其中的路径(文件里已记住的内容保留)");
-                            }
-                            // 开关状态本身立刻落盘,免得下次启动又变回上一次的样子
-                            self.save_settings_now();
-                        }
-                        if ui
-                            .small_button("打开配置目录")
-                            .on_hover_text("profile.yaml / look.json / settings.json 所在目录")
-                            .clicked()
-                        {
-                            self.open_config_dir();
-                        }
-                    });
-                    if let Some((ok, msg)) = &self.test_msg {
-                        let th = self.theme();
-                        ui.colored_label(if *ok { th.ok } else { th.danger }, msg);
-                    }
 
-                    ui.horizontal(|ui| {
-                        ui.label("scrcpy.exe ");
-                        ui.text_edit_singleline(&mut self.scrcpy_path);
-                        if ui.small_button("浏览").clicked() {
-                            self.dialog = Some(crate::filedialog::pick_file());
-                            self.dialog_purpose = DialogPurpose::ScrcpyExe;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("scrcpy-server");
-                        ui.text_edit_singleline(&mut self.server_path);
-                        if ui.small_button("浏览").clicked() {
-                            self.dialog = Some(crate::filedialog::pick_file());
-                            self.dialog_purpose = DialogPurpose::ServerJar;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("adb.exe    ");
-                        ui.text_edit_singleline(&mut self.adb_path);
-                        if ui.small_button("浏览").clicked() {
-                            self.dialog = Some(crate::filedialog::pick_file());
-                            self.dialog_purpose = DialogPurpose::AdbExe;
-                        }
-                        if ui.small_button("自动").clicked() {
-                            match self.effective_adb() {
-                                Some(p) => {
-                                    self.adb_path = p.display().to_string();
-                                    self.log(format!("adb: {}", self.adb_path));
-                                    self.resync();
-                                }
-                                None => self.log("未找到 adb,请手动指定路径或加入 PATH"),
-                            }
-                        }
-                    });
-                    let adb_eff = self
-                        .effective_adb()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "未找到(将回退 PATH 的 adb)".to_string());
-                    let ver_txt = if self.server_version.is_empty() {
-                        "未检测".to_string()
-                    } else {
-                        self.server_version.clone()
-                    };
-                    ui.small(format!("当前 adb: {adb_eff}"));
-                    ui.small(format!("server 版本: {ver_txt}"));
-                }); // ← 配置区滚动到这里结束
+                            self.ui_toggle_key_row(ui);
 
-            // 左栏下部:日志固定在底部,始终能看到、也始终有滚动条可翻
-            let log_max_h = ui.available_height().max(60.0);
-            ui.separator();
-            ui.heading("日志");
-            egui::ScrollArea::vertical()
-                .id_salt("left_log")
-                .stick_to_bottom(true)
-                .max_height(log_max_h)
-                .show(ui, |ui| {
-                    for l in self.logs.iter().rev().take(200) {
-                        ui.monospace(l);
-                    }
+                            if !visual {
+                                ui.separator();
+                                egui::CollapsingHeader::new("按键组合 / 切换键位")
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        self.ui_schemes(ui);
+                                    });
+                            }
+
+                            // 引擎运行状态:把"按了没反应"的原因直接摆出来
+                            self.ui_engine_status(ui);
+
+                            if !visual {
+                                ui.separator();
+                                egui::CollapsingHeader::new("诊断")
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        self.ui_diagnostics(ui);
+                                    });
+                            }
+
+                            ui.separator();
+                            self.ui_scrcpy_manage(ui);
+                        }); // ← 配置区滚动到这里结束
                 });
-        });
 
-        // ================= 中央区 =================
-        egui::CentralPanel::default().show(ui, |ui| {
-            // 横纵双向滚动:键位条目较长时可用滚轮/横向滚动查看,不再被窗口裁掉
-            egui::ScrollArea::both().show(ui, |ui| {
-                self.ui_binds(ui);
-                ui.separator();
-                self.ui_wheels(ui);
-                ui.separator();
-                self.ui_aim(ui, mouse_captured);
-                ui.separator();
-                self.ui_picker(ui);
+            // ================= 中央区 =================
+            egui::CentralPanel::default().show(ui, |ui| {
+                // Screenshot picker is pinned to the bottom of the right-hand body.
+                egui::Panel::bottom("screenshot_picker")
+                    .resizable(true)
+                    .default_size(330.0)
+                    .min_size(170.0)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::both()
+                            .id_salt("screenshot_panel_scroll")
+                            .show(ui, |ui| {
+                                self.ui_picker(ui);
+                            });
+                    });
+
+                egui::CentralPanel::default().show(ui, |ui| {
+                    // 可视化风格:三张标签页(键位 / FPS设置 / 其他功能),摇杆并入键位页;
+                    // 其余风格:维持四张(键位/摇杆/FPS/其他)。
+                    let visual = self.ui_style() == theme::UiStyle::Visual;
+                    ui.horizontal(|ui| {
+                        let th = self.theme();
+                        let tabs: &[RightTab] = if visual {
+                            &[
+                                RightTab::Keys,
+                                RightTab::Macro,
+                                RightTab::Fps,
+                                RightTab::Other,
+                            ]
+                        } else {
+                            &[
+                                RightTab::Keys,
+                                RightTab::Macro,
+                                RightTab::Wheels,
+                                RightTab::Fps,
+                                RightTab::Other,
+                            ]
+                        };
+                        for tab in tabs {
+                            if Self::tab_button(ui, tab.label(), self.right_tab == *tab, th.ok) {
+                                self.right_tab = *tab;
+                            }
+                        }
+                    });
+                    ui.separator();
+                    let content_height = ui.available_height().max(160.0);
+                    egui::ScrollArea::both()
+                        .max_height(content_height)
+                        .id_salt("right_tab_content")
+                        .show(ui, |ui| {
+                            if visual {
+                                match self.right_tab {
+                                    // 键位页:虚拟键盘+鼠标取键 + 操作栏 + 全部既有列表(多加,不是选择)
+                                    RightTab::Keys => self.ui_visual_keys(ui),
+                                    RightTab::Macro => self.ui_macro_page(ui),
+                                    // FPS 页:虚拟键盘只能设置 FPS 相关键 + 既有 FPS 面板
+                                    RightTab::Fps => self.ui_visual_fps(ui, mouse_captured),
+                                    RightTab::Other => self.ui_other(ui),
+                                    // 摇杆已并入键位页,此页在可视化风格下不可达
+                                    RightTab::Wheels => self.ui_wheels(ui),
+                                }
+                            } else {
+                                match self.right_tab {
+                                    RightTab::Keys => self.ui_binds(ui),
+                                    RightTab::Macro => self.ui_macro_page(ui),
+                                    RightTab::Wheels => self.ui_wheels(ui),
+                                    RightTab::Fps => self.ui_aim(ui, mouse_captured),
+                                    RightTab::Other => self.ui_other(ui),
+                                }
+                            }
+                        });
+                });
             });
-        });
+        } // ← 布局分派:非鸿蒙分支到这里结束
 
         // ================= 关于窗口 =================
         let mut open_license = false;
@@ -3059,6 +3679,11 @@ impl eframe::App for PadApp {
             self.help.show(ctx, &mut self.help_open, &th);
         }
 
+        // ================= 调试信息悬浮窗 =================
+        self.ui_debug_overlay(ctx);
+        self.ui_log_window(ctx);
+        self.ui_macro_virtual_window(ctx);
+
         // ================= 参数助手窗口 =================
         self.ui_args_helper(ctx);
 
@@ -3087,7 +3712,17 @@ impl eframe::App for PadApp {
         self.remember_now();
         self.persist_settings();
 
+        if mouse_captured || self.cursor_hide_flag.load(Ordering::Relaxed) {
+            crate::capture::hide_cursor_shape_from_ui();
+        }
         ctx.request_repaint_after(Duration::from_millis(120));
+    }
+}
+
+impl Drop for PadApp {
+    fn drop(&mut self) {
+        self.cursor_hide_flag.store(false, Ordering::Relaxed);
+        crate::capture::set_cursor_visible_from_ui(true);
     }
 }
 
@@ -3137,58 +3772,31 @@ impl PadApp {
             });
         }
         ui.horizontal(|ui| {
-            if ui.button("新建组合").on_hover_text("复制当前这套并切过去").clicked() {
+            if ui
+                .button("新建组合")
+                .on_hover_text("复制当前这套并切过去")
+                .clicked()
+            {
                 self.add_scheme();
             }
         });
 
         ui.separator();
-        ui.label("切换键位:");
-        ui.small("按一下就把生效中的组合换成它指向的那套(按住只算一次)。");
-
-        let rows: Vec<(u16, usize)> = {
-            let g = self.shared.lock().unwrap();
-            g.switch_keys.iter().map(|s| (s.key, s.target)).collect()
-        };
-        let mut row_del: Option<usize> = None;
-        for (i, (key, target)) in rows.iter().enumerate() {
-            ui.horizontal(|ui| {
-                let waiting = self.waiting_key == Some(KeySlot::SwitchKey(i));
-                if Self::key_button(ui, waiting, Some(*key)).clicked() {
-                    self.waiting_key = Some(KeySlot::SwitchKey(i));
-                }
-                ui.label("→");
-                let mut t = *target;
-                let cur = names.get(t).cloned().unwrap_or_else(|| "?".into());
-                egui::ComboBox::from_id_salt(("switch_target", i))
-                    .selected_text(cur)
-                    .width(112.0)
-                    .show_ui(ui, |ui| {
-                        for (j, nm) in names.iter().enumerate() {
-                            ui.selectable_value(&mut t, j, nm);
-                        }
-                    });
-                if t != *target {
-                    if let Some(s) = self.shared.lock().unwrap().switch_keys.get_mut(i) {
-                        s.target = t;
-                    }
-                    self.scheme_dirty = true;
-                }
-                if ui.button("×").on_hover_text("删除这个切换键位").clicked() {
-                    row_del = Some(i);
-                }
+        let mut fast = self.shared.lock().unwrap().fast_switch_enabled;
+        if ui
+            .checkbox(&mut fast, "启用快速切换")
+            .on_hover_text("只有勾选后，切换键才会真正切换组合；不勾选也可在[其他功能]里预先设置")
+            .changed()
+        {
+            self.shared.lock().unwrap().fast_switch_enabled = fast;
+            self.scheme_dirty = true;
+            self.log(if fast {
+                "已启用快速切换"
+            } else {
+                "已停用快速切换（键位设置保留）"
             });
         }
-        // 目标默认指向"下一套":新建时多数的意图就是在两套之间来回切
-        let next = if n > 1 { (active + 1) % n } else { 0 };
-        if ui.button("添加切换键位").clicked() {
-            self.shared
-                .lock()
-                .unwrap()
-                .switch_keys
-                .push(SwitchKey { key: 0, target: next });
-            self.scheme_dirty = true;
-        }
+        ui.small("切换键的具体按键/组合键和目标组合，在[其他功能 → 切换键位]里设置。");
 
         if let Some(i) = pick {
             self.select_scheme(i);
@@ -3196,17 +3804,15 @@ impl PadApp {
         if let Some(i) = del {
             self.delete_scheme(i);
         }
-        if let Some(i) = row_del {
-            self.shared.lock().unwrap().switch_keys.remove(i);
-            self.scheme_dirty = true;
-        }
     }
 
     /// 组合改名(生效中的那套连同 `profile.name` 一起改,两者必须一致)
     fn rename_scheme(&mut self, i: usize, name: String) {
         {
             let mut g = self.shared.lock().unwrap();
-            let Some(slot) = g.schemes.get_mut(i) else { return };
+            let Some(slot) = g.schemes.get_mut(i) else {
+                return;
+            };
             slot.name = name;
             if g.active_scheme == i {
                 g.profile.name = g.schemes[i].name.clone();
@@ -3217,270 +3823,320 @@ impl PadApp {
     }
 
     fn ui_binds(&mut self, ui: &mut egui::Ui) {
+        self.ui_binds_list(ui);
+        // ---- 新增绑定 + 组合键 ----
+        self.ui_binds_new(ui);
+        self.apply_pending_scroll(ui);
+    }
+
+    fn apply_pending_scroll(&mut self, ui: &mut egui::Ui) {
+        if self.scroll_to_new && self.ui_style() != theme::UiStyle::Harmony {
+            ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+            self.scroll_to_new = false;
+        }
+    }
+
+    /// 键位绑定列表(可视化风格的键位页也用它;那里新增草稿走 vk 操作栏,不渲染新增节)。
+    fn ui_binds_list(&mut self, ui: &mut egui::Ui) {
         ui.heading("按键映射");
+        ui.label("勾选每行的 [仅 FPS]：该物理键只在 FPS 模式生效并覆盖同键普通映射。")
+            .on_hover_text("FPS 模式运行时优先使用“仅 FPS”键位；退出或按住才退出后恢复普通映射。");
         let mut to_delete: Option<usize> = None;
         let bind_count = self.shared.lock().unwrap().profile.binds.len();
 
         for i in 0..bind_count {
-            ui.horizontal(|ui| {
-                let (key, kind, is_swipe, is_point, fps_only) = {
-                    let g = self.shared.lock().unwrap();
-                    let b = &g.profile.binds[i];
-                    (
-                        b.key,
-                        b.action.kind_name(),
-                        matches!(b.action, Action::Swipe(_)),
-                        matches!(b.action, Action::Tap { .. } | Action::Hold { .. }),
-                        b.fps_only,
-                    )
-                };
-                ui.label(format!("[{kind}]"));
-                let waiting = self.waiting_key == Some(KeySlot::Bind(i));
-                if Self::key_button(ui, waiting, Some(key)).clicked() {
-                    // 开始重新捕获按键:按最新操作优先,退出正在进行的改范围/取点
-                    self.resizing = None;
-                    self.picking = None;
-                    self.waiting_key = Some(KeySlot::Bind(i));
-                }
-
-                let mut fps_only_edit = fps_only;
-                if ui
-                    .checkbox(&mut fps_only_edit, "仅 FPS")
-                    .on_hover_text("开启后该键只在 FPS 模式生效,退出 FPS 自动抬起")
-                    .changed()
-                {
-                    let before = {
-                        let mut g = self.shared.lock().unwrap();
-                        let before = g.profile.clone();
-                        if let Some(b) = g.profile.binds.get_mut(i) {
-                            b.fps_only = fps_only_edit;
-                        }
-                        before
-                    };
-                    self.push_undo_snapshot(before);
-                }
-
-                if is_swipe {
-                    // 滑动:控件已展示起终点/时长/曲线/轨迹,不再重复 desc
-                    let mut pick = self.picking;
-                    let mut easing_edit = self.easing_edit;
-                    let mut swipe_edit = false;
-                    {
-                        let mut g = self.shared.lock().unwrap();
-                        // 撤销快照只取这一个键位:每次拖动/聚焦都会压一份,
-                        // 而整份 Profile 的深拷贝与"键位总数"成正比,这里没必要。
-                        let before = g.profile.binds.get(i).cloned();
-                        if let Some(b) = g.profile.binds.get_mut(i) {
-                            if let Action::Swipe(s) = &mut b.action {
-                                swipe_edit = swipe_controls(
-                                    ui,
-                                    s,
-                                    &mut pick,
-                                    &mut easing_edit,
-                                    CoordSlot::SwipeStart(i),
-                                    CoordSlot::SwipeEnd(i),
-                                    CoordSlot::CircleAngle(i),
-                                    EasingEditTarget::Bind(i),
-                                );
-                            }
-                        }
-                        if swipe_edit {
-                            // 拖拽/聚焦开始那一帧:快照即"修改之前"的状态
-                            if let Some(before) = before {
-                                let mut snapshot = g.profile.clone();
-                                snapshot.binds[i] = before;
-                                self.pending_undo = Some(snapshot);
-                            }
-                        }
-                    }
-                    if let Some(slot) = pick {
-                        self.begin_pick(slot);
-                    } else {
-                        self.picking = None;
-                    }
-                    self.easing_edit = easing_edit;
-                } else if is_point {
-                    // 点按/长按:坐标、时长、响应范围、取点、长短按切换
-                    let (mut do_resize, mut do_convert, mut do_pick) = (false, false, false);
-                    let mut point_edit = false;
-                    // 界面按像素显示与编辑(便于对着截图核对),配置里始终存相对值
-                    let m = self.mapper();
-                    {
-                        let mut g = self.shared.lock().unwrap();
-                        // 同上:撤销快照只需这一个键位
-                        let before = g.profile.binds.get(i).cloned();
-                        if let Some(b) = g.profile.binds.get_mut(i) {
-                            match &mut b.action {
-                                Action::Tap {
-                                    x,
-                                    y,
-                                    duration_ms,
-                                    radius,
-                                } => {
-                                    ui.label("x:");
-                                    let mut px = m.x(*x);
-                                    let r = ui.add(egui::DragValue::new(&mut px).range(COORD_RANGE));
-                                    if r.changed() {
-                                        *x = m.rel_x(px);
-                                    }
-                                    point_edit |= r.drag_started() || r.gained_focus();
-                                    ui.label("y:");
-                                    let mut py = m.y(*y);
-                                    let r = ui.add(egui::DragValue::new(&mut py).range(COORD_RANGE));
-                                    if r.changed() {
-                                        *y = m.rel_y(py);
-                                    }
-                                    point_edit |= r.drag_started() || r.gained_focus();
-                                    ui.label("时长ms:");
-                                    let r = ui
-                                        .add(egui::DragValue::new(duration_ms).range(0..=5000))
-                                        .on_hover_text("0=按下不松手,直到再按一次");
-                                    point_edit |= r.drag_started() || r.gained_focus();
-                                    ui.label("范围:");
-                                    let mut pr = m.len(*radius);
-                                    let r = ui
-                                        .add(egui::DragValue::new(&mut pr).range(0.01..=100000.0));
-                                    if r.changed() {
-                                        *radius = m.rel_len(pr);
-                                    }
-                                    point_edit |= r.drag_started() || r.gained_focus();
-                                }
-                                Action::Hold { x, y, radius } => {
-                                    ui.label("x:");
-                                    let mut px = m.x(*x);
-                                    let r = ui.add(egui::DragValue::new(&mut px).range(COORD_RANGE));
-                                    if r.changed() {
-                                        *x = m.rel_x(px);
-                                    }
-                                    point_edit |= r.drag_started() || r.gained_focus();
-                                    ui.label("y:");
-                                    let mut py = m.y(*y);
-                                    let r = ui.add(egui::DragValue::new(&mut py).range(COORD_RANGE));
-                                    if r.changed() {
-                                        *y = m.rel_y(py);
-                                    }
-                                    point_edit |= r.drag_started() || r.gained_focus();
-                                    ui.label("范围:");
-                                    let mut pr = m.len(*radius);
-                                    let r = ui
-                                        .add(egui::DragValue::new(&mut pr).range(0.01..=100000.0));
-                                    if r.changed() {
-                                        *radius = m.rel_len(pr);
-                                    }
-                                    point_edit |= r.drag_started() || r.gained_focus();
-                                }
-                                _ => {}
-                            }
-                        }
-                        if point_edit {
-                            // 拖拽/聚焦开始那一帧:快照即"修改之前"的状态
-                            if let Some(before) = before {
-                                let mut snapshot = g.profile.clone();
-                                snapshot.binds[i] = before;
-                                self.pending_undo = Some(snapshot);
-                            }
-                        }
-                    }
-                    // 取点
-                    let waiting_p = self.picking == Some(CoordSlot::Bind(i));
-                    if ui
-                        .button(if waiting_p { "点击截图..." } else { "取点" })
-                        .clicked()
-                    {
-                        do_pick = true;
-                    }
-                    // 长短按一键切换(坐标/范围保留)
-                    let is_tap = {
-                        let g = self.shared.lock().unwrap();
-                        matches!(
-                            g.profile.binds.get(i).map(|b| &b.action),
-                            Some(Action::Tap { .. })
-                        )
-                    };
-                    if ui
-                        .button(if is_tap { "转长按" } else { "转点按" })
-                        .clicked()
-                    {
-                        do_convert = true;
-                    }
-                    if ui.button("修改响应范围").clicked() {
-                        do_resize = true;
-                    }
-                    if do_pick {
-                        self.begin_pick(CoordSlot::Bind(i));
-                    }
-                    if do_convert {
-                        self.push_undo();
-                        let mut g = self.shared.lock().unwrap();
-                        if let Some(b) = g.profile.binds.get_mut(i) {
-                            b.action = match &b.action {
-                                Action::Tap {
-                                    x,
-                                    y,
-                                    radius,
-                                    ..
-                                } => Action::Hold {
-                                    x: *x,
-                                    y: *y,
-                                    radius: *radius,
-                                },
-                                Action::Hold { x, y, radius } => Action::Tap {
-                                    x: *x,
-                                    y: *y,
-                                    duration_ms: crate::keymap::DEFAULT_TAP_DURATION_MS,
-                                    radius: *radius,
-                                },
-                                _ => unreachable!(),
-                            };
-                        }
-                    }
-                    if do_resize {
-                        self.begin_resize(i);
-                    }
-                } else {
-                    // 系统键
-                    let desc = {
-                        let g = self.shared.lock().unwrap();
-                        g.profile.binds[i].action.describe()
-                    };
-                    ui.label(desc);
-                    let mut g = self.shared.lock().unwrap();
-                    if let Some(b) = g.profile.binds.get_mut(i) {
-                        if let Action::AndroidKey { keycode } = &mut b.action {
-                            ui.label("keycode:");
-                            ui.add(egui::DragValue::new(keycode).range(0..=999));
-                        }
-                    }
-                }
-
-                if ui.button("删除").clicked() {
-                    to_delete = Some(i);
-                }
-            });
+            let is_macro = {
+                let g = self.shared.lock().unwrap();
+                matches!(
+                    g.profile.binds.get(i).map(|b| &b.action),
+                    Some(Action::Macro(_))
+                )
+            };
+            if is_macro {
+                continue;
+            }
+            if let Some(d) = ui.horizontal(|ui| self.ui_bind_row(ui, i)).inner {
+                to_delete = Some(d);
+            }
         }
         if let Some(i) = to_delete {
-            self.push_undo();
-            self.shared.lock().unwrap().profile.binds.remove(i);
-            // 交互态若指向刚删掉的条目就一并收尾,免得残留在失效索引上
-            if self.resizing == Some(ResizeTarget::Bind(i)) {
-                self.resizing = None;
-            }
-            self.log("已删除绑定");
+            self.delete_bind(i);
         }
+    }
 
-        // ---- 新增绑定 ----
+    /// 渲染第 i 条键位绑定(单行,完整编辑器)。返回 Some(i) 表示该条要删除。
+    /// ui_binds 的列表与可视化风格的操作栏共用这一份,保证两处行为完全一致。
+    fn ui_bind_row(&mut self, ui: &mut egui::Ui, i: usize) -> Option<usize> {
+        let mut to_delete: Option<usize> = None;
+        ui.horizontal(|ui| {
+            let (key, kind, is_swipe, is_point, fps_only) = {
+                let g = self.shared.lock().unwrap();
+                let b = &g.profile.binds[i];
+                (
+                    b.key,
+                    b.action.kind_name(),
+                    matches!(b.action, Action::Swipe(_)),
+                    matches!(b.action, Action::Tap { .. } | Action::Hold { .. }),
+                    b.fps_only,
+                )
+            };
+            ui.label(format!("[{kind}]"));
+            let waiting = self.waiting_key == Some(KeySlot::Bind(i));
+            if Self::key_button(ui, waiting, Some(key)).clicked() {
+                // 开始重新捕获按键:按最新操作优先,退出正在进行的改范围/取点
+                self.resizing = None;
+                self.picking = None;
+                self.waiting_key = Some(KeySlot::Bind(i));
+            }
+
+            let mut fps_only_edit = fps_only;
+            if ui
+                .checkbox(&mut fps_only_edit, "仅 FPS")
+                .on_hover_text("开启后该键只在 FPS 模式生效,退出 FPS 自动抬起")
+                .changed()
+            {
+                let before = {
+                    let mut g = self.shared.lock().unwrap();
+                    let before = g.profile.clone();
+                    if let Some(b) = g.profile.binds.get_mut(i) {
+                        b.fps_only = fps_only_edit;
+                    }
+                    before
+                };
+                self.push_undo_snapshot(before);
+            }
+
+            if is_swipe {
+                // 滑动:控件已展示起终点/时长/曲线/轨迹,不再重复 desc
+                let mut pick = self.picking;
+                let mut easing_edit = self.easing_edit;
+                let mut swipe_edit = false;
+                {
+                    let mut g = self.shared.lock().unwrap();
+                    // 撤销快照只取这一个键位:每次拖动/聚焦都会压一份,
+                    // 而整份 Profile 的深拷贝与"键位总数"成正比,这里没必要。
+                    let before = g.profile.binds.get(i).cloned();
+                    if let Some(b) = g.profile.binds.get_mut(i) {
+                        if let Action::Swipe(s) = &mut b.action {
+                            swipe_edit = swipe_controls(
+                                ui,
+                                s,
+                                &mut pick,
+                                &mut easing_edit,
+                                CoordSlot::SwipeStart(i),
+                                CoordSlot::SwipeEnd(i),
+                                CoordSlot::CircleAngle(i),
+                                EasingEditTarget::Bind(i),
+                            );
+                        }
+                    }
+                    if swipe_edit {
+                        // 拖拽/聚焦开始那一帧:快照即"修改之前"的状态
+                        if let Some(before) = before {
+                            let mut snapshot = g.profile.clone();
+                            snapshot.binds[i] = before;
+                            self.pending_undo = Some(snapshot);
+                        }
+                    }
+                }
+                if let Some(slot) = pick {
+                    self.begin_pick(slot);
+                } else {
+                    self.picking = None;
+                }
+                self.easing_edit = easing_edit;
+            } else if is_point {
+                // 点按/长按:坐标、时长、响应范围、取点、长短按切换
+                let (mut do_resize, mut do_convert, mut do_pick) = (false, false, false);
+                let mut point_edit = false;
+                // 界面按像素显示与编辑(便于对着截图核对),配置里始终存相对值
+                let m = self.mapper();
+                {
+                    let mut g = self.shared.lock().unwrap();
+                    // 同上:撤销快照只需这一个键位
+                    let before = g.profile.binds.get(i).cloned();
+                    if let Some(b) = g.profile.binds.get_mut(i) {
+                        match &mut b.action {
+                            Action::Tap {
+                                x,
+                                y,
+                                duration_ms,
+                                radius,
+                            } => {
+                                ui.label("x:");
+                                let mut px = m.x(*x);
+                                let r = ui.add(egui::DragValue::new(&mut px).range(COORD_RANGE));
+                                if r.changed() {
+                                    *x = m.rel_x(px);
+                                }
+                                point_edit |= r.drag_started() || r.gained_focus();
+                                ui.label("y:");
+                                let mut py = m.y(*y);
+                                let r = ui.add(egui::DragValue::new(&mut py).range(COORD_RANGE));
+                                if r.changed() {
+                                    *y = m.rel_y(py);
+                                }
+                                point_edit |= r.drag_started() || r.gained_focus();
+                                ui.label("时长ms:");
+                                let r = ui
+                                    .add(egui::DragValue::new(duration_ms).range(0..=5000))
+                                    .on_hover_text("0=按下不松手,直到再按一次");
+                                point_edit |= r.drag_started() || r.gained_focus();
+                                ui.label("范围:");
+                                let mut pr = m.len(*radius);
+                                let r =
+                                    ui.add(egui::DragValue::new(&mut pr).range(0.01..=100000.0));
+                                if r.changed() {
+                                    *radius = m.rel_len(pr);
+                                }
+                                point_edit |= r.drag_started() || r.gained_focus();
+                            }
+                            Action::Hold { x, y, radius } => {
+                                ui.label("x:");
+                                let mut px = m.x(*x);
+                                let r = ui.add(egui::DragValue::new(&mut px).range(COORD_RANGE));
+                                if r.changed() {
+                                    *x = m.rel_x(px);
+                                }
+                                point_edit |= r.drag_started() || r.gained_focus();
+                                ui.label("y:");
+                                let mut py = m.y(*y);
+                                let r = ui.add(egui::DragValue::new(&mut py).range(COORD_RANGE));
+                                if r.changed() {
+                                    *y = m.rel_y(py);
+                                }
+                                point_edit |= r.drag_started() || r.gained_focus();
+                                ui.label("范围:");
+                                let mut pr = m.len(*radius);
+                                let r =
+                                    ui.add(egui::DragValue::new(&mut pr).range(0.01..=100000.0));
+                                if r.changed() {
+                                    *radius = m.rel_len(pr);
+                                }
+                                point_edit |= r.drag_started() || r.gained_focus();
+                            }
+                            _ => {}
+                        }
+                    }
+                    if point_edit {
+                        // 拖拽/聚焦开始那一帧:快照即"修改之前"的状态
+                        if let Some(before) = before {
+                            let mut snapshot = g.profile.clone();
+                            snapshot.binds[i] = before;
+                            self.pending_undo = Some(snapshot);
+                        }
+                    }
+                }
+                // 取点
+                let waiting_p = self.picking == Some(CoordSlot::Bind(i));
+                if ui
+                    .button(if waiting_p {
+                        "点击截图..."
+                    } else {
+                        "取点"
+                    })
+                    .clicked()
+                {
+                    do_pick = true;
+                }
+                // 长短按一键切换(坐标/范围保留)
+                let is_tap = {
+                    let g = self.shared.lock().unwrap();
+                    matches!(
+                        g.profile.binds.get(i).map(|b| &b.action),
+                        Some(Action::Tap { .. })
+                    )
+                };
+                if ui
+                    .button(if is_tap { "转长按" } else { "转点按" })
+                    .clicked()
+                {
+                    do_convert = true;
+                }
+                if ui.button("修改响应范围").clicked() {
+                    do_resize = true;
+                }
+                if do_pick {
+                    self.begin_pick(CoordSlot::Bind(i));
+                }
+                if do_convert {
+                    self.push_undo();
+                    let mut g = self.shared.lock().unwrap();
+                    if let Some(b) = g.profile.binds.get_mut(i) {
+                        b.action = match &b.action {
+                            Action::Tap { x, y, radius, .. } => Action::Hold {
+                                x: *x,
+                                y: *y,
+                                radius: *radius,
+                            },
+                            Action::Hold { x, y, radius } => Action::Tap {
+                                x: *x,
+                                y: *y,
+                                duration_ms: crate::keymap::DEFAULT_TAP_DURATION_MS,
+                                radius: *radius,
+                            },
+                            _ => unreachable!(),
+                        };
+                    }
+                }
+                if do_resize {
+                    self.begin_resize(i);
+                }
+            } else {
+                // 系统键
+                let desc = {
+                    let g = self.shared.lock().unwrap();
+                    g.profile.binds[i].action.describe()
+                };
+                ui.label(desc);
+                let mut g = self.shared.lock().unwrap();
+                if let Some(b) = g.profile.binds.get_mut(i) {
+                    if let Action::AndroidKey { keycode } = &mut b.action {
+                        ui.label("keycode:");
+                        ui.add(egui::DragValue::new(keycode).range(0..=999));
+                    }
+                }
+            }
+
+            if ui.button("删除").clicked() {
+                to_delete = Some(i);
+            }
+        });
+        to_delete
+    }
+
+    /// 删除第 i 条键位绑定(撤销 + 移除 + 交互态复位)。
+    fn delete_bind(&mut self, i: usize) {
+        self.push_undo();
+        self.shared.lock().unwrap().profile.binds.remove(i);
+        // 交互态若指向刚删掉的条目就一并收尾,免得残留在失效索引上
+        if self.resizing == Some(ResizeTarget::Bind(i)) {
+            self.resizing = None;
+        }
+        self.log("已删除绑定");
+    }
+
+    /// 新增绑定(草稿编辑器)+ 组合键列表。ui_binds 与可视化操作栏共用。
+    fn ui_binds_new(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.label("新增:");
         ui.horizontal(|ui| {
             let waiting = self.waiting_key == Some(KeySlot::NewBind);
+            let had_draft = self.draft.key.is_some()
+                || self.draft_active
+                || self.picking == Some(CoordSlot::NewBind)
+                || self.waiting_key == Some(KeySlot::NewBind);
             if Self::key_button(ui, waiting, self.draft.key).clicked() {
-                // 开始新增:其它交互(改范围/取点)一律让位
+                // Re-capturing an existing draft must preserve its point and radius.
                 self.resizing = None;
                 self.picking = None;
                 self.waiting_key = Some(KeySlot::NewBind);
                 self.draft_active = true;
-                // 草稿坐标是像素:按当前屏幕尺寸把预览放到画面中央
-                self.reset_draft_to_screen();
+                // 默认风格的新增节建的是普通键位(仅 FPS 草稿只在可视化 FPS 页产生)
+                self.draft.fps_only = false;
+                if !had_draft {
+                    self.reset_draft_to_screen();
+                }
             }
             let kind_before = self.draft.kind;
             egui::ComboBox::from_id_salt("newkind")
@@ -3511,7 +4167,11 @@ impl PadApp {
                     ui.add(egui::DragValue::new(&mut self.draft.radius).range(0.01..=100000.0));
                     let waiting_p = self.picking == Some(CoordSlot::NewBind);
                     if ui
-                        .button(if waiting_p { "点击截图..." } else { "取点" })
+                        .button(if waiting_p {
+                            "点击截图..."
+                        } else {
+                            "取点"
+                        })
                         .clicked()
                     {
                         self.begin_pick(CoordSlot::NewBind);
@@ -3524,7 +4184,10 @@ impl PadApp {
                     let mut easing_edit = self.easing_edit;
                     let mut tmp = Swipe {
                         // 草稿是像素坐标,滑动控件按像素编辑
-                        start: (self.draft.swipe_start.0 as f32, self.draft.swipe_start.1 as f32),
+                        start: (
+                            self.draft.swipe_start.0 as f32,
+                            self.draft.swipe_start.1 as f32,
+                        ),
                         end: (self.draft.swipe_end.0 as f32, self.draft.swipe_end.1 as f32),
                         duration_ms: self.draft.swipe_duration_ms,
                         easing: self.draft.swipe_easing,
@@ -3556,64 +4219,2235 @@ impl PadApp {
                         self.draft_active = true;
                     }
                 }
-                _ => {
+                3 => {
                     ui.label("keycode(返回=4 主页=3):");
                     ui.add(egui::DragValue::new(&mut self.draft.keycode).range(0..=999));
                 }
+                _ => {
+                    ui.horizontal(|ui| {
+                        ui.label("keycode(返回=4 主页=3):");
+                        ui.add(egui::DragValue::new(&mut self.draft.keycode).range(0..=999));
+                    });
+                }
             }
-            if ui.button("添加").clicked() {
-                if let Some(key) = self.draft.key {
-                    self.push_undo();
-                    // 草稿是像素坐标,入配置前换算成相对值
-                    let m = self.mapper();
-                    let (dx, dy) = (self.draft.x, self.draft.y);
-                    let action = match self.draft.kind {
-                        0 => Action::Tap {
-                            x: m.rel_x(dx),
-                            y: m.rel_y(dy),
-                            duration_ms: self.draft.tap_duration_ms,
-                            radius: m.rel_len(self.draft.radius),
-                        },
-                        1 => Action::Hold {
-                            x: m.rel_x(dx),
-                            y: m.rel_y(dy),
-                            radius: m.rel_len(self.draft.radius),
-                        },
-                        2 => Action::Swipe(Swipe {
-                            start: (
-                                m.rel_x(self.draft.swipe_start.0),
-                                m.rel_y(self.draft.swipe_start.1),
-                            ),
-                            end: (
-                                m.rel_x(self.draft.swipe_end.0),
-                                m.rel_y(self.draft.swipe_end.1),
-                            ),
-                            duration_ms: self.draft.swipe_duration_ms,
-                            easing: self.draft.swipe_easing,
-                            path: self.draft.swipe_path,
-                        }),
-                        _ => Action::AndroidKey {
-                            keycode: self.draft.keycode,
-                        },
-                    };
-                    self.shared
-                        .lock()
-                        .unwrap()
-                        .profile
-                        .binds
-                        .push(KeyBind { key, action, fps_only: false });
+            if ui.button("新增").clicked() {
+                self.commit_draft();
+            }
+        });
+
+        self.ui_combos(ui);
+    }
+
+    /// 把当前草稿提交为一条键位绑定。键未捕获时只记日志,返回 false。
+    /// 默认风格的[添加]按钮与可视化操作栏的[确定添加]共用,行为完全一致。
+    fn commit_draft(&mut self) -> bool {
+        let Some(key) = self.draft.key else {
+            self.log("请先捕获按键");
+            return false;
+        };
+        self.push_undo();
+        // 草稿是像素坐标,入配置前换算成相对值
+        let m = self.mapper();
+        let (dx, dy) = (self.draft.x, self.draft.y);
+        let action = match self.draft.kind {
+            0 => Action::Tap {
+                x: m.rel_x(dx),
+                y: m.rel_y(dy),
+                duration_ms: self.draft.tap_duration_ms,
+                radius: m.rel_len(self.draft.radius),
+            },
+            1 => Action::Hold {
+                x: m.rel_x(dx),
+                y: m.rel_y(dy),
+                radius: m.rel_len(self.draft.radius),
+            },
+            2 => Action::Swipe(Swipe {
+                start: (
+                    m.rel_x(self.draft.swipe_start.0),
+                    m.rel_y(self.draft.swipe_start.1),
+                ),
+                end: (
+                    m.rel_x(self.draft.swipe_end.0),
+                    m.rel_y(self.draft.swipe_end.1),
+                ),
+                duration_ms: self.draft.swipe_duration_ms,
+                easing: self.draft.swipe_easing,
+                path: self.draft.swipe_path,
+            }),
+            3 => Action::AndroidKey {
+                keycode: self.draft.keycode,
+            },
+            _ => Action::AndroidKey {
+                keycode: self.draft.keycode,
+            },
+        };
+        self.shared.lock().unwrap().profile.binds.push(KeyBind {
+            key,
+            action,
+            // FPS 页建的草稿只入"仅 FPS"键位;键位页建的为普通键位
+            fps_only: self.draft.fps_only,
+        });
+        self.draft.key = None;
+        // 添加完成即彻底收尾:草稿预览、取点、改范围等交互全部结束,
+        // 不再"刚添加完又停在取点状态"。之后想改,再点该条的[取点]即可。
+        self.draft_active = false;
+        self.picking = None;
+        self.resizing = None;
+        self.log("已新增按键映射");
+        self.scroll_to_new = true;
+        true
+    }
+
+    // ==================== 可视化风格:虚拟键盘交互 ====================
+    //
+    // 交互模型(用户原话的落实):
+    //   * 点空闲键 -> 新建草稿并立刻进入截图取点(操作栏出现,可[取消取点]);
+    //   * 点已设置的键 -> 选中它,操作栏显示与右栏列表**同一套**编辑器
+    //     (ui_bind_row / ui_vk_special —— 功能是"多加"进去的,不是替换);
+    //   * 取点中,虚拟键盘上对应键呼吸闪烁(正在取点中时相应位置会亮起);
+    //   * 键位页与 FPS 页的**显示能力完全一样**(同一份 vk_lights / 同一组勾选),
+    //     区别只有两点:FPS 页默认只显示"仅 FPS"键位(普通映射/组合键/摇杆要手动勾),
+    //     以及 FPS 页只允许编辑 FPS 相关的键。
+
+    /// 键位页:显示开关 + 虚拟键盘/鼠标 + 操作栏 + 全部既有列表(列表全保留)。
+    fn ui_visual_keys(&mut self, ui: &mut egui::Ui) {
+        ui.heading("键位(可视化)");
+        ui.horizontal(|ui| self.vk_filters.ui(ui, "vk_filters_keys"))
+            .response
+            .on_hover_text("控制虚拟键盘上哪几类已设置的键亮起(不影响下方列表与实际映射)");
+        self.ui_vk_area(ui, false);
+        self.ui_vk_panel(ui, false);
+        if self.vk_add_kind == VkAddKind::Key {
+            self.ui_binds_list(ui);
+            ui.separator();
+            if !self.vk_bottom_add_active {
+                if Self::tab_button(ui, "＋ 新增按键映射", false, self.theme().ok) {
+                    self.cancel_draft();
+                    self.reset_draft_to_screen();
                     self.draft.key = None;
-                    // 添加完成即彻底收尾:草稿预览、取点、改范围等交互全部结束,
-                    // 不再"刚添加完又停在取点状态"。之后想改,再点该条的[取点]即可。
-                    self.draft_active = false;
-                    self.picking = None;
-                    self.resizing = None;
-                    self.log("已添加绑定");
-                } else {
-                    self.log("请先捕获按键");
+                    self.draft.fps_only = false;
+                    self.draft_active = true;
+                    self.vk_sel = None;
+                    self.waiting_key = Some(KeySlot::NewBind);
+                    self.vk_bottom_add_active = true;
+                    self.scroll_to_new = true;
+                }
+            } else {
+                self.ui_vk_draft(ui);
+            }
+        }
+        self.apply_pending_scroll(ui);
+    }
+
+    /// FPS 页:虚拟键盘(与键位页同一套显示能力,默认只亮 FPS 键位)
+    /// + 既有 FPS 面板(全保留)。功能上只能设置 FPS 相关键。
+    fn ui_visual_fps(&mut self, ui: &mut egui::Ui, captured: bool) {
+        ui.horizontal(|ui| self.vk_fps_filters.ui(ui, "vk_filters_fps"))
+            .response
+            .on_hover_text(
+                "与[键位]页一样:想在这里看到普通映射/组合键/摇杆,勾上即可。\n\
+                 默认只显示 FPS 独有的键位。",
+            );
+        self.ui_vk_area(ui, true);
+        self.ui_vk_panel(ui, true);
+        self.apply_pending_scroll(ui);
+        let _ = captured; // FPS 面板现在由“新增项目 → 瞄准锚点”在操作栏中展开
+    }
+
+    /// 虚拟键盘 + 虚拟鼠标 + 下方操作栏。fps_tab=true 时空闲键建"仅 FPS"草稿,
+    /// 非 FPS 目标不可选(FPS 页功能上只能设置 FPS)。
+    fn ui_vk_area(&mut self, ui: &mut egui::Ui, fps_tab: bool) {
+        // 键亮表:键码 -> (语义色, 悬停说明)。一次锁全建好,绘制期间不再碰配置锁。
+        let filters = if fps_tab {
+            self.vk_fps_filters
+        } else {
+            self.vk_filters
+        };
+        let lights = self.vk_lights(filters);
+        // 取点中会呼吸闪烁的键(正在取点中时虚拟键盘相应位置亮起)
+        let pulse_code = self.vk_pulse_code();
+        // 操作栏正在编辑的键(加亮 + 白描边)
+        let sel_code = self.vk_sel_code();
+        let th = self.theme();
+        let ok = th.ok;
+        let combo_waiting =
+            self.vk_add_kind == VkAddKind::Combo && !self.vk_combo_pending.is_empty();
+        let combo_first = self.vk_combo_pending.first().copied();
+        let pulse = if pulse_code.is_some() && !combo_waiting {
+            Some(ui.time() * 4.0)
+        } else {
+            None
+        };
+        let pulse_time = ui.time() * 4.0;
+        // 绘制参数:已设置的键 = 语义色键帽(亮起);空闲键 = 老式机械键帽的空壳
+        // (半透明但看得见,见 KeyLook::idle)。选中键再加亮;取点中的键由 show_* 呼吸闪烁。
+        let look_of = move |code: u16| {
+            let mut look = if let Some((c, t)) = lights.get(&code) {
+                keyboard::KeyLook {
+                    fill: theme::with_alpha(*c, 176),
+                    side: theme::with_alpha(darken(*c, 60), 224),
+                    stroke: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 190),
+                    text: egui::Color32::WHITE,
+                    tip: Some(t.clone()),
+                }
+            } else {
+                keyboard::KeyLook::idle()
+            };
+            if combo_waiting && Some(code) == combo_first {
+                look.fill = theme::with_alpha(ok, 220);
+                look.side = theme::with_alpha(darken(ok, 70), 235);
+                look.stroke = egui::Color32::WHITE;
+                look.tip = Some("组合键第一个键已选".into());
+            } else if combo_waiting {
+                let k = (pulse_time.sin() * 0.5 + 0.5) as f32;
+                look.fill = theme::with_alpha(th.accent, (70.0 + 120.0 * k) as u8);
+                look.side = theme::with_alpha(darken(th.accent, 60), (150.0 + 70.0 * k) as u8);
+                look.stroke = egui::Color32::WHITE;
+                look.tip = Some("点击这里选组合键下一个键".into());
+            } else if Some(code) == sel_code {
+                look.fill = theme::with_alpha(ok, 220);
+                look.side = theme::with_alpha(darken(ok, 70), 235);
+                look.stroke = egui::Color32::WHITE;
+            }
+            look
+        };
+        let (key_click, mouse_click) = ui
+            .horizontal(|ui| {
+                // 右边 96px 留给虚拟鼠标(86 宽 + 10 间距)
+                let kc = keyboard::show_keyboard(ui, "vk_kb", &look_of, pulse, 96.0);
+                ui.add_space(10.0);
+                let mc = keyboard::show_mouse(ui, "vk_mouse", &look_of, pulse);
+                (kc, mc)
+            })
+            .inner;
+        if let Some(code) = key_click.or(mouse_click) {
+            self.vk_on_key_clicked(code, fps_tab);
+        }
+    }
+
+    /// 预扫描配置建"键亮表":键码 -> (语义色, 悬停说明)。
+    /// 颜色语义:键位=绿 / 仅FPS=橙 / 摇杆方向=青·品红 / 临时启用=品红 /
+    /// 组合键与切换键=蓝 / 瞄准三键与总开关=红。
+    ///
+    /// `filters` 决定"哪几类亮起" —— **键位页与 FPS 页走同一套逻辑**,
+    /// 只是两页的默认勾选不同(FPS 页默认只看"仅 FPS"键位)。
+    /// 瞄准三键与总开关键属于 FPS 语义,只要 `filters.fps` 为真就亮。
+    fn vk_lights(
+        &self,
+        filters: VkFilters,
+    ) -> std::collections::HashMap<u16, (egui::Color32, String)> {
+        fn put(
+            m: &mut std::collections::HashMap<u16, (egui::Color32, String)>,
+            code: u16,
+            c: egui::Color32,
+            tip: String,
+        ) {
+            if code != 0 {
+                m.entry(code).or_insert((c, tip));
+            }
+        }
+        let mut m = std::collections::HashMap::new();
+        let th = self.theme();
+        let g = self.shared.lock().unwrap();
+        let p = &g.profile;
+        // 键位(普通 / 宏 / 仅 FPS 各自受一个勾选控制)
+        for b in p.binds.iter() {
+            let (on, c, tag) = if matches!(b.action, Action::Macro(_)) {
+                (
+                    filters.macros || (b.fps_only && filters.fps),
+                    th.key_macro,
+                    "宏",
+                )
+            } else if b.fps_only {
+                (filters.fps, th.warn, "仅FPS")
+            } else {
+                (filters.binds, th.ok, "键位")
+            };
+            if on {
+                put(&mut m, b.key, c, format!("[{tag}] {}", b.action.describe()));
+            }
+        }
+        for (wi, w) in p.wheels.iter().enumerate() {
+            let (on, c, tag) = if w.temp.is_some() {
+                (filters.wheels_temp, th.wheel_temp, "临时")
+            } else {
+                (filters.wheels_perm, th.wheel_perm, "永久")
+            };
+            if !on {
+                continue;
+            }
+            for (_, code) in w.active_dirs() {
+                put(&mut m, code, c, format!("摇杆#{}({tag}) 方向键", wi + 1));
+            }
+            if let Some(t) = w.temp.as_ref() {
+                put(
+                    &mut m,
+                    t.key,
+                    th.wheel_enable,
+                    format!("摇杆#{} {tag}启用键", wi + 1),
+                );
+            }
+        }
+        if filters.combos {
+            for (ci, c) in p.combos.iter().enumerate() {
+                for (si, &k) in c.keys.iter().enumerate() {
+                    put(
+                        &mut m,
+                        k,
+                        th.accent,
+                        format!("组合键#{} 第{}键", ci + 1, si + 1),
+                    );
+                }
+            }
+            for (si, s) in g.switch_keys.iter().enumerate() {
+                put(
+                    &mut m,
+                    s.key,
+                    th.accent,
+                    format!("切换键位#{}(按下切到它指向的组合)", si + 1),
+                );
+            }
+        }
+        // 瞄准三键:属于 FPS 语义,受"显示FPS"勾选控制(FPS 页默认为真)
+        if filters.fps {
+            put(
+                &mut m,
+                p.aim.hold_key,
+                th.danger,
+                "FPS 瞄准门控键(按住开镜)".into(),
+            );
+            put(
+                &mut m,
+                p.aim.toggle_key,
+                th.danger,
+                "FPS 模式独立开关".into(),
+            );
+            put(
+                &mut m,
+                p.aim.suspend_key,
+                th.danger,
+                "按住暂时退出 FPS 并显示鼠标".into(),
+            );
+        }
+        put(
+            &mut m,
+            p.cursor_toggle_key,
+            th.accent,
+            "全局鼠标消隐切换键".into(),
+        );
+        // 总开关键两页都亮(全局键)
+        put(&mut m, p.toggle_key, th.danger, "映射总开关键".into());
+        m
+    }
+
+    /// 取点中应当呼吸闪烁的键码(取点目标本身在哪条键上就闪哪条)
+    fn vk_pulse_code(&self) -> Option<u16> {
+        let g = self.shared.lock().unwrap();
+        match self.picking? {
+            CoordSlot::NewBind => self.draft.key,
+            CoordSlot::Bind(i)
+            | CoordSlot::SwipeStart(i)
+            | CoordSlot::SwipeEnd(i)
+            | CoordSlot::CircleAngle(i) => g.profile.binds.get(i).map(|b| b.key),
+            CoordSlot::WheelCenter(i) => g
+                .profile
+                .wheels
+                .get(i)
+                .and_then(|w| w.temp.as_ref().map(|t| t.key)),
+            _ => None,
+        }
+    }
+
+    /// 操作栏正在编辑的目标对应的键码(用于加亮显示)
+    fn vk_sel_code(&self) -> Option<u16> {
+        let g = self.shared.lock().unwrap();
+        match self.vk_sel? {
+            VkSel::New => self.draft.key,
+            VkSel::Bind(i) => g.profile.binds.get(i).map(|b| b.key),
+            VkSel::Macro(i) => g.profile.binds.get(i).map(|b| b.key),
+            VkSel::Toggle => Some(g.profile.toggle_key),
+            VkSel::CursorToggle => Some(g.profile.cursor_toggle_key),
+            VkSel::AimHold => Some(g.profile.aim.hold_key),
+            VkSel::AimToggle => Some(g.profile.aim.toggle_key),
+            VkSel::AimSuspend => Some(g.profile.aim.suspend_key),
+            VkSel::WheelDir { wheel, dir } => g
+                .profile
+                .wheels
+                .get(wheel)
+                .and_then(|w| w.active_dirs().get(dir).map(|(_, key)| *key)),
+            VkSel::WheelEnable(i) => g
+                .profile
+                .wheels
+                .get(i)
+                .and_then(|w| w.temp.as_ref().map(|t| t.key)),
+            VkSel::SwitchKey(i) => g.switch_keys.get(i).map(|s| s.key),
+            VkSel::SwitchKeySecond(i) => g.switch_keys.get(i).and_then(|s| s.keys.get(1)).copied(),
+            VkSel::ComboKey { combo, slot } => g
+                .profile
+                .combos
+                .get(combo)
+                .and_then(|c| c.keys.get(slot))
+                .copied(),
+        }
+    }
+
+    /// 键码 -> 它当前被用在哪里(优先级:键位 > 特殊键 > 摇杆 > 组合键/切换键)
+    fn vk_find_target(&self, code: u16) -> Option<VkSel> {
+        if code == 0 {
+            return None;
+        }
+        let g = self.shared.lock().unwrap();
+        let p = &g.profile;
+        if let Some(i) = p.binds.iter().position(|b| b.key == code) {
+            return Some(if matches!(p.binds[i].action, Action::Macro(_)) {
+                VkSel::Macro(i)
+            } else {
+                VkSel::Bind(i)
+            });
+        }
+        if p.toggle_key == code {
+            return Some(VkSel::Toggle);
+        }
+        if p.cursor_toggle_key == code {
+            return Some(VkSel::CursorToggle);
+        }
+        if p.aim.hold_key == code {
+            return Some(VkSel::AimHold);
+        }
+        if p.aim.toggle_key == code {
+            return Some(VkSel::AimToggle);
+        }
+        if p.aim.suspend_key == code {
+            return Some(VkSel::AimSuspend);
+        }
+        for (wi, w) in p.wheels.iter().enumerate() {
+            for (dir, (_, kc)) in w.active_dirs().iter().enumerate() {
+                if *kc == code {
+                    return Some(VkSel::WheelDir { wheel: wi, dir });
+                }
+            }
+            if w.temp.as_ref().map(|t| t.key) == Some(code) {
+                return Some(VkSel::WheelEnable(wi));
+            }
+        }
+        if let Some(i) = g.switch_keys.iter().position(|s| s.key == code) {
+            return Some(VkSel::SwitchKey(i));
+        }
+        if let Some(i) = g
+            .switch_keys
+            .iter()
+            .position(|s| s.keys.get(1).copied() == Some(code))
+        {
+            return Some(VkSel::SwitchKeySecond(i));
+        }
+        for (ci, c) in p.combos.iter().enumerate() {
+            if let Some(si) = c.keys.iter().position(|&k| k == code) {
+                return Some(VkSel::ComboKey {
+                    combo: ci,
+                    slot: si,
+                });
+            }
+        }
+        None
+    }
+
+    /// 该目标是否属于 FPS 范畴(FPS 页只允许编辑这些)
+    fn vk_sel_is_fps(&self, sel: &VkSel) -> bool {
+        let g = self.shared.lock().unwrap();
+        match sel {
+            VkSel::Bind(i) => g.profile.binds.get(*i).map(|b| b.fps_only).unwrap_or(false),
+            VkSel::Macro(i) => g.profile.binds.get(*i).map(|b| b.fps_only).unwrap_or(false),
+            VkSel::AimHold | VkSel::AimToggle | VkSel::AimSuspend => true,
+            _ => false,
+        }
+    }
+
+    /// 虚拟键盘/鼠标上某键被点击:
+    ///   已设置 -> 选中它,操作栏显示对应编辑器;
+    ///   空闲   -> 新建草稿并立刻进入截图取点(可随时[取消取点])。
+    fn vk_on_key_clicked(&mut self, code: u16, fps_tab: bool) {
+        match self.vk_add_kind {
+            VkAddKind::Key => {}
+            VkAddKind::Combo => {
+                self.vk_combo_key_clicked(code, fps_tab);
+                return;
+            }
+            VkAddKind::Wheel => {
+                self.log("轮盘请在“新增项目”旁点[＋ 新增轮盘]，再在下方设置");
+                return;
+            }
+            VkAddKind::Aim => {
+                self.log("准星/瞄准锚点请在下方点[取锚点]并点击截图");
+                return;
+            }
+        }
+        let name = key_name(code);
+        if let Some(sel) = self.vk_find_target(code) {
+            // 虚拟键盘只允许直接编辑临时轮盘的方向键。永久轮盘和任何轮盘的
+            // 启用键必须在“摇杆映射”页设置，避免误改后出现方向键/启用键冲突。
+            match sel {
+                VkSel::WheelEnable(_) => {
+                    self.log("轮盘启用键不能在虚拟键盘上直接设置，请到[摇杆映射]页修改");
+                    return;
+                }
+                VkSel::WheelDir { wheel, .. } => {
+                    let is_temp = {
+                        let g = self.shared.lock().unwrap();
+                        g.profile
+                            .wheels
+                            .get(wheel)
+                            .map(|w| w.temp.is_some())
+                            .unwrap_or(false)
+                    };
+                    if !is_temp {
+                        self.log(
+                            "实体轮盘方向键请在[摇杆映射]页设置；虚拟键盘只设置临时轮盘方向键",
+                        );
+                        return;
+                    }
+                }
+                _ => {}
+            }
+            if fps_tab && !self.vk_sel_is_fps(&sel) {
+                self.log(format!(
+                    "{name} 已被普通映射/摇杆/组合键占用: FPS 页只能设置 FPS 相关键,请到[键位]页修改它"
+                ));
+                return;
+            }
+            // 选中已设置的键:退出进行中的取点/等待,操作栏显示它的编辑器
+            self.picking = None;
+            self.waiting_key = None;
+            self.resizing = None;
+            self.vk_sel = Some(sel);
+            return;
+        }
+        // 空闲键:新建草稿 -> 立刻进入取点
+        self.cancel_draft();
+        self.reset_draft_to_screen();
+        self.draft.key = Some(code);
+        self.draft.fps_only = fps_tab;
+        self.draft_active = true;
+        self.vk_sel = Some(VkSel::New);
+        self.begin_pick(CoordSlot::NewBind);
+        self.log(format!(
+            "已选中 {name}: 请在截图上点击取点(或点[取消取点]放弃)"
+        ));
+    }
+
+    /// 可视化“组合键”新增：第一次点选前缀，第二次点选成员。
+    /// 第二次后立即生成默认点按动作，下方组合键编辑器继续负责动作与取点。
+    fn vk_combo_key_clicked(&mut self, code: u16, fps_tab: bool) {
+        let name = key_name(code);
+        if self.vk_combo_pending.is_empty() {
+            self.vk_combo_pending.push(code);
+            self.log(format!("组合键第一个键已选: {name}，请再点第二个键"));
+            return;
+        }
+        if self.vk_combo_pending[0] == code {
+            self.log("组合键的前两个键不能相同");
+            return;
+        }
+        let first = self.vk_combo_pending[0];
+        self.push_undo();
+        let m = self.mapper();
+        let (x, y) = (m.rel_x(540), m.rel_y(960));
+        let index = {
+            let mut g = self.shared.lock().unwrap();
+            g.profile.combos_enabled = true;
+            g.profile.combos.push(KeyCombo {
+                keys: vec![first, code],
+                action: Action::Tap {
+                    x,
+                    y,
+                    duration_ms: crate::keymap::DEFAULT_TAP_DURATION_MS,
+                    radius: crate::keymap::DEFAULT_RADIUS,
+                },
+                fps_only: fps_tab,
+            });
+            g.profile.combos.len() - 1
+        };
+        self.vk_combo_pending.clear();
+        self.waiting_key = None;
+        self.picking = None;
+        self.vk_sel = None;
+        self.log(format!(
+            "已新增组合键 #{}: {} + {}；可在下方继续调整动作/取点",
+            index + 1,
+            key_name(first),
+            name
+        ));
+    }
+
+    /// 可视化风格键盘下方的“新增项目”栏。
+    fn ui_vk_add_bar(&mut self, ui: &mut egui::Ui, fps_tab: bool) {
+        let th = self.theme();
+        if fps_tab {
+            self.ui_fps_add_bar(ui);
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label("新增项目：");
+            let old = self.vk_add_kind;
+            egui::ComboBox::from_id_salt("vk_add_kind")
+                .selected_text(self.vk_add_kind.label())
+                .show_ui(ui, |ui| {
+                    for kind in [
+                        VkAddKind::Key,
+                        VkAddKind::Combo,
+                        VkAddKind::Wheel,
+                        VkAddKind::Aim,
+                    ] {
+                        ui.selectable_value(&mut self.vk_add_kind, kind, kind.label());
+                    }
+                });
+            if self.vk_add_kind != old {
+                self.vk_combo_pending.clear();
+                self.vk_sel = None;
+                self.waiting_key = None;
+                self.picking = None;
+            }
+            match self.vk_add_kind {
+                VkAddKind::Key => {
+                    ui.label("点击键盘/鼠标上的空闲键，或点击已设置键修改");
+                }
+                VkAddKind::Combo => {
+                    if Self::tab_button(ui, "＋ 新增组合键", false, th.ok) {
+                        self.push_undo();
+                        let m = self.mapper();
+                        let (x, y) = (m.rel_x(540), m.rel_y(960));
+                        let mut g = self.shared.lock().unwrap();
+                        g.profile.combos_enabled = true;
+                        g.profile.combos.push(KeyCombo {
+                            keys: vec![0, 0],
+                            action: Action::Tap {
+                                x,
+                                y,
+                                duration_ms: crate::keymap::DEFAULT_TAP_DURATION_MS,
+                                radius: crate::keymap::DEFAULT_RADIUS,
+                            },
+                            fps_only: fps_tab,
+                        });
+                        self.vk_combo_pending.clear();
+                        self.scroll_to_new = true;
+                    }
+                    if self.vk_combo_pending.is_empty() {
+                        ui.label("或点下方键盘上的第 1 个键（会闪烁指引）");
+                    } else {
+                        ui.label(format!(
+                            "前缀 {} 已选，请点第 2 个键",
+                            key_name(self.vk_combo_pending[0])
+                        ));
+                        if Self::tab_button(ui, "清空重选", false, th.danger) {
+                            self.vk_combo_pending.clear();
+                        }
+                    }
+                }
+                VkAddKind::Wheel => {
+                    if Self::tab_button(ui, "＋ 新增轮盘", false, th.ok) {
+                        self.add_wheel_default();
+                    }
+                }
+                VkAddKind::Aim => {
+                    if Self::tab_button(
+                        ui,
+                        "取锚点",
+                        self.picking == Some(CoordSlot::AimAnchor),
+                        th.ok,
+                    ) {
+                        self.begin_pick(CoordSlot::AimAnchor);
+                    }
+                    ui.label("锚点是在手机屏幕上放置虚拟手指的起点，不是游戏准星。");
                 }
             }
         });
+    }
+
+    /// FPS 页专用添加栏：只允许 FPS 独有键位和瞄准锚点，不暴露普通键位/组合键/轮盘。
+    fn ui_fps_add_bar(&mut self, ui: &mut egui::Ui) {
+        if !matches!(self.vk_add_kind, VkAddKind::Key | VkAddKind::Aim) {
+            self.vk_add_kind = VkAddKind::Key;
+            self.vk_sel = None;
+            self.waiting_key = None;
+        }
+        let th = self.theme();
+        ui.horizontal(|ui| {
+            ui.label("新增 FPS 项目：");
+            let old = self.vk_add_kind;
+            egui::ComboBox::from_id_salt("vk_add_kind_fps")
+                .selected_text(match self.vk_add_kind {
+                    VkAddKind::Aim => "瞄准锚点",
+                    _ => "FPS 专用键位",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.vk_add_kind, VkAddKind::Key, "FPS 专用键位");
+                    ui.selectable_value(&mut self.vk_add_kind, VkAddKind::Aim, "瞄准锚点");
+                });
+            if self.vk_add_kind != old {
+                self.vk_combo_pending.clear();
+                self.vk_sel = None;
+                self.waiting_key = None;
+                self.picking = None;
+            }
+            match self.vk_add_kind {
+                VkAddKind::Key => {
+                    if Self::tab_button(ui, "＋ 新增 FPS 键位", false, th.ok) {
+                        self.cancel_draft();
+                        self.reset_draft_to_screen();
+                        self.draft.key = None;
+                        self.draft.fps_only = true;
+                        self.draft_active = true;
+                        self.vk_sel = None;
+                        self.waiting_key = Some(KeySlot::NewBind);
+                    }
+                    ui.label("也可直接点击键盘/鼠标上的空闲键创建仅 FPS 键位");
+                }
+                VkAddKind::Aim => {
+                    if Self::tab_button(
+                        ui,
+                        "取锚点",
+                        self.picking == Some(CoordSlot::AimAnchor),
+                        th.ok,
+                    ) {
+                        self.begin_pick(CoordSlot::AimAnchor);
+                    }
+                    ui.label("锚点是在手机屏幕上放置虚拟手指的起点，不是游戏准星。");
+                }
+                VkAddKind::Combo | VkAddKind::Wheel => {}
+            }
+        });
+    }
+
+    /// 键盘下方的操作栏:当前选中目标的编辑器。
+    /// 按钮一律"浏览器标签页"式:方形、不立体、大小不变(见 tab_button)。
+    fn ui_vk_panel(&mut self, ui: &mut egui::Ui, fps_tab: bool) {
+        ui.separator();
+        self.ui_vk_add_bar(ui, fps_tab);
+        ui.separator();
+        // 取点中:提示 + 取消按钮(用户要求:先点键再取点的流程必须能取消)
+        if self.picking == Some(CoordSlot::NewBind) && self.draft.key.is_some() {
+            let name = self
+                .draft
+                .key
+                .map(key_name)
+                .unwrap_or_else(|| "未定".into());
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    self.theme().warn,
+                    format!("取点中: {name} —— 点击截图选点,或"),
+                );
+                if Self::tab_button(ui, "取消取点", false, self.theme().danger) {
+                    self.cancel_draft();
+                    self.vk_sel = None;
+                    self.log("已取消取点");
+                }
+            });
+        }
+        let sel = match self.vk_sel {
+            Some(s) => s,
+            None => {
+                match self.vk_add_kind {
+                    VkAddKind::Key => {
+                        ui.label("点击键盘/鼠标上的键开始设置:空闲键进入取点,已设置的键可修改");
+                    }
+                    VkAddKind::Combo => {
+                        self.ui_combos(ui);
+                    }
+                    VkAddKind::Wheel => {
+                        self.ui_wheels(ui);
+                    }
+                    VkAddKind::Aim => {
+                        let captured = self.mouse_grab_flag.load(Ordering::Relaxed);
+                        self.ui_aim(ui, captured);
+                    }
+                }
+                return;
+            }
+        };
+        match sel {
+            // 新增草稿:类型/坐标/取点/确定/取消(与默认风格的新增节同一套参数)
+            VkSel::New => self.ui_vk_draft(ui),
+            // 既有键位:与列表**同一套**完整编辑行(撤销/删除/仅FPS/取点/改范围全保留)
+            VkSel::Bind(i) => {
+                ui.horizontal(|ui| {
+                    ui.strong("修改键位");
+                    if Self::tab_button(ui, "取消编辑", false, self.theme().danger) {
+                        self.waiting_key = None;
+                        self.picking = None;
+                        self.resizing = None;
+                        self.vk_sel = None;
+                        self.log("已取消键位编辑");
+                    }
+                });
+                if self.vk_sel.is_some() {
+                    if let Some(d) = ui.horizontal(|ui| self.ui_bind_row(ui, i)).inner {
+                        self.delete_bind(d);
+                        self.vk_sel = None;
+                    }
+                }
+            }
+            VkSel::Macro(i) => {
+                ui.horizontal(|ui| {
+                    ui.strong("修改宏");
+                    ui.colored_label(self.theme().key_macro, "宏");
+                    if Self::tab_button(ui, "取消编辑", false, self.theme().danger) {
+                        self.vk_sel = None;
+                        self.log("已取消宏编辑");
+                    }
+                });
+                if self.vk_sel.is_some() {
+                    let mut action = {
+                        let g = self.shared.lock().unwrap();
+                        g.profile.binds.get(i).and_then(|b| match &b.action {
+                            Action::Macro(m) => Some(m.clone()),
+                            _ => None,
+                        })
+                    };
+                    if let Some(action) = action.as_mut() {
+                        let mut changed = false;
+                        if !action.steps.is_empty() {
+                            Self::ui_macro_recorded_steps(ui, &action.steps);
+                        }
+                        if let Some(vp) = &action.virtual_profile {
+                            Self::ui_macro_virtual_profile_info(ui, vp);
+                        }
+                        if !action.instructions.is_empty() || action.virtual_profile.is_some() {
+                            changed |= self.ui_macro_instruction_list(
+                                ui,
+                                &mut action.instructions,
+                                &format!("vk_macro_{i}"),
+                            );
+                        } else {
+                            ui.small("该宏只有录制步骤；展开后可查看，编辑请点[载入编辑]。");
+                        }
+                        if ui.button("保存宏修改").clicked() {
+                            let mut g = self.shared.lock().unwrap();
+                            if let Some(b) = g.profile.binds.get_mut(i) {
+                                b.action = Action::Macro(action.clone());
+                            }
+                            changed = true;
+                        }
+                        if changed {
+                            self.log("宏已更新");
+                        }
+                    }
+                }
+            }
+            // 特殊键:改绑 + 取消选择
+            VkSel::Toggle => self.ui_vk_special(ui, KeySlot::Toggle, "总开关键"),
+            VkSel::CursorToggle => self.ui_vk_special(ui, KeySlot::CursorToggle, "鼠标消隐切换键"),
+            VkSel::AimHold => self.ui_vk_special(ui, KeySlot::AimHold, "FPS 瞄准门控键"),
+            VkSel::AimToggle => self.ui_vk_special(ui, KeySlot::AimToggle, "FPS 独立开关"),
+            VkSel::AimSuspend => self.ui_vk_special(ui, KeySlot::AimSuspend, "FPS 暂时退出键"),
+            VkSel::WheelDir { wheel, dir } => {
+                self.ui_vk_special(ui, KeySlot::WheelDir { wheel, dir }, "摇杆方向键")
+            }
+            VkSel::WheelEnable(i) => {
+                self.ui_vk_special(ui, KeySlot::WheelEnable(i), "摇杆临时启用键")
+            }
+            VkSel::SwitchKey(i) => self.ui_vk_special(ui, KeySlot::SwitchKey(i), "组合切换键"),
+            VkSel::SwitchKeySecond(i) => {
+                self.ui_vk_special(ui, KeySlot::SwitchKeySecond(i), "组合切换键第二位")
+            }
+            VkSel::ComboKey { combo, slot } => {
+                self.ui_vk_special(ui, KeySlot::ComboKey { combo, slot }, "组合键成员")
+            }
+        }
+    }
+
+    /// 独立的宏页面：录制、虚拟键盘取键、宏列表和触发键绑定都在这里完成。
+    fn ui_macro_page(&mut self, ui: &mut egui::Ui) {
+        let th = self.theme();
+        let visual = self.ui_style() == theme::UiStyle::Visual;
+        ui.heading("宏（开发中）");
+        ui.label("录制真实按键时序，或用设置宏编排按键、组合键、轮盘、FPS、点击、滑动与间隔，再绑定到一个触发键。");
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.strong("录制");
+            ui.label("空闲停止:");
+            ui.add(
+                egui::DragValue::new(&mut self.macro_idle_ms)
+                    .range(100..=2000)
+                    .suffix(" ms"),
+            );
+            ui.checkbox(&mut self.macro_show_events, "显示录制事件")
+                .on_hover_text("默认只显示结果摘要；录制长按时不会把自动重复显示成连续点击");
+            if self.macro_recording.is_some() {
+                if Self::tab_button(ui, "停止录制", false, th.danger) {
+                    self.finish_macro_recording();
+                }
+            } else if Self::tab_button(ui, "开始录制", false, th.ok) {
+                self.waiting_key = None;
+                self.picking = None;
+                self.macro_page_steps.clear();
+                self.macro_recording = Some(MacroRecording {
+                    steps: Vec::new(),
+                    held: HashSet::new(),
+                    last_event: Instant::now(),
+                    last_step_at: Instant::now(),
+                    idle_ms: self.macro_idle_ms,
+                });
+                self.log("宏录制开始：操作按键或点击下方虚拟键盘；空闲会自动停止");
+            }
+            if Self::tab_button(ui, "清空", false, th.accent) {
+                self.reset_macro_draft();
+            }
+            if visual && Self::tab_button(ui, "扩展宏...", false, th.accent) {
+                self.open_macro_virtual_editor();
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("触发键:");
+            let waiting = self.waiting_key == Some(KeySlot::MacroTrigger);
+            if Self::key_button(ui, waiting, self.macro_page_key).clicked() {
+                self.waiting_key = Some(KeySlot::MacroTrigger);
+                self.log("请按任意键作为宏触发键");
+            }
+            ui.checkbox(&mut self.macro_page_fps_only, "仅 FPS");
+            let ready = self.macro_page_key.is_some()
+                && (!self.macro_page_steps.is_empty() || !self.macro_page_instructions.is_empty());
+            ui.add_enabled_ui(ready, |ui| {
+                if Self::tab_button(ui, "新建宏", false, th.ok) {
+                    self.macro_add_from_page();
+                }
+            });
+            if Self::tab_button(ui, "取消编辑", false, th.danger) {
+                self.reset_macro_draft();
+                self.log("已取消宏编辑");
+            }
+        });
+
+        let mut open_extended_editor = false;
+        let virtual_profile_snapshot = self.macro_page_virtual_profile.clone();
+        if let Some(vp) = virtual_profile_snapshot.as_ref() {
+            let bind_count = vp.binds.len();
+            let wheel_count = vp.wheels.len();
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    th.accent,
+                    format!("扩展宏虚拟键位: {bind_count} 个按键 / {wheel_count} 个轮盘"),
+                );
+                if Self::tab_button(ui, "清除扩展", false, th.danger) {
+                    self.macro_page_virtual_profile = None;
+                }
+                if visual && Self::tab_button(ui, "编辑扩展宏...", false, th.accent) {
+                    open_extended_editor = true;
+                }
+            });
+            ui.collapsing("查看扩展宏临时键位表", |ui| {
+                Self::ui_macro_virtual_profile_info(ui, vp);
+            });
+        }
+        if open_extended_editor {
+            self.open_macro_virtual_editor();
+        }
+
+        if self.macro_recording.is_some() {
+            let n = self
+                .macro_recording
+                .as_ref()
+                .map(|r| r.steps.len())
+                .unwrap_or(0);
+            ui.colored_label(
+                th.warn,
+                format!("录制中… 已记录 {n} 条结果（长按重复已合并）"),
+            );
+        } else if self.macro_page_steps.is_empty() {
+            ui.small("尚未录制。先点[开始录制]，再操作按键或点击下方虚拟键盘；也可以直接设置宏。");
+        } else {
+            ui.colored_label(th.ok, macro_summary(&self.macro_page_steps));
+            if self.macro_show_events {
+                let start = self.macro_page_steps.len().saturating_sub(16);
+                for (i, step) in self.macro_page_steps[start..].iter().enumerate() {
+                    ui.small(format!(
+                        "{}. {} {} (+{}ms)",
+                        start + i + 1,
+                        key_name(step.code),
+                        if step.pressed { "按下" } else { "抬起" },
+                        step.delay_ms
+                    ));
+                }
+            }
+        }
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.strong("设置宏");
+            ui.small("把按键、组合键、轮盘、FPS、点击、滑动、间隔和嵌套宏编排成一次操作");
+            if visual && Self::tab_button(ui, "扩展宏...", false, th.accent) {
+                self.open_macro_virtual_editor();
+            }
+        });
+        let mut instructions = std::mem::take(&mut self.macro_page_instructions);
+        self.ui_macro_instruction_list(ui, &mut instructions, "macro_page");
+        self.macro_page_instructions = instructions;
+
+        if visual {
+            ui.separator();
+            ui.label("虚拟键盘：录制时点击会写入宏；非录制时点击用于选择触发键。");
+            let mut in_macro: HashSet<u16> = self.macro_page_steps.iter().map(|s| s.code).collect();
+            for instruction in &self.macro_page_instructions {
+                match instruction {
+                    MacroInstruction::Key { code, .. } if *code != 0 => {
+                        in_macro.insert(*code);
+                    }
+                    MacroInstruction::Combo { keys, .. } => {
+                        in_macro.extend(keys.iter().copied().filter(|key| *key != 0));
+                    }
+                    _ => {}
+                }
+            }
+            let selected = self.macro_page_key;
+            let look_of = move |code: u16| {
+                if Some(code) == selected {
+                    keyboard::KeyLook {
+                        fill: theme::with_alpha(th.ok, 210),
+                        side: theme::with_alpha(darken(th.ok, 60), 230),
+                        stroke: egui::Color32::WHITE,
+                        text: egui::Color32::WHITE,
+                        tip: Some("宏触发键".into()),
+                    }
+                } else if in_macro.contains(&code) {
+                    keyboard::KeyLook {
+                        fill: theme::with_alpha(th.key_macro, 190),
+                        side: theme::with_alpha(darken(th.key_macro, 60), 220),
+                        stroke: egui::Color32::WHITE,
+                        text: egui::Color32::WHITE,
+                        tip: Some("已录制".into()),
+                    }
+                } else {
+                    keyboard::KeyLook::idle()
+                }
+            };
+            let (key_click, mouse_click) = ui
+                .horizontal(|ui| {
+                    let kc = keyboard::show_keyboard(ui, "macro_kb", &look_of, None, 96.0);
+                    ui.add_space(10.0);
+                    let mc = keyboard::show_mouse(ui, "macro_mouse", &look_of, None);
+                    (kc, mc)
+                })
+                .inner;
+            if let Some(code) = key_click.or(mouse_click) {
+                self.macro_virtual_key(code);
+            }
+        }
+
+        ui.separator();
+        ui.heading("已录宏");
+        let rows: Vec<(usize, u16, usize, usize, bool)> = {
+            let g = self.shared.lock().unwrap();
+            g.profile
+                .binds
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| match &b.action {
+                    Action::Macro(m) => {
+                        Some((i, b.key, m.steps.len(), m.instructions.len(), b.fps_only))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut delete = None;
+        let mut load = None;
+        for (i, key, steps, instructions, fps) in rows {
+            let expanded = self.macro_expanded == Some(i);
+            ui.horizontal(|ui| {
+                ui.colored_label(th.key_macro, format!("宏#{}", i + 1));
+                let waiting = self.waiting_key == Some(KeySlot::Bind(i));
+                if Self::key_button(ui, waiting, Some(key)).clicked() {
+                    self.waiting_key = Some(KeySlot::Bind(i));
+                }
+                let count_text = match (steps, instructions) {
+                    (0, n) => format!("设置 {n} 项"),
+                    (n, 0) => format!("录制 {n} 项"),
+                    (s, i) => format!("录制 {s} 项 / 设置 {i} 项"),
+                };
+                ui.label(count_text);
+                if fps {
+                    ui.colored_label(th.key_fps, "仅 FPS");
+                }
+                if ui.button(if expanded { "收起" } else { "展开" }).clicked() {
+                    self.macro_expanded = if expanded { None } else { Some(i) };
+                }
+                let loaded = self.macro_loaded_index == Some(i);
+                if ui
+                    .button(if loaded {
+                        "取消编辑"
+                    } else {
+                        "载入编辑"
+                    })
+                    .clicked()
+                {
+                    if loaded {
+                        self.reset_macro_draft();
+                        self.log("已取消宏编辑");
+                    } else {
+                        load = Some(i);
+                    }
+                }
+                if ui.button("删除").clicked() {
+                    delete = Some(i);
+                }
+            });
+            if expanded {
+                let mut action = {
+                    let g = self.shared.lock().unwrap();
+                    g.profile.binds.get(i).and_then(|b| match &b.action {
+                        Action::Macro(m) => Some(m.clone()),
+                        _ => None,
+                    })
+                };
+                if let Some(action) = action.as_mut() {
+                    let before = action.clone();
+                    if !action.steps.is_empty() {
+                        Self::ui_macro_recorded_steps(ui, &action.steps);
+                    }
+                    if let Some(vp) = &action.virtual_profile {
+                        Self::ui_macro_virtual_profile_info(ui, vp);
+                    }
+                    if !action.instructions.is_empty() || action.virtual_profile.is_some() {
+                        ui.small("设置动作:");
+                        self.ui_macro_instruction_list(
+                            ui,
+                            &mut action.instructions,
+                            &format!("macro_expand_{i}"),
+                        );
+                    } else {
+                        ui.small("该宏只有录制步骤，录制步骤只读。");
+                    }
+                    if action != &before {
+                        {
+                            let mut g = self.shared.lock().unwrap();
+                            if let Some(b) = g.profile.binds.get_mut(i) {
+                                b.action = Action::Macro(action.clone());
+                            }
+                        }
+                        self.log(format!("宏#{} 已更新", i + 1));
+                    }
+                }
+            }
+        }
+        if let Some(i) = load {
+            let loaded = {
+                let g = self.shared.lock().unwrap();
+                g.profile.binds.get(i).and_then(|b| match &b.action {
+                    Action::Macro(m) => Some((b.key, m.clone(), b.fps_only)),
+                    _ => None,
+                })
+            };
+            if let Some((key, action, fps)) = loaded {
+                self.macro_page_key = Some(key);
+                self.macro_page_steps = action.steps;
+                self.macro_page_instructions = action.instructions;
+                self.macro_page_virtual_profile = action.virtual_profile.as_deref().cloned();
+                self.macro_page_fps_only = fps;
+                self.macro_loaded_index = Some(i);
+                self.waiting_key = None;
+                self.log("已载入宏步骤到编辑区；修改后点[新建宏]会保存为新宏");
+            }
+        }
+        if let Some(i) = delete {
+            self.push_undo();
+            self.shared.lock().unwrap().profile.binds.remove(i);
+            if self.macro_loaded_index == Some(i) {
+                self.reset_macro_draft();
+            }
+            self.log("已删除宏");
+        }
+    }
+
+    fn reset_macro_draft(&mut self) {
+        self.macro_recording = None;
+        self.macro_page_steps.clear();
+        self.macro_page_instructions.clear();
+        self.macro_page_virtual_profile = None;
+        self.macro_page_key = None;
+        self.macro_page_fps_only = false;
+        self.macro_loaded_index = None;
+        self.picking = None;
+        self.waiting_key = None;
+    }
+
+    fn open_macro_virtual_editor(&mut self) {
+        let (source_scheme, profile) = {
+            let g = self.shared.lock().unwrap();
+            let source = g.active_scheme.min(g.schemes.len().saturating_sub(1));
+            let profile = self
+                .macro_page_virtual_profile
+                .clone()
+                .or_else(|| g.schemes.get(source).cloned())
+                .unwrap_or_else(|| g.profile.clone());
+            (source, profile)
+        };
+        let mut profile = profile;
+        sanitize_virtual_profile(&mut profile);
+        self.macro_virtual_editor = Some(MacroVirtualEditor {
+            profile,
+            selected_key: None,
+            source_scheme,
+        });
+    }
+
+    fn ui_macro_virtual_window(&mut self, ctx: &egui::Context) {
+        let Some(mut editor) = self.macro_virtual_editor.take() else {
+            return;
+        };
+        let schemes: Vec<String> = {
+            let g = self.shared.lock().unwrap();
+            g.schemes.iter().map(|p| p.name.clone()).collect()
+        };
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new("扩展宏：虚拟键位")
+            .open(&mut open)
+            .default_size([760.0, 600.0])
+            .min_size([520.0, 360.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.label("先在这里模拟一套虚拟键位；宏执行时按这套位置和动作解析。关闭窗口或点取消会完全丢弃本次设置。");
+                ui.horizontal(|ui| {
+                    ui.label("继承已有键位组合:");
+                    let mut source = editor.source_scheme;
+                    egui::ComboBox::from_id_salt("macro_virtual_source")
+                        .selected_text(schemes.get(source).cloned().unwrap_or_else(|| "当前配置".into()))
+                        .show_ui(ui, |ui| {
+                            for (i, name) in schemes.iter().enumerate() {
+                                ui.selectable_value(&mut source, i, name);
+                            }
+                        });
+                    if source != editor.source_scheme {
+                        let mut inherited = self
+                            .shared
+                            .lock()
+                            .unwrap()
+                            .schemes
+                            .get(source)
+                            .cloned()
+                            .unwrap_or_default();
+                        sanitize_virtual_profile(&mut inherited);
+                        editor.profile = inherited;
+                        editor.source_scheme = source;
+                        editor.selected_key = None;
+                    }
+                });
+                ui.separator();
+                let lights = virtual_keyboard_lights(&editor.profile);
+                let selected = editor.selected_key;
+                let look_of = move |code: u16| {
+                    if Some(code) == selected {
+                        keyboard::KeyLook {
+                            fill: theme::with_alpha(egui::Color32::LIGHT_BLUE, 210),
+                            side: theme::with_alpha(egui::Color32::BLUE, 220),
+                            stroke: egui::Color32::WHITE,
+                            text: egui::Color32::WHITE,
+                            tip: Some("当前虚拟键位".into()),
+                        }
+                    } else if let Some((c, tip)) = lights.get(&code) {
+                        keyboard::KeyLook {
+                            fill: theme::with_alpha(*c, 185),
+                            side: theme::with_alpha(darken(*c, 60), 220),
+                            stroke: egui::Color32::WHITE,
+                            text: egui::Color32::WHITE,
+                            tip: Some(tip.clone()),
+                        }
+                    } else {
+                        keyboard::KeyLook::idle()
+                    }
+                };
+                let clicked = ui
+                    .horizontal(|ui| {
+                        let kc = keyboard::show_keyboard(ui, "macro_virtual_kb", &look_of, None, 96.0);
+                        ui.add_space(10.0);
+                        let mc = keyboard::show_mouse(ui, "macro_virtual_mouse", &look_of, None);
+                        kc.or(mc)
+                    })
+                    .inner;
+                if let Some(code) = clicked {
+                    if editor.profile.binds.iter().any(|b| b.key == code) {
+                        editor.selected_key = Some(code);
+                    } else {
+                        editor.profile.binds.push(KeyBind {
+                            key: code,
+                            action: Action::Tap {
+                                x: 0.5,
+                                y: 0.5,
+                                duration_ms: crate::keymap::DEFAULT_TAP_DURATION_MS,
+                                radius: crate::keymap::DEFAULT_RADIUS,
+                            },
+                            fps_only: false,
+                        });
+                        editor.selected_key = Some(code);
+                    }
+                }
+                ui.separator();
+                if let Some(key) = editor.selected_key {
+                    ui.horizontal(|ui| {
+                        ui.strong(format!("虚拟键位: {}", key_name(key)));
+                        if ui.small_button("删除键位").clicked() {
+                            editor.profile.binds.retain(|b| b.key != key);
+                            editor.selected_key = None;
+                        }
+                    });
+                    if let Some(index) = editor.profile.binds.iter().position(|b| b.key == key) {
+                        Self::ui_macro_virtual_bind(ui, &mut editor.profile.binds[index]);
+                    }
+                } else {
+                    ui.small("点击虚拟键盘上的键，可新增或编辑虚拟键位。");
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("保存到宏草稿").clicked() {
+                        save = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if save {
+            self.macro_page_virtual_profile = Some(editor.profile.clone());
+            self.log("扩展宏虚拟键位已保存到当前宏草稿");
+        } else if !cancel && open {
+            self.macro_virtual_editor = Some(editor);
+        } else {
+            self.log("已取消扩展宏设置，未保留任何修改");
+        }
+    }
+
+    fn ui_macro_virtual_bind(ui: &mut egui::Ui, bind: &mut KeyBind) {
+        let kind = match bind.action {
+            Action::Tap { .. } => 0,
+            Action::Hold { .. } => 1,
+            Action::Swipe(_) => 2,
+            Action::AndroidKey { .. } => 3,
+            Action::Macro(_) => 0,
+        };
+        let mut kind = kind;
+        ui.horizontal(|ui| {
+            ui.label("动作:");
+            egui::ComboBox::from_id_salt(("macro_virtual_action", bind.key))
+                .selected_text(match kind {
+                    0 => "点按",
+                    1 => "长按",
+                    2 => "滑动",
+                    _ => "系统键",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut kind, 0, "点按");
+                    ui.selectable_value(&mut kind, 1, "长按");
+                    ui.selectable_value(&mut kind, 2, "滑动");
+                    ui.selectable_value(&mut kind, 3, "系统键");
+                });
+        });
+        let old_kind = match bind.action {
+            Action::Tap { .. } => 0,
+            Action::Hold { .. } => 1,
+            Action::Swipe(_) => 2,
+            Action::AndroidKey { .. } => 3,
+            Action::Macro(_) => 0,
+        };
+        if kind != old_kind {
+            bind.action = match kind {
+                1 => Action::Hold {
+                    x: 0.5,
+                    y: 0.5,
+                    radius: crate::keymap::DEFAULT_RADIUS,
+                },
+                2 => Action::Swipe(Swipe {
+                    start: (0.5, 0.7),
+                    end: (0.5, 0.3),
+                    duration_ms: 300,
+                    easing: Easing::Linear,
+                    path: SwipePath::Line,
+                }),
+                3 => Action::AndroidKey { keycode: 4 },
+                _ => Action::Tap {
+                    x: 0.5,
+                    y: 0.5,
+                    duration_ms: crate::keymap::DEFAULT_TAP_DURATION_MS,
+                    radius: crate::keymap::DEFAULT_RADIUS,
+                },
+            };
+        }
+        match &mut bind.action {
+            Action::Tap {
+                x,
+                y,
+                duration_ms,
+                radius,
+            } => {
+                ui.horizontal(|ui| {
+                    ui.label("X/Y");
+                    ui.add(egui::DragValue::new(x).range(0.0..=1.0).speed(0.005));
+                    ui.add(egui::DragValue::new(y).range(0.0..=1.0).speed(0.005));
+                    ui.label("时长");
+                    ui.add(
+                        egui::DragValue::new(duration_ms)
+                            .range(0..=600_000)
+                            .suffix(" ms"),
+                    );
+                    ui.label("范围");
+                    ui.add(egui::DragValue::new(radius).range(0.001..=0.5).speed(0.001));
+                });
+            }
+            Action::Hold { x, y, radius } => {
+                ui.horizontal(|ui| {
+                    ui.label("X/Y");
+                    ui.add(egui::DragValue::new(x).range(0.0..=1.0).speed(0.005));
+                    ui.add(egui::DragValue::new(y).range(0.0..=1.0).speed(0.005));
+                    ui.label("范围");
+                    ui.add(egui::DragValue::new(radius).range(0.001..=0.5).speed(0.001));
+                });
+            }
+            Action::Swipe(s) => {
+                ui.horizontal(|ui| {
+                    ui.label("起点 X/Y");
+                    ui.add(
+                        egui::DragValue::new(&mut s.start.0)
+                            .range(0.0..=1.0)
+                            .speed(0.005),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut s.start.1)
+                            .range(0.0..=1.0)
+                            .speed(0.005),
+                    );
+                    ui.label("终点 X/Y");
+                    ui.add(
+                        egui::DragValue::new(&mut s.end.0)
+                            .range(0.0..=1.0)
+                            .speed(0.005),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut s.end.1)
+                            .range(0.0..=1.0)
+                            .speed(0.005),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("时长");
+                    ui.add(
+                        egui::DragValue::new(&mut s.duration_ms)
+                            .range(10..=600_000)
+                            .suffix(" ms"),
+                    );
+                });
+            }
+            Action::AndroidKey { keycode } => {
+                ui.horizontal(|ui| {
+                    ui.label("系统 keycode");
+                    ui.add(egui::DragValue::new(keycode).range(0..=999));
+                });
+            }
+            Action::Macro(_) => {}
+        }
+        ui.checkbox(&mut bind.fps_only, "仅 FPS");
+    }
+
+    fn ui_macro_recorded_steps(ui: &mut egui::Ui, steps: &[MacroStep]) {
+        ui.small("录制步骤（只读）:");
+        egui::ScrollArea::vertical()
+            .id_salt("macro_recorded_steps")
+            .max_height(160.0)
+            .show(ui, |ui| {
+                for (i, step) in steps.iter().enumerate() {
+                    ui.monospace(format!(
+                        "{:>3}. {} {}  +{}ms",
+                        i + 1,
+                        key_name(step.code),
+                        if step.pressed { "按下" } else { "抬起" },
+                        step.delay_ms
+                    ));
+                }
+            });
+    }
+
+    fn ui_macro_virtual_profile_info(ui: &mut egui::Ui, profile: &Profile) {
+        ui.small(format!(
+            "扩展宏临时键位表: {} 个按键 / {} 个轮盘",
+            profile.binds.len(),
+            profile.wheels.len()
+        ));
+        for bind in profile.binds.iter().take(64) {
+            ui.monospace(format!(
+                "虚拟 {} → {}",
+                key_name(bind.key),
+                bind.action.describe()
+            ));
+        }
+        if profile.binds.len() > 64 {
+            ui.small(format!("... 还有 {} 个虚拟键位", profile.binds.len() - 64));
+        }
+        for (i, wheel) in profile.wheels.iter().enumerate() {
+            let dirs = wheel
+                .active_dirs()
+                .iter()
+                .map(|(_, key)| key_name(*key))
+                .collect::<Vec<_>>()
+                .join("/");
+            ui.monospace(format!("虚拟轮盘#{} → {}", i + 1, dirs));
+        }
+    }
+
+    /// 设置宏动作列表：下拉选择 + 添加，删除和精确编辑。
+    fn ui_macro_instruction_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        instructions: &mut Vec<MacroInstruction>,
+        id: &str,
+    ) -> bool {
+        let before = instructions.clone();
+        let mut remove = None;
+        for (i, instruction) in instructions.iter_mut().enumerate() {
+            ui.push_id(format!("{id}_{i}"), |ui| {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(format!("{}. {}", i + 1, instruction.label()));
+                        if ui.small_button("删除").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                    self.ui_macro_instruction(ui, instruction, i, id);
+                });
+            });
+        }
+        if let Some(i) = remove {
+            instructions.remove(i);
+        }
+        ui.horizontal(|ui| {
+            ui.label("新增项目：");
+            egui::ComboBox::from_id_salt(format!("{id}_add_kind"))
+                .selected_text(self.macro_instruction_kind.label())
+                .show_ui(ui, |ui| {
+                    for kind in MacroInstructionKind::ALL {
+                        ui.selectable_value(&mut self.macro_instruction_kind, kind, kind.label());
+                    }
+                });
+            if ui.button("新增操作").clicked() {
+                instructions.push(self.macro_instruction_kind.make());
+            }
+        });
+        before != *instructions
+    }
+
+    /// 单个设置宏动作的参数编辑器。
+    fn ui_macro_instruction(
+        &mut self,
+        ui: &mut egui::Ui,
+        instruction: &mut MacroInstruction,
+        index: usize,
+        id: &str,
+    ) {
+        let mut pending_key = None;
+        match instruction {
+            MacroInstruction::Delay { ms } => {
+                ui.horizontal(|ui| {
+                    ui.label("等待");
+                    ui.add(egui::DragValue::new(ms).range(0..=600_000).suffix(" ms"));
+                });
+            }
+            MacroInstruction::Key {
+                code,
+                mode,
+                duration_ms,
+                delay_ms,
+            } => {
+                ui.horizontal(|ui| {
+                    ui.label("按键");
+                    let waiting = self.waiting_key == Some(KeySlot::MacroInstructionKey(index));
+                    if Self::key_button(ui, waiting, Some(*code)).clicked() {
+                        pending_key = Some(KeySlot::MacroInstructionKey(index));
+                    }
+                    ui.selectable_value(mode, MacroKeyMode::Tap, "点按");
+                    ui.selectable_value(mode, MacroKeyMode::Hold, "长按");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("持续");
+                    ui.add(
+                        egui::DragValue::new(duration_ms)
+                            .range(5..=600_000)
+                            .suffix(" ms"),
+                    );
+                    ui.label("间隔");
+                    ui.add(
+                        egui::DragValue::new(delay_ms)
+                            .range(0..=600_000)
+                            .suffix(" ms"),
+                    );
+                });
+            }
+            MacroInstruction::Combo {
+                keys,
+                duration_ms,
+                delay_ms,
+            } => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("组合键");
+                    for (slot, key) in keys.iter_mut().enumerate() {
+                        let waiting = self.waiting_key
+                            == Some(KeySlot::MacroInstructionComboKey {
+                                instruction: index,
+                                slot,
+                            });
+                        if Self::key_button(ui, waiting, Some(*key)).clicked() {
+                            pending_key = Some(KeySlot::MacroInstructionComboKey {
+                                instruction: index,
+                                slot,
+                            });
+                        }
+                    }
+                    if keys.len() < 4 && ui.small_button("＋").clicked() {
+                        keys.push(0);
+                    }
+                    if keys.len() > 2 && ui.small_button("－").clicked() {
+                        keys.pop();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("持续");
+                    ui.add(
+                        egui::DragValue::new(duration_ms)
+                            .range(5..=600_000)
+                            .suffix(" ms"),
+                    );
+                    ui.label("间隔");
+                    ui.add(
+                        egui::DragValue::new(delay_ms)
+                            .range(0..=600_000)
+                            .suffix(" ms"),
+                    );
+                });
+            }
+            MacroInstruction::Wheel {
+                wheel,
+                part,
+                duration_ms,
+                delay_ms,
+            } => {
+                let wheels = {
+                    let g = self.shared.lock().unwrap();
+                    g.profile
+                        .wheels
+                        .iter()
+                        .enumerate()
+                        .map(|(i, w)| (i, format!("轮盘#{} ({:?})", i + 1, w.kind)))
+                        .collect::<Vec<_>>()
+                };
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("轮盘");
+                    egui::ComboBox::from_id_salt(format!("{id}_wheel_{index}"))
+                        .selected_text(format!("轮盘#{}", *wheel + 1))
+                        .show_ui(ui, |ui| {
+                            for (wi, label) in &wheels {
+                                ui.selectable_value(wheel, *wi, label);
+                            }
+                        });
+                    ui.label("方向");
+                    let selected = match part {
+                        MacroWheelPart::Up => "上",
+                        MacroWheelPart::Down => "下",
+                        MacroWheelPart::Left => "左",
+                        MacroWheelPart::Right => "右",
+                        MacroWheelPart::Custom(i) => {
+                            ui.label(format!("自定义#{i}"));
+                            "自定义"
+                        }
+                    };
+                    egui::ComboBox::from_id_salt(format!("{id}_part_{index}"))
+                        .selected_text(selected)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(part, MacroWheelPart::Up, "上");
+                            ui.selectable_value(part, MacroWheelPart::Down, "下");
+                            ui.selectable_value(part, MacroWheelPart::Left, "左");
+                            ui.selectable_value(part, MacroWheelPart::Right, "右");
+                            for c in 0..8usize {
+                                ui.selectable_value(
+                                    part,
+                                    MacroWheelPart::Custom(c),
+                                    format!("自定义#{c}"),
+                                );
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("持续");
+                    ui.add(
+                        egui::DragValue::new(duration_ms)
+                            .range(5..=600_000)
+                            .suffix(" ms"),
+                    );
+                    ui.label("间隔");
+                    ui.add(
+                        egui::DragValue::new(delay_ms)
+                            .range(0..=600_000)
+                            .suffix(" ms"),
+                    );
+                });
+            }
+            MacroInstruction::Fps { on, delay_ms } => {
+                ui.horizontal(|ui| {
+                    ui.checkbox(on, "开启 FPS 模式");
+                    ui.label("间隔");
+                    ui.add(
+                        egui::DragValue::new(delay_ms)
+                            .range(0..=600_000)
+                            .suffix(" ms"),
+                    );
+                });
+            }
+            MacroInstruction::Click {
+                x,
+                y,
+                duration_ms,
+                delay_ms,
+            } => {
+                ui.horizontal(|ui| {
+                    ui.label("位置 X/Y");
+                    ui.add(egui::DragValue::new(x).range(0.0..=1.0).speed(0.005));
+                    ui.add(egui::DragValue::new(y).range(0.0..=1.0).speed(0.005));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("持续");
+                    ui.add(
+                        egui::DragValue::new(duration_ms)
+                            .range(5..=600_000)
+                            .suffix(" ms"),
+                    );
+                    ui.label("间隔");
+                    ui.add(
+                        egui::DragValue::new(delay_ms)
+                            .range(0..=600_000)
+                            .suffix(" ms"),
+                    );
+                });
+            }
+            MacroInstruction::Swipe {
+                start_x,
+                start_y,
+                end_x,
+                end_y,
+                duration_ms,
+                delay_ms,
+            } => {
+                ui.horizontal(|ui| {
+                    ui.label("起点 X/Y");
+                    ui.add(egui::DragValue::new(start_x).range(0.0..=1.0).speed(0.005));
+                    ui.add(egui::DragValue::new(start_y).range(0.0..=1.0).speed(0.005));
+                    ui.label("终点 X/Y");
+                    ui.add(egui::DragValue::new(end_x).range(0.0..=1.0).speed(0.005));
+                    ui.add(egui::DragValue::new(end_y).range(0.0..=1.0).speed(0.005));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("滑动时长");
+                    ui.add(
+                        egui::DragValue::new(duration_ms)
+                            .range(10..=600_000)
+                            .suffix(" ms"),
+                    );
+                    ui.label("间隔");
+                    ui.add(
+                        egui::DragValue::new(delay_ms)
+                            .range(0..=600_000)
+                            .suffix(" ms"),
+                    );
+                });
+            }
+            MacroInstruction::Macro { action, delay_ms } => {
+                let macros = {
+                    let g = self.shared.lock().unwrap();
+                    g.profile
+                        .binds
+                        .iter()
+                        .filter_map(|b| match &b.action {
+                            Action::Macro(m) => Some((b.key, m.clone())),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                };
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("嵌套宏");
+                    egui::ComboBox::from_id_salt(format!("{id}_nested_{index}"))
+                        .selected_text(format!(
+                            "{}步/{}项",
+                            action.steps.len(),
+                            action.instructions.len()
+                        ))
+                        .show_ui(ui, |ui| {
+                            for (key, candidate) in &macros {
+                                if ui
+                                    .selectable_label(
+                                        candidate.steps.len() == action.steps.len()
+                                            && candidate.instructions.len()
+                                                == action.instructions.len(),
+                                        format!(
+                                            "{} ({}步/{}项)",
+                                            key_name(*key),
+                                            candidate.steps.len(),
+                                            candidate.instructions.len()
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    *action = Box::new(candidate.clone());
+                                }
+                            }
+                        });
+                    if ui.small_button("清空").clicked() {
+                        *action = Box::new(MacroAction::default());
+                    }
+                    ui.label("间隔");
+                    ui.add(
+                        egui::DragValue::new(delay_ms)
+                            .range(0..=600_000)
+                            .suffix(" ms"),
+                    );
+                });
+            }
+        }
+        if let Some(slot) = pending_key {
+            self.waiting_key = Some(slot);
+            self.log("请按键盘/鼠标键完成宏动作设置");
+        }
+    }
+
+    fn macro_virtual_key(&mut self, code: u16) {
+        if let Some(KeySlot::MacroInstructionKey(index)) = self.waiting_key {
+            self.assign_key(KeySlot::MacroInstructionKey(index), code);
+            return;
+        }
+        if let Some(KeySlot::MacroInstructionComboKey { instruction, slot }) = self.waiting_key {
+            self.assign_key(
+                KeySlot::MacroInstructionComboKey { instruction, slot },
+                code,
+            );
+            return;
+        }
+        if let Some(rec) = self.macro_recording.as_mut() {
+            let now = Instant::now();
+            let delay = if rec.steps.is_empty() {
+                0
+            } else {
+                now.saturating_duration_since(rec.last_step_at)
+                    .as_millis()
+                    .min(2000) as u32
+            };
+            rec.steps.push(MacroStep {
+                code,
+                pressed: true,
+                delay_ms: delay,
+            });
+            rec.steps.push(MacroStep {
+                code,
+                pressed: false,
+                delay_ms: 40,
+            });
+            rec.last_event = now;
+            rec.last_step_at = now + Duration::from_millis(40);
+            rec.held.remove(&code);
+        } else {
+            self.macro_page_key = Some(code);
+        }
+    }
+
+    /// 把捕获层上报的按键事件写入录制宏。重复 KEY_DOWN（键盘自动重复）
+    /// 只更新空闲计时，不再追加一次按下；抬起时才用真实持续时间写一条记录。
+    fn record_macro_button(rec: &mut MacroRecording, code: u16, pressed: bool, now: Instant) {
+        rec.last_event = now;
+        if pressed && rec.held.contains(&code) {
+            return;
+        }
+        if !pressed && !rec.held.remove(&code) {
+            return;
+        }
+        if pressed {
+            rec.held.insert(code);
+        }
+        let delay = if rec.steps.is_empty() {
+            0
+        } else {
+            now.duration_since(rec.last_step_at).as_millis().min(2000) as u32
+        };
+        rec.steps.push(MacroStep {
+            code,
+            pressed,
+            delay_ms: delay,
+        });
+        rec.last_step_at = now;
+    }
+
+    fn macro_add_from_page(&mut self) {
+        let Some(key) = self.macro_page_key else {
+            self.log("请先选择宏触发键");
+            return;
+        };
+        if self.macro_page_steps.is_empty() && self.macro_page_instructions.is_empty() {
+            self.log("宏没有录制步骤或设置动作");
+            return;
+        }
+        self.push_undo();
+        self.shared.lock().unwrap().profile.binds.push(KeyBind {
+            key,
+            action: Action::Macro(MacroAction {
+                steps: self.macro_page_steps.clone(),
+                instructions: self.macro_page_instructions.clone(),
+                virtual_profile: self.macro_page_virtual_profile.clone().map(Box::new),
+            }),
+            fps_only: self.macro_page_fps_only,
+        });
+        self.reset_macro_draft();
+        self.log("已新建宏");
+    }
+    fn finish_macro_recording(&mut self) {
+        if let Some(rec) = self.macro_recording.take() {
+            self.macro_page_steps = rec.steps;
+            self.log(format!(
+                "宏录制结束：{} 个事件",
+                self.macro_page_steps.len()
+            ));
+        }
+    }
+    /// 新增草稿编辑器(点击空闲键后出现在操作栏)。
+    /// 与默认风格的新增节同一套参数控件;类型选择用方形标签按钮。
+    fn ui_vk_draft(&mut self, ui: &mut egui::Ui) {
+        let th = self.theme();
+        ui.horizontal(|ui| {
+            ui.strong("新增键位:");
+            ui.monospace(
+                self.draft
+                    .key
+                    .map(key_name)
+                    .unwrap_or_else(|| "未定".into()),
+            );
+            if Self::tab_button(
+                ui,
+                "改键",
+                self.waiting_key == Some(KeySlot::NewBind),
+                th.accent,
+            ) {
+                self.picking = None;
+                self.resizing = None;
+                self.waiting_key = Some(KeySlot::NewBind);
+            }
+            ui.checkbox(&mut self.draft.fps_only, "仅 FPS")
+                .on_hover_text("开启后该键只在 FPS 模式生效(FPS 页点空闲键会自动勾上)");
+            for (ki, n) in KIND_NAMES.iter().enumerate() {
+                if Self::tab_button(ui, n, self.draft.kind == ki, th.accent) {
+                    self.draft.kind = ki;
+                    self.draft_active = true;
+                }
+            }
+        });
+        match self.draft.kind {
+            0 | 1 => {
+                ui.horizontal(|ui| {
+                    ui.label("x:");
+                    ui.add(egui::DragValue::new(&mut self.draft.x).range(COORD_RANGE));
+                    ui.label("y:");
+                    ui.add(egui::DragValue::new(&mut self.draft.y).range(COORD_RANGE));
+                    if self.draft.kind == 0 {
+                        ui.label("时长ms:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.draft.tap_duration_ms).range(0..=5000),
+                        )
+                        .on_hover_text("0=按下不松手,直到再按一次");
+                    }
+                    ui.label("范围:");
+                    ui.add(egui::DragValue::new(&mut self.draft.radius).range(0.01..=100000.0));
+                    let waiting_p = self.picking == Some(CoordSlot::NewBind);
+                    if Self::tab_button(
+                        ui,
+                        if waiting_p { "取点中..." } else { "取点" },
+                        waiting_p,
+                        th.ok,
+                    ) {
+                        self.begin_pick(CoordSlot::NewBind);
+                        self.draft_active = true;
+                    }
+                });
+            }
+            2 => {
+                // 滑动:与既有新增节同一套 swipe_controls(草稿用 New* 槽位;
+                // 可视化风格下新增节不渲染,不会出现重复控件 id)
+                let mut pick = self.picking;
+                let mut easing_edit = self.easing_edit;
+                let mut tmp = Swipe {
+                    start: (
+                        self.draft.swipe_start.0 as f32,
+                        self.draft.swipe_start.1 as f32,
+                    ),
+                    end: (self.draft.swipe_end.0 as f32, self.draft.swipe_end.1 as f32),
+                    duration_ms: self.draft.swipe_duration_ms,
+                    easing: self.draft.swipe_easing,
+                    path: self.draft.swipe_path,
+                };
+                swipe_controls(
+                    ui,
+                    &mut tmp,
+                    &mut pick,
+                    &mut easing_edit,
+                    CoordSlot::NewSwipeStart,
+                    CoordSlot::NewSwipeEnd,
+                    CoordSlot::NewCircleAngle,
+                    EasingEditTarget::New,
+                );
+                self.draft.swipe_start = (tmp.start.0 as i32, tmp.start.1 as i32);
+                self.draft.swipe_end = (tmp.end.0 as i32, tmp.end.1 as i32);
+                self.draft.swipe_duration_ms = tmp.duration_ms;
+                self.draft.swipe_easing = tmp.easing;
+                self.draft.swipe_path = tmp.path;
+                if let Some(slot) = pick {
+                    self.begin_pick(slot);
+                } else {
+                    self.picking = None;
+                }
+                self.easing_edit = easing_edit;
+            }
+            3 => {
+                ui.horizontal(|ui| {
+                    ui.label("keycode(返回=4 主页=3):");
+                    ui.add(egui::DragValue::new(&mut self.draft.keycode).range(0..=999));
+                });
+            }
+            _ => {
+                ui.horizontal(|ui| {
+                    ui.label("keycode(返回=4 主页=3):");
+                    ui.add(egui::DragValue::new(&mut self.draft.keycode).range(0..=999));
+                });
+            }
+        }
+        ui.horizontal(|ui| {
+            if Self::tab_button(ui, "确认新增", false, th.ok) {
+                if self.commit_draft() {
+                    self.vk_sel = None;
+                    self.vk_bottom_add_active = false;
+                }
+            }
+            if Self::tab_button(ui, "取消", false, th.danger) {
+                self.cancel_draft();
+                self.vk_sel = None;
+                self.vk_bottom_add_active = false;
+                self.log("已取消新增");
+            }
+        });
+    }
+
+    /// 特殊目标(总开关/FPS 三键/摇杆方向/临时启用/切换键/组合键成员)的编辑行。
+    /// 键细节(坐标/半径等)仍在下方对应列表里改,这里负责"哪个键"。
+    fn ui_vk_special(&mut self, ui: &mut egui::Ui, slot: KeySlot, title: &str) {
+        ui.horizontal(|ui| {
+            ui.strong(title);
+            let waiting = self.waiting_key == Some(slot);
+            let code = self.vk_slot_code(&slot);
+            if Self::key_button(ui, waiting, Some(code)).clicked() {
+                self.picking = None;
+                self.resizing = None;
+                self.waiting_key = Some(slot);
+                self.log("按任意键完成改绑(或点[取消选择]退出)");
+            }
+            if Self::tab_button(ui, "取消选择", false, self.theme().accent) {
+                self.vk_sel = None;
+                self.waiting_key = None;
+            }
+        });
+        if self.waiting_key == Some(slot) {
+            ui.small("等待按键中... 按任意键完成改绑");
+        }
+    }
+
+    /// 读取一个 KeySlot 当前持有的键码(0 = 未绑定)
+    fn vk_slot_code(&self, slot: &KeySlot) -> u16 {
+        let g = self.shared.lock().unwrap();
+        match slot {
+            KeySlot::Toggle => g.profile.toggle_key,
+            KeySlot::CursorToggle => g.profile.cursor_toggle_key,
+            KeySlot::AimHold => g.profile.aim.hold_key,
+            KeySlot::AimToggle => g.profile.aim.toggle_key,
+            KeySlot::AimSuspend => g.profile.aim.suspend_key,
+            KeySlot::WheelDir { wheel, dir } => g
+                .profile
+                .wheels
+                .get(*wheel)
+                .and_then(|w| w.active_dirs().get(*dir).map(|(_, key)| *key))
+                .unwrap_or(0),
+            KeySlot::WheelEnable(i) => g
+                .profile
+                .wheels
+                .get(*i)
+                .and_then(|w| w.temp.as_ref().map(|t| t.key))
+                .unwrap_or(0),
+            KeySlot::SwitchKey(i) => g.switch_keys.get(*i).map(|s| s.key).unwrap_or(0),
+            KeySlot::SwitchKeySecond(i) => g
+                .switch_keys
+                .get(*i)
+                .and_then(|s| s.keys.get(1))
+                .copied()
+                .unwrap_or(0),
+            KeySlot::ComboKey { combo, slot } => g
+                .profile
+                .combos
+                .get(*combo)
+                .and_then(|c| c.keys.get(*slot))
+                .copied()
+                .unwrap_or(0),
+            KeySlot::MacroTrigger => self.macro_page_key.unwrap_or(0),
+            KeySlot::MacroInstructionKey(index) => self
+                .macro_page_instructions
+                .get(*index)
+                .and_then(|instruction| match instruction {
+                    MacroInstruction::Key { code, .. } => Some(*code),
+                    _ => None,
+                })
+                .unwrap_or(0),
+            KeySlot::MacroInstructionComboKey { instruction, slot } => self
+                .macro_page_instructions
+                .get(*instruction)
+                .and_then(|item| match item {
+                    MacroInstruction::Combo { keys, .. } => keys.get(*slot).copied(),
+                    _ => None,
+                })
+                .unwrap_or(0),
+            KeySlot::NewBind | KeySlot::Bind(_) => 0,
+        }
+    }
+
+    /// Optional simultaneous chords.  The first key is the chord leader: it is
+    /// held briefly so a following key can complete the chord without firing
+    /// the leader's single-key action first.
+    fn ui_combos(&mut self, ui: &mut egui::Ui) {
+        let (mut enabled, combos, mapper) = {
+            let g = self.shared.lock().unwrap();
+            let screen = g
+                .control
+                .as_ref()
+                .map(|c| (c.screen_w, c.screen_h))
+                .or(g.profile.screen)
+                .unwrap_or((1080, 2400));
+            (
+                g.profile.combos_enabled,
+                g.profile.combos.clone(),
+                g.profile.mapper(screen),
+            )
+        };
+        ui.separator();
+        ui.heading("组合键（可选）");
+        if ui
+            .checkbox(&mut enabled, "启用组合键")
+            .on_hover_text("关闭时组合键设置保留但整体变灰失效；第一个键作为组合前缀。")
+            .changed()
+        {
+            self.push_undo();
+            self.shared.lock().unwrap().profile.combos_enabled = enabled;
+        }
+        ui.label("按键顺序：第一个键是前缀，后续键要与前缀同时按住。Ctrl+R 应先按 Ctrl 再按 R。")
+            .on_hover_text(
+                "有单键映射时使用 45ms 快速判定；没有单键映射时可等待 120ms，降低误触。",
+            );
+
+        let mut delete_combo = None;
+        let mut delete_slot = None;
+        let mut add_slot = None;
+        let mut snapshots: Vec<(usize, KeyCombo)> = Vec::new();
+        let mut combo_pick = self.picking;
+        let mut combo_easing = self.easing_edit;
+        for (index, original) in combos.into_iter().enumerate() {
+            let mut combo = original;
+            ui.add_enabled_ui(enabled, |ui| {
+                egui::Frame::group(ui.style())
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("组合 {}", index + 1));
+                            if ui.small_button("删除组合").clicked() {
+                                delete_combo = Some(index);
+                            }
+                            if ui.small_button("＋ 新增成员").clicked() {
+                                add_slot = Some(index);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("按键:");
+                            for (slot, key) in combo.keys.iter().copied().enumerate() {
+                                let waiting = self.waiting_key
+                                    == Some(KeySlot::ComboKey { combo: index, slot });
+                                let shown = (key != 0).then_some(key);
+                                if Self::key_button(ui, waiting, shown).clicked() {
+                                    self.waiting_key =
+                                        Some(KeySlot::ComboKey { combo: index, slot });
+                                }
+                                if combo.keys.len() > 2 && ui.small_button("×").clicked() {
+                                    delete_slot = Some((index, slot));
+                                }
+                                ui.label(if slot == 0 { "前缀" } else { "成员" });
+                            }
+                        });
+                        let action_changed = combo_action_editor(
+                            ui,
+                            &mut combo.action,
+                            &mapper,
+                            index,
+                            &mut combo_pick,
+                            &mut combo_easing,
+                        );
+                        let fps_changed = ui.checkbox(&mut combo.fps_only, "仅视角模式").changed();
+                        if action_changed || fps_changed {
+                            snapshots.push((index, combo.clone()));
+                        }
+                    });
+            });
+        }
+        self.picking = combo_pick;
+        self.easing_edit = combo_easing;
+        if let Some(index) = delete_combo {
+            self.push_undo();
+            let mut g = self.shared.lock().unwrap();
+            if index < g.profile.combos.len() {
+                g.profile.combos.remove(index);
+            }
+            self.waiting_key = None;
+        }
+        if let Some((combo_index, slot)) = delete_slot {
+            self.push_undo();
+            let mut g = self.shared.lock().unwrap();
+            if let Some(combo) = g.profile.combos.get_mut(combo_index)
+                && slot < combo.keys.len()
+            {
+                combo.keys.remove(slot);
+            }
+            self.waiting_key = None;
+        }
+        if let Some(index) = add_slot {
+            self.push_undo();
+            let mut g = self.shared.lock().unwrap();
+            if let Some(combo) = g.profile.combos.get_mut(index) {
+                combo.keys.push(0);
+            }
+        }
+        for (index, combo) in snapshots {
+            self.push_undo();
+            if let Some(target) = self.shared.lock().unwrap().profile.combos.get_mut(index) {
+                *target = combo;
+            }
+        }
+        if ui.button("＋ 新增组合键").clicked() {
+            self.push_undo();
+            let m = self.mapper();
+            let (x, y) = (m.rel_x(540), m.rel_y(960));
+            self.shared.lock().unwrap().profile.combos.push(KeyCombo {
+                keys: vec![0, 0],
+                action: Action::Tap {
+                    x,
+                    y,
+                    duration_ms: crate::keymap::DEFAULT_TAP_DURATION_MS,
+                    radius: crate::keymap::DEFAULT_RADIUS,
+                },
+                fps_only: false,
+            });
+            self.scroll_to_new = true;
+        }
+        self.apply_pending_scroll(ui);
     }
 
     fn ui_wheels(&mut self, ui: &mut egui::Ui) {
@@ -3621,7 +6455,6 @@ impl PadApp {
         ui.label("设置[启用键]后变为临时轮盘:仅在启用期间生效,期间方向键的其它绑定让位");
         let mut to_delete: Option<usize> = None;
         let wheel_count = self.shared.lock().unwrap().profile.wheels.len();
-        let dir_names = ["上", "下", "左", "右"];
 
         for i in 0..wheel_count {
             ui.horizontal(|ui| {
@@ -3631,6 +6464,7 @@ impl PadApp {
                     (
                         w.temp.as_ref().map(|t| (t.key, t.mode)),
                         w.mode,
+                        w.kind,
                         format!(
                             "轮盘{}{}",
                             i + 1,
@@ -3638,25 +6472,57 @@ impl PadApp {
                         ),
                     )
                 };
-                let (temp, old_mode, title) = temp_info;
+                let (temp, old_mode, old_kind, title) = temp_info;
                 ui.label(title);
 
-                let mut mode = old_mode;
-                egui::ComboBox::from_id_salt(("wheel_mode", i))
-                    .selected_text(mode.label())
+                let mut kind = old_kind;
+                egui::ComboBox::from_id_salt(("wheel_kind", i))
+                    .selected_text(kind.label())
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut mode, WheelMode::Classic, WheelMode::Classic.label());
-                        ui.selectable_value(&mut mode, WheelMode::Sensitive, WheelMode::Sensitive.label());
+                        for k in [WheelKind::Standard, WheelKind::Custom, WheelKind::Execute] {
+                            ui.selectable_value(&mut kind, k, k.label());
+                        }
                     });
-                if mode != old_mode {
+                if kind != old_kind {
                     self.push_undo();
                     {
                         let mut g = self.shared.lock().unwrap();
                         if let Some(w) = g.profile.wheels.get_mut(i) {
-                            w.mode = mode;
+                            w.kind = kind;
+                            w.ensure_custom_directions();
                         }
                     }
-                    self.log(format!("轮盘模式已切换为: {}", mode.label()));
+                    self.log(format!("轮盘类型已切换为: {}", kind.label()));
+                }
+
+                if kind == WheelKind::Standard {
+                    let mut mode = old_mode;
+                    egui::ComboBox::from_id_salt(("wheel_mode", i))
+                        .selected_text(mode.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut mode,
+                                WheelMode::Classic,
+                                WheelMode::Classic.label(),
+                            );
+                            ui.selectable_value(
+                                &mut mode,
+                                WheelMode::Sensitive,
+                                WheelMode::Sensitive.label(),
+                            );
+                        });
+                    if mode != old_mode {
+                        self.push_undo();
+                        {
+                            let mut g = self.shared.lock().unwrap();
+                            if let Some(w) = g.profile.wheels.get_mut(i) {
+                                w.mode = mode;
+                            }
+                        }
+                        self.log(format!("轮盘模式已切换为: {}", mode.label()));
+                    }
+                } else {
+                    ui.label("双键方向取平均");
                 }
 
                 // 启用键(设置后变为临时轮盘)
@@ -3695,20 +6561,61 @@ impl PadApp {
                     ui.label("(永久)");
                 }
             });
-            ui.horizontal(|ui| {
-                for d in 0..4 {
-                    ui.label(dir_names[d]);
-                    let code = {
-                        let g = self.shared.lock().unwrap();
-                        let w = &g.profile.wheels[i];
-                        [w.up, w.down, w.left, w.right][d]
+            let (dirs, kind) = {
+                let g = self.shared.lock().unwrap();
+                let w = &g.profile.wheels[i];
+                (w.active_dirs(), w.kind)
+            };
+            if kind != WheelKind::Standard {
+                ui.horizontal(|ui| {
+                    ui.label("方向数量:");
+                    let mut count = dirs.len().clamp(2, 8);
+                    let r = ui.add(egui::DragValue::new(&mut count).range(2..=8));
+                    if r.drag_started() || r.gained_focus() {
+                        self.push_undo();
+                    }
+                    if r.changed() {
+                        let mut g = self.shared.lock().unwrap();
+                        g.profile.wheels[i].set_direction_count(count);
+                    }
+                    ui.label("最多 8 个；同时只接受最早按下的 2 个方向并取平均");
+                });
+            }
+            for (d, (angle, code)) in dirs.into_iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let label = match angle.round() as i32 {
+                        -90 => "上".to_string(),
+                        0 => "右".to_string(),
+                        90 => "下".to_string(),
+                        a if a.abs() == 180 => "左".to_string(),
+                        a => format!("{a}°"),
                     };
+                    ui.label(format!("{}{}", label, d + 1));
+                    if kind != WheelKind::Standard {
+                        ui.label("角度:");
+                        let mut a = angle;
+                        let r = ui.add(
+                            egui::DragValue::new(&mut a)
+                                .range(-360.0..=360.0)
+                                .suffix("°"),
+                        );
+                        if r.drag_started() || r.gained_focus() {
+                            self.push_undo();
+                        }
+                        if r.changed() {
+                            let mut g = self.shared.lock().unwrap();
+                            if let Some(dir) = g.profile.wheels[i].directions.get_mut(d) {
+                                dir.angle_deg = a;
+                            }
+                        }
+                    }
+                    ui.label("按键:");
                     let waiting = self.waiting_key == Some(KeySlot::WheelDir { wheel: i, dir: d });
                     if Self::key_button(ui, waiting, Some(code)).clicked() {
                         self.waiting_key = Some(KeySlot::WheelDir { wheel: i, dir: d });
                     }
-                }
-            });
+                });
+            }
             // 半径 / 影响范围:两行放不下(双向滚动区里横排太长),故半径独占一行、
             // 影响范围另起一行,并给出"实际推出的像素距离"便于和游戏里的判定圈对照。
             ui.horizontal(|ui| {
@@ -3741,6 +6648,22 @@ impl PadApp {
                         w.radius = m.rel_len(pr);
                     }
                     wheel_edit |= r.drag_started() || r.gained_focus();
+                    if w.kind == WheelKind::Execute {
+                        ui.label("中心范围:");
+                        let mut cr = m.len(w.center_radius);
+                        let r = ui.add(egui::DragValue::new(&mut cr).range(10..=500).suffix("px"));
+                        if r.changed() {
+                            w.center_radius = m.rel_len(cr);
+                        }
+                        wheel_edit |= r.drag_started() || r.gained_focus();
+                        ui.label("滑动:");
+                        let r = ui.add(
+                            egui::DragValue::new(&mut w.execute_duration_ms)
+                                .range(30..=500)
+                                .suffix("ms"),
+                        );
+                        wheel_edit |= r.drag_started() || r.gained_focus();
+                    }
                     // 影响范围:触点实际推出的距离 = 半径 × 系数。
                     // 半径仍是截图上那个圆环(视觉/响应圈),系数单独决定手指推多远,
                     // 于是可以把"看得见的圈"和"游戏里真实摇杆的判定圈"解耦。
@@ -3783,7 +6706,11 @@ impl PadApp {
                         crate::keymap::DEFAULT_WHEEL_SCOPE;
                 }
                 if ui
-                    .button(if waiting_p { "点击截图..." } else { "取圆心" })
+                    .button(if waiting_p {
+                        "点击截图..."
+                    } else {
+                        "取圆心"
+                    })
                     .clicked()
                 {
                     self.begin_pick(CoordSlot::WheelCenter(i));
@@ -3791,7 +6718,11 @@ impl PadApp {
                 // 与按键一致的"改响应范围":进入后 Ctrl++/- 调半径,或直接在截图上拖动
                 let resizing_w = self.resizing == Some(ResizeTarget::Wheel(i));
                 if ui
-                    .button(if resizing_w { "完成" } else { "改响应范围" })
+                    .button(if resizing_w {
+                        "完成"
+                    } else {
+                        "改响应范围"
+                    })
                     .on_hover_text("进入后用 Ctrl++ / Ctrl+- 缩放半径,或直接在截图上拖动圆圈")
                     .clicked()
                 {
@@ -3814,7 +6745,7 @@ impl PadApp {
             }
             self.log("已删除轮盘");
         }
-        if ui.button("添加轮盘").clicked() {
+        if ui.button("新增轮盘").clicked() {
             self.push_undo();
             // 半径固定 150px、落点避开已有摇杆(见 keymap::Wheel::new_default /
             // next_wheel_spot):新建出来的摇杆不该比用户辛苦调小的那个大一圈,
@@ -3832,20 +6763,44 @@ impl PadApp {
                 g.profile.wheels.len()
             };
             self.log(format!(
-                "已添加轮盘 {n}(半径 {r_px:.0}px,圆心 {:.0}%,{:.0}%)",
+                "已新增轮盘 {n}(半径 {r_px:.0}px,圆心 {:.0}%,{:.0}%)",
                 cx * 100.0,
                 cy * 100.0
             ));
+            self.scroll_to_new = true;
         }
+        self.apply_pending_scroll(ui);
     }
 
+    /// 新建一个默认轮盘，并返回它在配置中的下标。
+    fn add_wheel_default(&mut self) -> usize {
+        self.push_undo();
+        self.scroll_to_new = true;
+        let m = self.mapper();
+        let (cx, cy) = {
+            let g = self.shared.lock().unwrap();
+            crate::keymap::next_wheel_spot(&g.profile.wheels)
+        };
+        let wheel = Wheel::new_default(&m, cx, cy);
+        let r_px = m.len(wheel.radius);
+        let n = {
+            let mut g = self.shared.lock().unwrap();
+            g.profile.wheels.push(wheel);
+            g.profile.wheels.len()
+        };
+        self.log(format!(
+            "已新增轮盘 {n}(半径 {r_px:.0}px,圆心 {:.0}%,{:.0}%)",
+            cx * 100.0,
+            cy * 100.0
+        ));
+        n - 1
+    }
     /// 在手机截图上叠加显示所有键位/轮盘的位置示意
     fn draw_overlay(&self, ui: &egui::Ui, rect: egui::Rect, scale: f32) {
         use egui::{Align2, FontId, Stroke, vec2};
         use theme::size;
         let painter = ui.painter();
-        let to_screen =
-            |x: i32, y: i32| rect.min + vec2(x as f32 * scale, y as f32 * scale);
+        let to_screen = |x: i32, y: i32| rect.min + vec2(x as f32 * scale, y as f32 * scale);
         let short_name = |code: u16| key_name(code).replace("KEY_", "");
 
         // 坐标换算器必须**先**构造好(它内部会加配置锁);
@@ -3864,20 +6819,22 @@ impl PadApp {
         };
 
         // 键位(含草稿标记)仅在"全部/仅键位"时显示
-        if matches!(self.overlay_filter, OverlayFilter::All | OverlayFilter::Keys) {
+        if self.overlay_filter.keys {
             let fps_overlay_active = g.aim_live.mode_active && !g.aim_live.suspended;
             for (i, b) in g.profile.binds.iter().enumerate() {
-                if b.fps_only && !fps_overlay_active {
+                if matches!(b.action, Action::Macro(_)) {
                     continue;
                 }
+                // 仅 FPS 键位始终显示，方便用户在截图取点阶段看见。
+                // 独立紫色与普通点按/长按区分；FPS 运行中提亮。
+                // 表示它此刻正在抢占同键普通映射。
+                let fps_only_dim = if b.fps_only && !fps_overlay_active {
+                    0.68
+                } else {
+                    1.0
+                };
                 match &b.action {
-                    Action::Tap {
-                        x,
-                        y,
-                        radius,
-                        ..
-                    }
-                    | Action::Hold { x, y, radius } => {
+                    Action::Tap { x, y, radius, .. } | Action::Hold { x, y, radius } => {
                         let (px, py) = (m.x(*x), m.y(*y));
                         let p = to_screen(px, py);
                         let r = m.len(*radius) * scale;
@@ -3885,11 +6842,17 @@ impl PadApp {
                         // 修改响应范围中的键位显示黄色;否则点按绿、长按橙
                         let (ring, fill) = if self.resizing == Some(ResizeTarget::Bind(i)) {
                             (th.key_resize, th.key_resize_fill)
+                        } else if b.fps_only {
+                            (th.key_fps, th.key_fps_fill)
                         } else if matches!(b.action, Action::Tap { .. }) {
                             (th.key_tap, th.key_tap_fill)
                         } else {
                             (th.key_hold, th.key_hold_fill)
                         };
+                        let (ring, fill) = (
+                            ring.gamma_multiply(fps_only_dim),
+                            fill.gamma_multiply(fps_only_dim),
+                        );
                         let (ring, fill) = theme::tone_ring_fill(ring, fill, tone);
                         painter.circle_filled(p, r, fill);
                         // 外套(halo):先画一圈反相粗线,再画本色圈 ——
@@ -3925,6 +6888,7 @@ impl PadApp {
                         );
                     }
                     Action::AndroidKey { .. } => {}
+                    Action::Macro(_) => {}
                 }
             }
             // 草稿(新增绑定)高亮:0 不显示,1 显示点/圈,2 显示滑动轨迹。
@@ -3973,10 +6937,127 @@ impl PadApp {
             }
         }
 
+        // 组合键没有单独的“触发坐标”，在动作落点绘制蓝色组合标记；滑动沿用轨迹。
+        if self.overlay_filter.combos {
+            for (ci, combo) in g.profile.combos.iter().enumerate() {
+                let keys = combo
+                    .keys
+                    .iter()
+                    .filter(|k| **k != 0)
+                    .map(|k| short_name(*k))
+                    .collect::<Vec<_>>()
+                    .join("+");
+                match &combo.action {
+                    Action::Tap { x, y, radius, .. } | Action::Hold { x, y, radius } => {
+                        let (px, py) = (m.x(*x), m.y(*y));
+                        let p = to_screen(px, py);
+                        let r = m.len(*radius) * scale;
+                        let tone = tone_at(px, py);
+                        let ink = theme::tone_color(th.accent, tone);
+                        painter.circle_filled(p, r, theme::with_alpha(ink, 45));
+                        painter.circle_stroke(
+                            p,
+                            r,
+                            Stroke::new(size::KEY_STROKE + 2.0, theme::casing(ink)),
+                        );
+                        painter.circle_stroke(p, r, Stroke::new(size::KEY_STROKE, ink));
+                        theme::paint_label(
+                            painter,
+                            p,
+                            Align2::CENTER_CENTER,
+                            &format!("组合{}", ci + 1),
+                            FontId::proportional(size::SMALL_FONT),
+                            theme::tone_text(tone),
+                        );
+                        if !keys.is_empty() {
+                            theme::paint_label(
+                                painter,
+                                p + vec2(0.0, r + 10.0),
+                                Align2::CENTER_CENTER,
+                                &keys,
+                                FontId::proportional(size::SMALL_FONT),
+                                ink,
+                            );
+                        }
+                    }
+                    Action::Swipe(s) => {
+                        let sp = m.point(s.start.0, s.start.1);
+                        let ep = m.point(s.end.0, s.end.1);
+                        draw_swipe_track(
+                            painter,
+                            &th,
+                            s.path,
+                            sp,
+                            ep,
+                            &to_screen,
+                            scale,
+                            &format!("组合{} {}", ci + 1, keys),
+                            tone_at(sp.0, sp.1),
+                        );
+                    }
+                    Action::AndroidKey { .. } | Action::Macro(_) => {}
+                }
+            }
+        }
+
+        // 宏没有固定落点，用截图左下角的标签列出触发键，确保浮层和虚拟键盘
+        // 都能直接看到宏；原始动作不会挤占截图。
+        if self.overlay_filter.macros {
+            let macros: Vec<(u16, u32)> = g
+                .profile
+                .binds
+                .iter()
+                .filter_map(|b| match &b.action {
+                    Action::Macro(m) => Some((
+                        b.key,
+                        m.steps
+                            .iter()
+                            .map(|s| s.delay_ms)
+                            .sum::<u32>()
+                            .saturating_add(
+                                m.instructions
+                                    .iter()
+                                    .map(|i| match i {
+                                        MacroInstruction::Delay { ms } => *ms,
+                                        MacroInstruction::Key { duration_ms, .. }
+                                        | MacroInstruction::Combo { duration_ms, .. }
+                                        | MacroInstruction::Wheel { duration_ms, .. }
+                                        | MacroInstruction::Click { duration_ms, .. }
+                                        | MacroInstruction::Swipe { duration_ms, .. } => {
+                                            *duration_ms
+                                        }
+                                        MacroInstruction::Fps { .. }
+                                        | MacroInstruction::Macro { .. } => 0,
+                                    })
+                                    .sum::<u32>(),
+                            ),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            for (n, (key, ms)) in macros.iter().take(8).enumerate() {
+                let pos = rect.min + vec2(12.0, 20.0 + n as f32 * 18.0);
+                painter.rect_filled(
+                    egui::Rect::from_min_size(
+                        pos - vec2(6.0, 9.0),
+                        vec2(rect.width().min(260.0) - 12.0, 18.0),
+                    ),
+                    3.0,
+                    th.key_macro_fill,
+                );
+                theme::paint_label(
+                    painter,
+                    pos,
+                    Align2::LEFT_CENTER,
+                    &format!("宏 {} / {}ms", short_name(*key), ms),
+                    FontId::proportional(size::SMALL_FONT),
+                    th.key_macro,
+                );
+            }
+        }
+
         // FPS 瞄准锚点:与键位一样画在截图上,标出鼠标拖动时的落点起点
-        if matches!(self.overlay_filter, OverlayFilter::All | OverlayFilter::Aim)
-            && g.profile.aim.anchor_set()
-        {
+        if self.overlay_filter.aim && g.profile.aim.anchor_set() {
             let aim = &g.profile.aim;
             let (ax, ay) = (m.x(aim.anchor_x), m.y(aim.anchor_y));
             let p = to_screen(ax, ay);
@@ -4031,12 +7112,12 @@ impl PadApp {
         }
 
         // 轮盘按过滤条件显示;临时轮盘用虚线圆环区分
-        if !matches!(self.overlay_filter, OverlayFilter::Keys | OverlayFilter::Aim) {
+        if self.overlay_filter.wheels_perm || self.overlay_filter.wheels_temp {
             for (wi, w) in g.profile.wheels.iter().enumerate() {
-                let show = match self.overlay_filter {
-                    OverlayFilter::PermWheels => w.temp.is_none(),
-                    OverlayFilter::TempWheels => w.temp.is_some(),
-                    _ => true,
+                let show = if w.temp.is_none() {
+                    self.overlay_filter.wheels_perm
+                } else {
+                    self.overlay_filter.wheels_temp
                 };
                 if !show {
                     continue;
@@ -4056,12 +7137,20 @@ impl PadApp {
                 // (用户反馈:那一长串字压在游戏画面上,既挡视野又看不清)。
                 let quick_label = format!(
                     "{}{}",
-                    if w.temp.is_some() { "临时摇杆" } else { "摇杆" },
+                    if w.temp.is_some() {
+                        "临时摇杆"
+                    } else {
+                        "摇杆"
+                    },
                     wi + 1
                 );
                 if let Some(t) = &w.temp {
                     // 临时轮盘:虚线圆环(摇杆的视觉结构不变,只按亮度档位调明暗)
-                    let base = if resizing_this { th.key_resize } else { th.wheel_temp };
+                    let base = if resizing_this {
+                        th.key_resize
+                    } else {
+                        th.wheel_temp
+                    };
                     let color = theme::tone_color(base, tone);
                     let n = 48;
                     let pts: Vec<egui::Pos2> = (0..=n)
@@ -4071,28 +7160,29 @@ impl PadApp {
                         })
                         .collect();
                     // 外套:先用反相粗虚线垫一层,再画本色虚线
-                    for shape in
-                        egui::Shape::dashed_line(&pts, Stroke::new(5.0, theme::casing(color)), 6.0, 5.0)
-                    {
+                    for shape in egui::Shape::dashed_line(
+                        &pts,
+                        Stroke::new(5.0, theme::casing(color)),
+                        6.0,
+                        5.0,
+                    ) {
                         painter.add(shape);
                     }
-                    for shape in
-                        egui::Shape::dashed_line(&pts, Stroke::new(2.0, color), 6.0, 5.0)
-                    {
+                    for shape in egui::Shape::dashed_line(&pts, Stroke::new(2.0, color), 6.0, 5.0) {
                         painter.add(shape);
                     }
                     if selected {
-                        painter.circle_stroke(
-                            c,
-                            r + 6.0,
-                            Stroke::new(1.5, theme::tone_text(tone)),
-                        );
+                        painter.circle_stroke(c, r + 6.0, Stroke::new(1.5, theme::tone_text(tone)));
                     }
                     painter.circle_filled(c, 5.0, color);
                     // 圆心那个小圈是"摇杆"观感的关键:它让圆心看起来是个可推的摇杆头,
                     // 所以无论亮度档位怎么调都保留(只跟着一起调明暗)
                     let knob = theme::tone_color(egui::Color32::WHITE, tone);
-                    painter.circle_stroke(c, size::WHEEL_RING, Stroke::new(3.5, theme::casing(knob)));
+                    painter.circle_stroke(
+                        c,
+                        size::WHEEL_RING,
+                        Stroke::new(3.5, theme::casing(knob)),
+                    );
                     painter.circle_stroke(c, size::WHEEL_RING, Stroke::new(1.0, knob));
                     theme::paint_label(
                         painter,
@@ -4105,20 +7195,24 @@ impl PadApp {
                     let _ = t;
                 } else {
                     // 永久轮盘:实线圆环
-                    let base = if resizing_this { th.key_resize } else { th.wheel_perm };
+                    let base = if resizing_this {
+                        th.key_resize
+                    } else {
+                        th.wheel_perm
+                    };
                     let color = theme::tone_color(base, tone);
                     painter.circle_stroke(c, r, Stroke::new(6.0, theme::casing(color)));
                     painter.circle_stroke(c, r, Stroke::new(size::KEY_STROKE, color));
                     if selected {
-                        painter.circle_stroke(
-                            c,
-                            r + 6.0,
-                            Stroke::new(1.5, theme::tone_text(tone)),
-                        );
+                        painter.circle_stroke(c, r + 6.0, Stroke::new(1.5, theme::tone_text(tone)));
                     }
                     painter.circle_filled(c, 5.0, color);
                     let knob = theme::tone_color(egui::Color32::WHITE, tone);
-                    painter.circle_stroke(c, size::WHEEL_RING, Stroke::new(3.5, theme::casing(knob)));
+                    painter.circle_stroke(
+                        c,
+                        size::WHEEL_RING,
+                        Stroke::new(3.5, theme::casing(knob)),
+                    );
                     painter.circle_stroke(c, size::WHEEL_RING, Stroke::new(1.0, knob));
                     theme::paint_label(
                         painter,
@@ -4140,9 +7234,12 @@ impl PadApp {
                         })
                         .collect();
                     let ring_ink = theme::tone_color(th.key_hold, tone);
-                    for shape in
-                        egui::Shape::dashed_line(&pts, Stroke::new(3.5, theme::casing(ring_ink)), 7.0, 6.0)
-                    {
+                    for shape in egui::Shape::dashed_line(
+                        &pts,
+                        Stroke::new(3.5, theme::casing(ring_ink)),
+                        7.0,
+                        6.0,
+                    ) {
                         painter.add(shape);
                     }
                     for shape in
@@ -4197,6 +7294,16 @@ impl PadApp {
             EasingEditTarget::Bind(i) => {
                 let g = self.shared.lock().unwrap();
                 match g.profile.binds.get(i).map(|b| &b.action) {
+                    Some(Action::Swipe(s)) => s.easing,
+                    _ => {
+                        self.easing_edit = None;
+                        return;
+                    }
+                }
+            }
+            EasingEditTarget::Combo(i) => {
+                let g = self.shared.lock().unwrap();
+                match g.profile.combos.get(i).map(|c| &c.action) {
                     Some(Action::Swipe(s)) => s.easing,
                     _ => {
                         self.easing_edit = None;
@@ -4266,6 +7373,13 @@ impl PadApp {
                 EasingEditTarget::Bind(i) => {
                     if let Some(b) = g.profile.binds.get_mut(i) {
                         if let Action::Swipe(s) = &mut b.action {
+                            s.easing = easing;
+                        }
+                    }
+                }
+                EasingEditTarget::Combo(i) => {
+                    if let Some(combo) = g.profile.combos.get_mut(i) {
+                        if let Action::Swipe(s) = &mut combo.action {
                             s.easing = easing;
                         }
                     }
@@ -4415,6 +7529,46 @@ impl PadApp {
         self.shared.lock().unwrap().profile.look.theme()
     }
 
+    /// 当前界面风格(默认/鸿蒙/可视化)。布局分支一律经它判断。
+    /// 读的是 `self.style`(界面级),不是 `profile.look.style`:后者会被
+    /// "切换按键组合"整体替换掉(见 `stamp_style`)。
+    fn ui_style(&self) -> theme::UiStyle {
+        self.style
+    }
+
+    /// 把界面风格回写进共享配置(每帧一次,值不变时零开销)。
+    ///
+    /// 为什么需要它:切换按键组合 / 按切换键换组合时,`profile` 会被 YAML 里的那套
+    /// 整体替换,而 YAML 的 `look` 没有 `style` 字段(反序列化缺省 = 默认风格)。
+    /// 如果不守住,用户会看到"切一下组合,整个 UI 变回默认"——这正是被反馈的 bug。
+    /// 风格是界面级设置,只能由界面侧持有并在换组合后重新盖上。
+    fn stamp_style(&mut self) {
+        let style = self.style;
+        let mut g = self.shared.lock().unwrap();
+        if g.profile.look.style != style {
+            g.profile.look.style = style;
+        }
+    }
+
+    /// 请求切换界面风格:写进配置并立即落盘(look.json),然后关闭窗口。
+    /// main.rs 的重启循环随后用新风格重开 UI(见文件头 STYLE_RESTART 的说明)。
+    fn request_style_restart(&mut self, ctx: &egui::Context, new_style: theme::UiStyle) {
+        self.style = new_style;
+        {
+            let mut g = self.shared.lock().unwrap();
+            g.profile.look.style = new_style;
+            let look = g.profile.look.clone();
+            drop(g);
+            self.persist_look(&look);
+        }
+        self.log(format!(
+            "界面风格切换为「{}」: 正在关闭并重新打开窗口...",
+            new_style.label()
+        ));
+        STYLE_RESTART.store(true, Ordering::SeqCst);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
     /// 当前外观设置
     fn look(&self) -> theme::Look {
         self.shared.lock().unwrap().profile.look.clone()
@@ -4433,7 +7587,9 @@ impl PadApp {
 
     /// 保存前补全配置元信息:记录这份布局是按哪个分辨率设计的(仅供显示参考)
     fn stamp_profile_meta(&mut self) {
-        let Some(space) = self.screen_size() else { return };
+        let Some(space) = self.screen_size() else {
+            return;
+        };
         let mut g = self.shared.lock().unwrap();
         if g.profile.format_version >= crate::keymap::PROFILE_VERSION {
             g.profile.screen = Some(space);
@@ -4475,22 +7631,836 @@ impl PadApp {
         }
     }
 
-    /// 外观设置面板:配色 / 控件密度 / 背景图(改动可撤销,随配置保存)
+    /// 配置区(保存/另存为/选用/新建/默认/检测/保存日志)。
+    /// 默认与可视化风格放在左栏;鸿蒙风格放在"按键映射"页的卡片里 —— 两条布局共用这一份。
+    fn ui_profile_config(&mut self, ui: &mut egui::Ui) {
+        ui.heading("配置");
+        ui.horizontal(|ui| {
+            if ui.button("保存配置").clicked() {
+                self.save_profile();
+            }
+            if ui.button("另存为...").clicked() {
+                self.dialog = Some(crate::filedialog::save_file("scrcpy-pad-profile.yaml"));
+                self.dialog_purpose = DialogPurpose::SaveProfileAs;
+            }
+            if ui.button("重新加载").clicked() {
+                self.reload_profile_from_current();
+            }
+        });
+        // 键位文件重定向:指定任意目录/文件名为当前键位(可无文件则新建)。
+        // 用 horizontal_wrapped:左栏可以被拖窄,按钮多了以后换行总比被裁掉好
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("选用配置...").clicked() {
+                self.dialog = Some(crate::filedialog::pick_file());
+                self.dialog_purpose = DialogPurpose::ChooseProfile;
+            }
+            if ui.button("新建配置...").clicked() {
+                self.dialog = Some(crate::filedialog::save_file("scrcpy-pad-profile.yaml"));
+                self.dialog_purpose = DialogPurpose::NewProfile;
+            }
+            if ui
+                .button("默认配置")
+                .on_hover_text("切回程序默认的配置文件(首次运行时自动创建的那份),并加载它的内容")
+                .clicked()
+            {
+                self.load_default_profile();
+            }
+            if ui.button("检测当前 yaml").clicked() {
+                self.check_current_profile();
+            }
+        });
+        // 长路径必须**换行**,否则会把整个左栏撑宽,挤掉中央的键位/键盘区
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(format!(
+                    "当前配置文件: {}{}",
+                    self.profile_path.display(),
+                    if self.profile_path == profile_path() {
+                        " (默认)"
+                    } else {
+                        ""
+                    }
+                ))
+                .small(),
+            )
+            .wrap(),
+        );
+        if ui.button("保存日志...").clicked() {
+            let serial = self.serial();
+            if serial.is_empty() {
+                self.log("错误: 未选择设备(日志需包含设备信息)");
+            } else {
+                let ver = if self.server_version.is_empty() {
+                    adb::scrcpy_version_at(&self.scrcpy_path).unwrap_or_default()
+                } else {
+                    self.server_version.clone()
+                };
+                let (tx, rx) = channel();
+                self.loginfo_rx = Some(rx);
+                self.log("正在收集设备信息...");
+                std::thread::spawn(move || {
+                    let info = adb::device_info(&serial, &ver);
+                    let _ = tx.send(info);
+                });
+            }
+        }
+    }
+
+    /// scrcpy 三件套的定位与管理(目录/自动寻找/测试/记住路径/打开配置目录)。
+    /// 默认与可视化风格放在左栏;鸿蒙风格放在"连接与设备"页的卡片里。
+    fn ui_scrcpy_manage(&mut self, ui: &mut egui::Ui) {
+        ui.heading("scrcpy 管理");
+        ui.small(
+            "官方 Windows 包里 scrcpy.exe、scrcpy-server、adb.exe 三者同目录。\n\
+             可以直接指定 scrcpy 所在**目录**(最省事),也可以只填其中一个文件,\n\
+             其余留空会自动补齐。",
+        );
+        // scrcpy 目录:用户最自然的用法就是把发行包那个文件夹指给它
+        ui.horizontal(|ui| {
+            ui.label("scrcpy 目录");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.scrcpy_dir)
+                    .desired_width(220.0)
+                    .hint_text("例如 D:\\scrcpy-win64-v3.3"),
+            );
+            if ui.small_button("浏览目录").clicked() {
+                self.dialog = Some(crate::filedialog::pick_folder());
+                self.dialog_purpose = DialogPurpose::ScrcpyDir;
+            }
+            if ui
+                .small_button("应用")
+                .on_hover_text("按这个目录补齐 scrcpy / server / adb")
+                .clicked()
+            {
+                self.apply_scrcpy_dir();
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.button("自动寻找全部").clicked() {
+                match adb::find_scrcpy() {
+                    Some(p) => {
+                        self.scrcpy_path = p.display().to_string();
+                        if let Some(d) = PathBuf::from(&self.scrcpy_path).parent() {
+                            self.scrcpy_dir = d.display().to_string();
+                        }
+                        self.log(format!("已找到 scrcpy: {}", self.scrcpy_path));
+                        self.resync();
+                        self.test_scrcpy();
+                        self.save_settings_now();
+                    }
+                    None => self.log("未找到 scrcpy,请手动指定它所在目录或 scrcpy.exe"),
+                }
+            }
+            if ui.button("测试并刷新").clicked() {
+                self.resync();
+                self.test_scrcpy();
+                // 验证 adb 是否真的可运行(打印版本行),便于诊断
+                if let Some(exe) = self.effective_adb() {
+                    let exe_s = exe.display().to_string();
+                    match adb::adb_version_at(&exe_s) {
+                        Some(v) => self.log(format!("adb 版本: {v}")),
+                        None => self.log(format!("adb 可执行失败,无法读取版本: {exe_s}")),
+                    }
+                } else {
+                    self.log("未找到 adb(可点击上方 [浏览]/[自动] 手动指定)");
+                }
+                self.refresh_devices();
+            }
+        });
+        // 记住路径:与主题(look.json)一样存在配置目录里,重启后自动沿用
+        ui.horizontal(|ui| {
+            if ui
+                .checkbox(&mut self.remember_paths, "记住路径(下次启动直接用)")
+                .on_hover_text(
+                    "把 scrcpy / scrcpy-server / adb 路径、scrcpy 目录与启动参数存到\n\
+                     配置目录的 settings.json,即使 scrcpy 目录不在程序同级,\n\
+                     重启后也不必重新寻找。关掉它只是『下次启动不再使用』,\n\
+                     文件里已记住的路径会保留。",
+                )
+                .changed()
+            {
+                if self.remember_paths {
+                    self.log("已开启记住路径: 本次路径将写入 settings.json");
+                } else {
+                    self.log("已关闭记住路径: 下次启动不再使用其中的路径(文件里已记住的内容保留)");
+                }
+                // 开关状态本身立刻落盘,免得下次启动又变回上一次的样子
+                self.save_settings_now();
+            }
+            if ui
+                .small_button("打开配置目录")
+                .on_hover_text("profile.yaml / look.json / settings.json 所在目录")
+                .clicked()
+            {
+                self.open_config_dir();
+            }
+        });
+        if let Some((ok, msg)) = &self.test_msg {
+            let th = self.theme();
+            ui.colored_label(if *ok { th.ok } else { th.danger }, msg);
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("scrcpy.exe ");
+            ui.text_edit_singleline(&mut self.scrcpy_path);
+            if ui.small_button("浏览").clicked() {
+                self.dialog = Some(crate::filedialog::pick_file());
+                self.dialog_purpose = DialogPurpose::ScrcpyExe;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("scrcpy-server");
+            ui.text_edit_singleline(&mut self.server_path);
+            if ui.small_button("浏览").clicked() {
+                self.dialog = Some(crate::filedialog::pick_file());
+                self.dialog_purpose = DialogPurpose::ServerJar;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("adb.exe    ");
+            ui.text_edit_singleline(&mut self.adb_path);
+            if ui.small_button("浏览").clicked() {
+                self.dialog = Some(crate::filedialog::pick_file());
+                self.dialog_purpose = DialogPurpose::AdbExe;
+            }
+            if ui.small_button("自动").clicked() {
+                match self.effective_adb() {
+                    Some(p) => {
+                        self.adb_path = p.display().to_string();
+                        self.log(format!("adb: {}", self.adb_path));
+                        self.resync();
+                    }
+                    None => self.log("未找到 adb,请手动指定路径或加入 PATH"),
+                }
+            }
+        });
+        let adb_eff = self
+            .effective_adb()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "未找到(将回退 PATH 的 adb)".to_string());
+        let ver_txt = if self.server_version.is_empty() {
+            "未检测".to_string()
+        } else {
+            self.server_version.clone()
+        };
+        ui.small(format!("当前 adb: {adb_eff}"));
+        ui.small(format!("server 版本: {ver_txt}"));
+    }
+
+    /// 总开关键 + [映射时屏蔽原键] 勾选(默认/可视化风格在左栏中段;鸿蒙在"连接与设备"页)
+    fn ui_toggle_key_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("总开关键:");
+            let tk = { self.shared.lock().unwrap().profile.toggle_key };
+            let waiting = self.waiting_key == Some(KeySlot::Toggle);
+            if Self::key_button(ui, waiting, Some(tk)).clicked() {
+                self.waiting_key = Some(KeySlot::Toggle);
+            }
+        });
+        ui.checkbox(
+            &mut self.grab_enabled,
+            "映射时屏蔽原键(grab)\n注意:开启后映射期间键盘只对本程序生效",
+        );
+    }
+
+    /// 引擎运行状态一行(触点占用 / 因池满被放弃)。
+    /// 默认/可视化风格在左栏中段;鸿蒙在"连接与设备"页与底部状态栏。
+    fn ui_engine_status(&mut self, ui: &mut egui::Ui) {
+        let g = self.shared.lock().unwrap();
+        let st = g.live;
+        let th = g.profile.look.theme();
+        let max = crate::engine::DEVICE_MAX_POINTERS;
+        let (color, tail) = if st.refused > 0 {
+            (
+                th.warn,
+                format!(
+                    "(最近被放弃的是 {})",
+                    if st.last_refused == 0 {
+                        "瞄准".to_string()
+                    } else {
+                        key_name(st.last_refused)
+                    }
+                ),
+            )
+        } else {
+            (th.muted, String::new())
+        };
+        ui.colored_label(
+            color,
+            format!(
+                "引擎: 触点 {}/{} · 因触点池满被放弃 {} 次{tail}",
+                st.pointers, max, st.refused
+            ),
+        )
+        .on_hover_text(
+            "设备端同时最多认 10 个触点(普通键位 + 摇杆 + 瞄准共用)。\n\
+             这里显示此刻占用了几个。\n\
+             若『被放弃』不为 0,说明某一刻同时按住的键比设备能接的还多 ——\n\
+             那一次按下会被设备直接丢掉(表现为『按了没反应』),日志里也会记。",
+        );
+    }
+
+    /// 运行日志列表(默认/可视化风格在左栏底部;鸿蒙在"诊断"页)
+    fn ui_log_list(&self, ui: &mut egui::Ui, max_h: f32) {
+        egui::ScrollArea::vertical()
+            .id_salt("log_list")
+            .stick_to_bottom(true)
+            .max_height(max_h)
+            .show(ui, |ui| {
+                for l in self.logs.iter().rev().take(500) {
+                    ui.monospace(l);
+                }
+            });
+    }
+
+    fn ui_log_card(&mut self, ui: &mut egui::Ui, max_h: f32) {
+        ui.horizontal(|ui| {
+            ui.heading("日志");
+            if ui
+                .button(if self.log_window_open {
+                    "关闭弹窗"
+                } else {
+                    "弹窗查看"
+                })
+                .clicked()
+            {
+                self.log_window_open = !self.log_window_open;
+            }
+        });
+
+        self.ui_log_list(ui, max_h.max(80.0));
+    }
+
+    fn ui_log_window(&mut self, ctx: &egui::Context) {
+        if !self.log_window_open {
+            return;
+        }
+        let mut open = self.log_window_open;
+        egui::Window::new("scrcpy-pad 日志")
+            .open(&mut open)
+            .default_size([760.0, 460.0])
+            .min_size([420.0, 240.0])
+            .resizable(true)
+            .show(ctx, |ui| self.ui_log_list(ui, 420.0));
+        self.log_window_open = open;
+    }
+
+    // ==================== 顶栏动作(两个布局共用) ====================
+    //
+    // 默认/可视化风格的顶栏与鸿蒙风格的顶栏都调用这几个方法,
+    // 保证"按一下做同一件事"只有一份实现(与 ui_bind_row 的纪律一致)。
+
+    /// [刷新设备]:重新定位三件套并刷新设备列表
+    fn act_refresh_devices(&mut self) {
+        self.resync();
+        self.refresh_devices();
+    }
+
+    /// [启动 scrcpy]:准备参数、启动、把关键输出接进日志
+    fn act_launch_scrcpy(&mut self) {
+        // 启动前联动一次:确保 server/adb 路径已就绪(如已手动粘贴 scrcpy 路径)
+        self.resync();
+        let launch_args = self.prepare_scrcpy_args();
+        self.log(format!("scrcpy 启动参数: {launch_args}"));
+        match adb::launch_scrcpy(&self.scrcpy_path, &self.serial(), &launch_args) {
+            Ok(rx) => {
+                self.scrcpy_status_rx = Some(rx);
+                self.log("scrcpy 启动请求已发送；stdout/stderr/退出码会显示在日志区，完整内容见 diagnostics.log");
+                // 部分机型音频转发起步慢,自动补一次音量键唤醒
+                self.wake_audio();
+            }
+            Err(e) => self.log(format!("启动失败: {e:#}")),
+        }
+    }
+
+    /// 顶栏的"映射: 开/关"按钮。关闭映射必须走引擎的收尾(抬起所有按住的触点),
+    /// 否则手机上会"卡键" —— 这里只置请求位,由引擎在下一轮(≤4ms)执行。
+    fn act_toggle_mapping(&mut self) {
+        let now = {
+            let mut g = self.shared.lock().unwrap();
+            g.enabled = !g.enabled;
+            if !g.enabled {
+                g.toolbar_release = true;
+            }
+            g.enabled
+        };
+        if now {
+            self.log("映射已开启");
+        } else {
+            self.log("映射已关闭: 正在抬起全部触点");
+        }
+    }
+
+    /// scrcpy 启动参数行(参数框 + 助手 + 启动预设 + [启动 scrcpy])。
+    /// 默认/可视化风格在顶栏;鸿蒙风格在"连接与设备"页的卡片里 —— 共用这一份。
+    fn ui_scrcpy_launch_row(&mut self, ui: &mut egui::Ui) {
+        ui.label("scrcpy参数:");
+        if ui
+            .small_button("...")
+            .on_hover_text("打开常用参数助手")
+            .clicked()
+        {
+            self.args_helper = Some(ArgHelp::defaults());
+        }
+        ui.add(egui::TextEdit::singleline(&mut self.scrcpy_args).desired_width(200.0));
+        // 启动预设:分辨率预设先重置为默认再叠加;音频类直接在现有参数上增删
+        let preset_resp = egui::ComboBox::from_id_salt("startpreset")
+            .selected_text("启动预设")
+            .show_ui(ui, |ui| {
+                for p in [
+                    StartPreset::None,
+                    StartPreset::Uhd2k,
+                    StartPreset::Uhd4k,
+                    StartPreset::Fhd1080,
+                    StartPreset::Hd720,
+                    StartPreset::NoAudio,
+                    StartPreset::WithAudio,
+                ] {
+                    if ui.selectable_label(false, p.label()).clicked() {
+                        self.apply_start_preset(p);
+                    }
+                }
+            });
+        preset_resp.response.on_hover_text(
+            "分辨率预设只是给 scrcpy 传 --max-size(最长边上限)。\n\
+             scrcpy 只缩小、不放大:设备本身能输出多高,画面上限就是多高。\n\
+             例如手机屏幕只有 1080p,选 4k 也拿不到 4k。",
+        );
+        if ui.button("启动 scrcpy").clicked() {
+            self.act_launch_scrcpy();
+        }
+    }
+
+    // ==================== 鸿蒙风格:照 harmonyos-pc(HDC UI)重新设计的界面 ====================
+    //
+    // 这不是"默认界面换个底色":整张界面的**骨架重新排过** ——
+    //   ┌ 顶栏(白底 + 细线): ● scrcpy-pad [设备▼] [状态 pill] … [使用说明][刷新设备][连接/断开][保存配置] ┐
+    //   ├ 左侧导航(图标+文字,选中淡蓝底) ┬ 中央:卡片页(浅灰底) ┬ 右侧:屏幕预览(截图取点) ┤
+    //   └ 底部状态栏:最新一条日志 ………… [引擎: 触点 n/10]                                  ┘
+    // 每个页面的内容都调用与默认风格**同一份**实现(ui_profile_config / ui_scrcpy_manage /
+    // ui_binds / ui_wheels / ui_aim / ui_look / ui_diagnostics …),所以不存在"鸿蒙少了某个功能"。
+
+    fn layout_harmony(
+        &mut self,
+        ui: &mut egui::Ui,
+        connected: bool,
+        enabled: bool,
+        mouse_captured: bool,
+    ) {
+        let line = egui::Stroke::new(1.0, theme::harmony::LINE);
+        let panel = |ui: &egui::Ui, inner: egui::Margin| {
+            egui::Frame::default()
+                .fill(ui.visuals().window_fill)
+                .inner_margin(inner)
+                .stroke(line)
+        };
+        // ---- 顶栏 ----
+        egui::Panel::top("h_top")
+            .frame(panel(ui, egui::Margin::symmetric(16, 10)))
+            .show(ui, |ui| self.h_top_bar(ui, connected, enabled));
+        // ---- 底部状态栏(最新一条日志 + 引擎状态) ----
+        egui::Panel::bottom("h_status")
+            .frame(panel(ui, egui::Margin::symmetric(14, 7)))
+            .show(ui, |ui| self.h_status_bar(ui));
+        // ---- 左侧导航 ----
+        egui::Panel::left("h_nav")
+            .resizable(false)
+            .default_size(196.0)
+            .frame(panel(ui, egui::Margin::symmetric(12, 16)))
+            .show(ui, |ui| self.h_nav(ui));
+        // ---- 右侧:屏幕预览(= 截图取点,原样复用) ----
+        egui::Panel::right("h_preview")
+            .resizable(true)
+            .default_size(430.0)
+            .min_size(300.0)
+            .frame(panel(ui, egui::Margin::same(16)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("屏幕预览");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some((_, w, h)) = &self.shot {
+                            ui.small(format!("{w} × {h}"));
+                        }
+                    });
+                });
+                egui::ScrollArea::both()
+                    .id_salt("h_preview_scroll")
+                    .show(ui, |ui| self.ui_picker_body(ui));
+            });
+        // ---- 中央:当前导航页(卡片) ----
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::default()
+                    .fill(ui.visuals().panel_fill)
+                    .inner_margin(egui::Margin::same(16)),
+            )
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("h_page_scroll")
+                    .show(ui, |ui| self.h_page_body(ui, mouse_captured));
+            });
+    }
+
+    /// 鸿蒙风格顶栏:标题 + 设备 + 状态 pill + 主操作按钮
+    fn h_top_bar(&mut self, ui: &mut egui::Ui, connected: bool, enabled: bool) {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("●")
+                    .size(18.0)
+                    .color(theme::harmony::PRIMARY),
+            );
+            ui.heading(
+                egui::RichText::new("scrcpy-pad")
+                    .strong()
+                    .color(theme::harmony::TEXT),
+            );
+            ui.label(egui::RichText::new("触控映射").color(theme::harmony::MUTED));
+            ui.separator();
+            let cur = self.serial();
+            egui::ComboBox::from_id_salt("h_dev")
+                .selected_text(if cur.is_empty() {
+                    "无设备".to_string()
+                } else {
+                    cur
+                })
+                .show_ui(ui, |ui| {
+                    for (i, d) in self.devices.iter().enumerate() {
+                        ui.selectable_value(&mut self.selected, i, d);
+                    }
+                });
+            Self::h_pill(
+                ui,
+                if connected {
+                    "控制已连接"
+                } else {
+                    "未连接"
+                },
+                if connected {
+                    theme::harmony::OK
+                } else {
+                    theme::harmony::DANGER
+                },
+            );
+            let tk = self.shared.lock().unwrap().profile.toggle_key;
+            let tkn = key_name(tk).replace("KEY_", "");
+            Self::h_pill(
+                ui,
+                &format!("映射 {} ({tkn})", if enabled { "开" } else { "关" }),
+                if enabled {
+                    theme::harmony::OK
+                } else {
+                    theme::harmony::MUTED
+                },
+            );
+            // 右侧:主操作(照 HDC UI —— 右侧放实心蓝按钮)
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if Self::h_primary_button(ui, "保存配置").clicked() {
+                    self.save_profile();
+                }
+                if let Some(label) = self.pending_task_label() {
+                    if ui
+                        .add(
+                            egui::Button::new(format!("取消{label}"))
+                                .fill(theme::harmony::DANGER.gamma_multiply(0.25))
+                                .stroke(egui::Stroke::new(
+                                    1.0,
+                                    theme::with_alpha(theme::harmony::DANGER, 190),
+                                )),
+                        )
+                        .clicked()
+                    {
+                        self.cancel_pending_tasks();
+                    }
+                }
+                if connected {
+                    if ui.button("断开").clicked() {
+                        self.disconnect();
+                    }
+                } else if self.connect_rx.is_some() {
+                    ui.label("连接中...");
+                } else if ui.button("连接控制").clicked() {
+                    self.connect_control();
+                }
+                if ui.button("刷新设备").clicked() {
+                    self.act_refresh_devices();
+                }
+                if ui.button("使用说明").clicked() {
+                    self.help_open = true;
+                }
+            });
+        });
+    }
+
+    /// 鸿蒙风格左侧导航:图标 + 文字;选中项淡蓝底 + 蓝字(照 HDC UI)
+    fn h_nav(&mut self, ui: &mut egui::Ui) {
+        for page in HPage::ALL {
+            let (icon, title) = page.icon_title();
+            let selected = self.h_page == page;
+            let (rect, resp) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::click());
+            let painter = ui.painter();
+            if selected || resp.hovered() {
+                let fill = if selected {
+                    theme::with_alpha(theme::harmony::PRIMARY, 30)
+                } else {
+                    theme::with_alpha(theme::harmony::PRIMARY, 14)
+                };
+                painter.rect_filled(rect, egui::CornerRadius::same(8), fill);
+            }
+            let fg = if selected {
+                theme::harmony::PRIMARY
+            } else {
+                theme::harmony::TEXT
+            };
+            painter.text(
+                rect.left_center() + egui::vec2(10.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                format!("{icon}  {title}"),
+                egui::FontId::proportional(15.0),
+                fg,
+            );
+            if resp.clicked() {
+                self.h_page = page;
+            }
+        }
+        // 底部:次要操作(撤销/重做/关于)—— 顶栏只放主操作,避免溢出窗口宽度
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+            ui.horizontal(|ui| {
+                if ui.small_button("关于").clicked() {
+                    self.about_open = true;
+                }
+                if ui.small_button("重做").clicked() {
+                    self.redo();
+                }
+                if ui.small_button("撤销").clicked() {
+                    self.undo();
+                }
+            });
+        });
+    }
+
+    /// 鸿蒙风格底部状态栏:最新一条日志(左) + 引擎状态(右)
+    fn h_status_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let last = self.logs.back().cloned().unwrap_or_default();
+            ui.label(
+                egui::RichText::new(last)
+                    .size(12.0)
+                    .color(theme::harmony::MUTED),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.ui_engine_status(ui);
+            });
+        });
+    }
+
+    /// 鸿蒙风格中央页:按左侧导航分发到各卡片
+    fn h_page_body(&mut self, ui: &mut egui::Ui, mouse_captured: bool) {
+        match self.h_page {
+            HPage::Connect => {
+                let (connected, _) = {
+                    let g = self.shared.lock().unwrap();
+                    (
+                        g.control
+                            .as_ref()
+                            .map(|c| c.is_connected())
+                            .unwrap_or(false),
+                        g.enabled,
+                    )
+                };
+                let th = self.theme();
+                Self::harmony_card(ui, "设备连接", |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("刷新设备").clicked() {
+                            self.act_refresh_devices();
+                        }
+                        let cur = self.serial();
+                        egui::ComboBox::from_id_salt("h_page_dev")
+                            .selected_text(if cur.is_empty() {
+                                "无设备".to_string()
+                            } else {
+                                cur
+                            })
+                            .show_ui(ui, |ui| {
+                                for (i, d) in self.devices.iter().enumerate() {
+                                    ui.selectable_value(&mut self.selected, i, d);
+                                }
+                            });
+                        if connected {
+                            Self::h_pill(ui, "控制已连接", theme::harmony::OK);
+                            if ui.button("断开").clicked() {
+                                self.disconnect();
+                            }
+                        } else if self.connect_rx.is_some() {
+                            ui.label("连接中...");
+                        } else if Self::h_primary_button(ui, "连接控制").clicked() {
+                            self.connect_control();
+                        }
+                    });
+                    if self.devices.is_empty() {
+                        ui.small(
+                            egui::RichText::new("未发现设备:请连接手机并打开 USB 调试")
+                                .color(theme::harmony::MUTED),
+                        );
+                    }
+                });
+                Self::harmony_card(ui, "scrcpy 画面", |ui| {
+                    ui.horizontal(|ui| self.ui_scrcpy_launch_row(ui));
+                    ui.small(
+                        egui::RichText::new(
+                            "画面由 scrcpy 本体窗口显示,与本程序互不干扰;启动后点右侧[截取手机屏幕]取画面。",
+                        )
+                        .color(theme::harmony::MUTED),
+                    );
+                });
+                Self::harmony_card(ui, "映射运行时", |ui| {
+                    self.ui_toggle_key_row(ui);
+                    ui.horizontal(|ui| {
+                        let (enabled, tk) = {
+                            let g = self.shared.lock().unwrap();
+                            (g.enabled, g.profile.toggle_key)
+                        };
+                        let tkn = key_name(tk).replace("KEY_", "");
+                        let txt = if enabled {
+                            format!("映射已开启 ({tkn})")
+                        } else {
+                            format!("开启并开始映射 ({tkn})")
+                        };
+                        let btn = egui::Button::new(egui::RichText::new(txt).color(if enabled {
+                            theme::harmony::TEXT
+                        } else {
+                            egui::Color32::WHITE
+                        }))
+                        .fill(if enabled {
+                            theme::harmony::BTN
+                        } else {
+                            theme::harmony::PRIMARY
+                        })
+                        .stroke(egui::Stroke::NONE);
+                        if ui.add(btn).clicked() {
+                            self.act_toggle_mapping();
+                        }
+                        ui.small(
+                            egui::RichText::new("默认 F8 开关;FPS 模式有独立开关")
+                                .color(theme::harmony::MUTED),
+                        );
+                    });
+                    let _ = th;
+                    self.ui_engine_status(ui);
+                });
+                Self::harmony_card(ui, "scrcpy 管理", |ui| self.ui_scrcpy_manage(ui));
+            }
+            HPage::Macro => Self::harmony_card(ui, "宏", |ui| self.ui_macro_page(ui)),
+            HPage::Keys => {
+                Self::harmony_card(ui, "配置", |ui| self.ui_profile_config(ui));
+                Self::harmony_card(ui, "按键映射", |ui| self.ui_binds(ui));
+                Self::harmony_card(ui, "按键组合 / 切换键位", |ui| self.ui_schemes(ui));
+            }
+            HPage::Wheels => Self::harmony_card(ui, "虚拟轮盘", |ui| self.ui_wheels(ui)),
+            HPage::Fps => {
+                Self::harmony_card(ui, "鼠标瞄准", |ui| self.ui_aim(ui, mouse_captured))
+            }
+            HPage::Look => Self::harmony_card(ui, "外观", |ui| self.ui_look(ui)),
+            HPage::Diag => {
+                Self::harmony_card(ui, "诊断", |ui| self.ui_diagnostics(ui));
+                let h = ui.available_height().max(180.0);
+                Self::harmony_card(ui, "运行日志", |ui| self.ui_log_card(ui, h));
+            }
+        }
+    }
+
+    /// 鸿蒙风格的卡片:白底 + 细描边 + 14px 圆角 + 标题(照 HDC UI 的 card())
+    fn harmony_card(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+        egui::Frame::default()
+            .fill(ui.visuals().window_fill)
+            .stroke(egui::Stroke::new(1.0, theme::harmony::LINE))
+            .corner_radius(egui::CornerRadius::same(theme::harmony::CARD_ROUND as u8))
+            .inner_margin(egui::Margin::same(16))
+            .outer_margin(egui::Margin::symmetric(0, 7))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    egui::RichText::new(title)
+                        .size(17.0)
+                        .strong()
+                        .color(theme::harmony::TEXT),
+                );
+                ui.add_space(8.0);
+                add(ui);
+            });
+    }
+
+    /// 鸿蒙风格的状态 pill(淡色底 + 同色文字,照 HDC UI)
+    fn h_pill(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+        egui::Frame::default()
+            .fill(theme::with_alpha(color, 34))
+            .corner_radius(egui::CornerRadius::same(20))
+            .inner_margin(egui::Margin::symmetric(10, 4))
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(text).size(12.0).color(color));
+            });
+    }
+
+    /// 鸿蒙风格的实心主按钮(蓝底白字)
+    fn h_primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+        ui.add(
+            egui::Button::new(egui::RichText::new(text).color(egui::Color32::WHITE))
+                .fill(theme::harmony::PRIMARY)
+                .stroke(egui::Stroke::NONE),
+        )
+    }
+
+    /// 外观设置面板:风格 / 配色 / 控件密度 / 背景图(改动可撤销,随配置保存)
     fn ui_look(&mut self, ui: &mut egui::Ui) {
         let mut pick_bg = false;
         let mut edit = false;
+        let mut style_restart: Option<theme::UiStyle> = None;
         let before = self.shared.lock().unwrap().profile.clone();
         {
             let mut g = self.shared.lock().unwrap();
             let look = &mut g.profile.look;
+
+            // ---- 界面风格(默认/鸿蒙/可视化) ----
+            // 风格牵动整体布局,选择后需要关闭再重开窗口(见 request_style_restart)。
+            // 不能像配色那样热应用,所以这里不进撤销栈(edit 不置位),直接走重启。
+            // 注意:选中的值先落在一个临时变量里,由 request_style_restart 统一改
+            // PadApp.style(界面级持有),避免在这里直接改 profile.look.style ——
+            // 那个副本会被"切换按键组合"覆盖(见 stamp_style)。
+            ui.horizontal(|ui| {
+                ui.label("界面风格:");
+                let mut want = self.style;
+                egui::ComboBox::from_id_salt("look_style")
+                    .selected_text(want.label())
+                    .show_ui(ui, |ui| {
+                        for s in theme::UiStyle::ALL {
+                            ui.selectable_value(&mut want, s, s.label());
+                        }
+                    });
+                if want != self.style {
+                    style_restart = Some(want);
+                }
+                ui.small("切换风格需重开窗口").on_hover_text(
+                    "风格决定整体布局(按键布局、信息显示都会变),无法热应用。\n\
+                                    选择后会自动关闭再重新打开窗口,并记住这次的选择。",
+                );
+            });
+            ui.separator();
 
             ui.horizontal(|ui| {
                 ui.label("配色:");
                 egui::ComboBox::from_id_salt("look_preset")
                     .selected_text(look.preset.label())
                     .show_ui(ui, |ui| {
-                        for p in [Preset::Dark, Preset::Light, Preset::Nord, Preset::Catppuccin] {
-                            if ui.selectable_value(&mut look.preset, p, p.label()).changed() {
+                        for p in [
+                            Preset::Dark,
+                            Preset::Light,
+                            Preset::Nord,
+                            Preset::Catppuccin,
+                        ] {
+                            if ui
+                                .selectable_value(&mut look.preset, p, p.label())
+                                .changed()
+                            {
                                 edit = true;
                             }
                         }
@@ -4500,7 +8470,10 @@ impl PadApp {
                     .selected_text(look.density.label())
                     .show_ui(ui, |ui| {
                         for d in [Density::Compact, Density::Standard, Density::Loose] {
-                            if ui.selectable_value(&mut look.density, d, d.label()).changed() {
+                            if ui
+                                .selectable_value(&mut look.density, d, d.label())
+                                .changed()
+                            {
                                 edit = true;
                             }
                         }
@@ -4537,7 +8510,10 @@ impl PadApp {
                         .selected_text(look.bg_fit.label())
                         .show_ui(ui, |ui| {
                             for f in [BgFit::Cover, BgFit::Contain, BgFit::Tile] {
-                                if ui.selectable_value(&mut look.bg_fit, f, f.label()).changed() {
+                                if ui
+                                    .selectable_value(&mut look.bg_fit, f, f.label())
+                                    .changed()
+                                {
                                     edit = true;
                                 }
                             }
@@ -4563,10 +8539,7 @@ impl PadApp {
             // 光靠手动调亮度解决不了"画面上既有亮块又有暗块"的问题 ——
             // 现在默认按截图**逐块采样**,自动决定每一处该用深色还是浅色。
             let r = ui
-                .checkbox(
-                    &mut look.overlay_auto,
-                    "键位自动对比(按截图明暗自动选深浅)",
-                )
+                .checkbox(&mut look.overlay_auto, "键位自动对比(按截图明暗自动选深浅)")
                 .on_hover_text(
                     "采样每个键位/摇杆底下的画面明暗,自动决定那一处用深色还是浅色,\n\
                      并给圈描一圈反相外套、给文字垫一层半透明衬底 ——\n\
@@ -4578,11 +8551,8 @@ impl PadApp {
             }
             let r = ui
                 .add(
-                    egui::Slider::new(
-                        &mut look.overlay_tone,
-                        theme::TONE_MIN..=theme::TONE_MAX,
-                    )
-                    .text("键位显示亮度(微调)"),
+                    egui::Slider::new(&mut look.overlay_tone, theme::TONE_MIN..=theme::TONE_MAX)
+                        .text("键位显示亮度(微调)"),
                 )
                 .on_hover_text(
                     "在自动对比的基础上做微调:\n\
@@ -4602,6 +8572,10 @@ impl PadApp {
         }
         if edit {
             self.push_undo_snapshot(before);
+        }
+        if let Some(s) = style_restart {
+            let ctx = ui.ctx().clone();
+            self.request_style_restart(&ctx, s);
         }
     }
 
@@ -4658,8 +8632,7 @@ impl PadApp {
             BgFit::Tile => {
                 for y in 0..((screen.height() / ts.y).ceil() as i32 + 1) {
                     for x in 0..((screen.width() / ts.x).ceil() as i32 + 1) {
-                        let min =
-                            screen.min + egui::vec2(x as f32 * ts.x, y as f32 * ts.y);
+                        let min = screen.min + egui::vec2(x as f32 * ts.x, y as f32 * ts.y);
                         painter.image(
                             tex.id(),
                             egui::Rect::from_min_size(min, ts),
@@ -4744,29 +8717,45 @@ impl PadApp {
         });
     }
 
-    /// FPS 鼠标瞄准设置(默认收起,点标题才展开)
+    /// 鼠标瞄准(FPS / 开放世界)。内容**直接展开**(不再套"（开发中）"折叠栏 ——
+    /// 用户明确要求把它放出来,少一层点击)。
     fn ui_aim(&mut self, ui: &mut egui::Ui, captured: bool) {
-        egui::CollapsingHeader::new("鼠标瞄准(FPS)（开发中）")
-            .default_open(false)
-            .show(ui, |ui| {
-                self.ui_aim_body(ui, captured);
-            });
+        ui.heading("鼠标瞄准（FPS / 开放世界）");
+        ui.small("注意：本功能处于开发阶段，实际应用效果可能与描述有出入。");
+        self.ui_aim_body(ui, captured);
     }
 
     fn ui_aim_body(&mut self, ui: &mut egui::Ui, captured: bool) {
         let th = self.theme();
-        ui.label("把鼠标的相对位移映射成手机上的手指拖动,用来转动游戏视角。");
-        ui.label("用法:先在截图上[取锚点](取视角区中央的空白处),再按 FPS 开关键进入;也可把需要鼠标点击的键位勾成“仅 FPS”。");
+        let gamepad_mode = {
+            let mode = self.shared.lock().unwrap().profile.aim.input_mode;
+            matches!(
+                mode,
+                ViewInputMode::VirtualGamepadContinuous | ViewInputMode::VirtualGamepadSegmented
+            )
+        };
+        if gamepad_mode {
+            ui.label("把鼠标的相对位移映射成虚拟 Xbox 手柄右摇杆。游戏必须支持手柄右摇杆视角；该模式不需要锚点。");
+            ui.label("用法:先开启总映射,连接控制通道,按视角模式开关键进入。");
+        } else {
+            ui.label("把鼠标的相对位移映射成手机上的手指拖动。FPS 模式用于开镜/射击；开放世界模式用于无需射击的无限水平转向。");
+            ui.label("锚点默认不设置。锚点不是游戏准星，而是虚拟手指落下的起点；应放在游戏 UI 之外的干净区域。");
+            ui.label("用法:先开启总映射，再到“瞄准锚点（开发中）”取点，按视角模式开关键进入。");
+        }
 
         // —— 生效条件自检:直接告诉用户"现在为什么没反应" ——
-        let (aim_on, anchor_ok, hold_key, connected, space, live) = {
+        let (mapping_enabled, aim_on, anchor_ok, hold_key, connected, space, live) = {
             let g = self.shared.lock().unwrap();
             let a = &g.profile.aim;
             (
+                g.enabled,
                 a.enabled,
                 a.anchor_set(),
                 a.hold_key,
-                g.control.as_ref().map(|c| c.is_connected()).unwrap_or(false),
+                g.control
+                    .as_ref()
+                    .map(|c| c.is_connected())
+                    .unwrap_or(false),
                 g.control.as_ref().map(|c| (c.screen_w, c.screen_h)),
                 g.aim_live,
             )
@@ -4785,16 +8774,31 @@ impl PadApp {
         let mut blocker: Option<String> = None;
         ui.separator();
         ui.label("生效条件自检:");
-        for (ok, text) in [
-            (aim_on, "已勾选 [启用鼠标瞄准]"),
-            (mouse_found, "检测到鼠标设备"),
-            (anchor_ok, "已设置锚点(勾选启用时会自动放置,可再[取锚点]调整)"),
-            (live.mode_active, "FPS 模式已开启(可用自定义开关键)"),
-            (!live.suspended, "当前没有按住临时退出键"),
-            (connected, "控制通道已连接(已点[启动])"),
-        ] {
+        let mut checks = vec![
+            (
+                mapping_enabled,
+                "映射总开关已开启（视角模式只在映射开启后生效）".to_string(),
+            ),
+            (aim_on, "已勾选 [启用鼠标视角]".to_string()),
+            (mouse_found, "检测到鼠标设备".to_string()),
+            (
+                live.mode_active,
+                "FPS 模式已开启(可用自定义开关键)".to_string(),
+            ),
+            (!live.suspended, "当前没有按住临时退出键".to_string()),
+            (connected, "控制通道已连接(已点[启动])".to_string()),
+        ];
+        if gamepad_mode {
+            checks.push((live.gamepad_created, "虚拟手柄已在设备端创建".to_string()));
+        } else {
+            checks.push((
+                anchor_ok,
+                "已设置锚点(勾选启用时会自动放置,可再[取锚点]调整)".to_string(),
+            ));
+        }
+        for (ok, text) in checks {
             if !ok && blocker.is_none() {
-                blocker = Some(text.to_string());
+                blocker = Some(text.clone());
             }
             ui.colored_label(
                 if ok { th.ok } else { th.warn },
@@ -4807,23 +8811,35 @@ impl PadApp {
                 if w > h { "(横屏)" } else { "(竖屏)" }
             ));
         }
-        if anchor_outside {
+        if anchor_outside && !gamepad_mode {
             ui.colored_label(
                 th.danger,
                 "锚点超出了上面的坐标空间(手机方向变了?):注入时会被自动钳到屏幕内,\n\
                  切回原来的方向即完全恢复,也可以现在[取锚点]重取一次",
             );
         }
-        ui.label(format!(
-            "运行状态: 位移{}次 最近({:.0},{:.0}) 偏移({:.0},{:.0}) 触点{} 已注入{}条",
-            live.motions,
-            live.last_dx,
-            live.last_dy,
-            live.ox,
-            live.oy,
-            if live.down { "按下" } else { "抬起" },
-            live.sent
-        ));
+        if gamepad_mode {
+            ui.label(format!(
+                "运行状态: 位移{}次 最近({:.0},{:.0}) 虚拟手柄{} 输入报告{}条",
+                live.motions,
+                live.last_dx,
+                live.last_dy,
+                if live.gamepad_created {
+                    "已创建"
+                } else {
+                    "未创建"
+                },
+                live.gamepad_reports,
+            ));
+        } else {
+            ui.label(format!(
+                "运行状态: 偏移({:.0},{:.0}) 触点{} 已注入{}条",
+                live.ox,
+                live.oy,
+                if live.down { "按下" } else { "抬起" },
+                live.sent
+            ));
+        }
         if let Some(b) = blocker {
             ui.colored_label(th.warn, format!("→ 现在没反应,因为: {b}"));
         } else if !live.active {
@@ -4861,27 +8877,132 @@ impl PadApp {
             undo_before = Some(g.profile.clone());
             let aim = &mut g.profile.aim;
 
-            if ui.checkbox(&mut aim.enabled, "启用鼠标瞄准").changed() {
+            if ui.checkbox(&mut aim.enabled, "启用鼠标视角").changed() {
                 toggled = true;
                 undo_needed = true;
             }
 
-            ui.horizontal(|ui| {
-                ui.label("锚点:");
-                if aim.anchor_set() {
-                    let (ax, ay) = am.point(aim.anchor_x, aim.anchor_y);
-                    ui.label(format!("({ax}, {ay})"));
-                } else {
-                    ui.colored_label(th.warn, "未设置");
+            if ui
+                .checkbox(
+                    &mut aim.open_world,
+                    "开放世界模式（无需射击/开镜，鼠标无限水平转向）",
+                )
+                .on_hover_text("使用无缝换手的触摸拖动带：越过回中半径后保留超出量继续同向转向。")
+                .changed()
+            {
+                if aim.open_world {
+                    aim.hold_key = 0;
                 }
-                let waiting_p = self.picking == Some(CoordSlot::AimAnchor);
-                if ui
-                    .button(if waiting_p { "点击截图..." } else { "取锚点" })
-                    .clicked()
-                {
-                    to_pick = Some(CoordSlot::AimAnchor);
+                undo_needed = true;
+            }
+            if aim.open_world {
+                ui.horizontal(|ui| {
+                    ui.label("水平回中半径");
+                    let r = ui.add(
+                        egui::Slider::new(&mut aim.open_world_radius, 0.05..=0.45).suffix(" ×屏宽"),
+                    );
+                    if r.drag_started() || r.gained_focus() {
+                        undo_needed = true;
+                    }
+                    ui.label("平滑");
+                    let s = ui.add(egui::Slider::new(&mut aim.open_world_smoothing, 0.15..=1.0));
+                    if s.drag_started() || s.gained_focus() {
+                        undo_needed = true;
+                    }
+                });
+            }
+
+            ui.horizontal(|ui| {
+                ui.label("视角输入:");
+                let previous = aim.input_mode;
+                egui::ComboBox::from_id_salt("aim_input_mode")
+                    .selected_text(aim.input_mode.label())
+                    .show_ui(ui, |ui| {
+                        for mode in [
+                            ViewInputMode::TouchDrag,
+                            ViewInputMode::VirtualGamepadContinuous,
+                            ViewInputMode::VirtualGamepadSegmented,
+                        ] {
+                            ui.selectable_value(&mut aim.input_mode, mode, mode.label());
+                        }
+                    });
+                if aim.input_mode != previous {
+                    undo_needed = true;
                 }
             });
+            match aim.input_mode {
+                ViewInputMode::TouchDrag | ViewInputMode::UhidMouse | ViewInputMode::AoaMouse => {}
+                ViewInputMode::VirtualGamepadContinuous
+                | ViewInputMode::VirtualGamepadSegmented => {
+                    let segmented = aim.input_mode == ViewInputMode::VirtualGamepadSegmented;
+                    ui.colored_label(
+                        th.ok,
+                        if segmented {
+                            "虚拟手柄分段回中：右摇杆达到极限后归中并保留超出量，模仿人类一段一段滑动视角；不需要游戏支持鼠标，只需要支持手柄右摇杆。"
+                        } else {
+                            "虚拟手柄连续：鼠标位移驱动右摇杆，停止一小段时间后自动回中；不需要游戏支持鼠标，只需要支持手柄右摇杆。"
+                        },
+                    );
+                }
+            }
+
+            if !gamepad_mode {
+                ui.separator();
+                ui.heading("瞄准锚点（开发中）");
+                ui.small("锚点是鼠标拖动映射到手机屏幕时，虚拟手指的起点；不是游戏准星。请取在游戏 UI 之外的干净区域。默认不自动设置，未设置时 FPS 模式不会真正落下拖动触点。");
+                ui.horizontal(|ui| {
+                    ui.label("锚点:");
+                    if aim.anchor_set() {
+                        let (ax, ay) = am.point(aim.anchor_x, aim.anchor_y);
+                        ui.label(format!("({ax}, {ay})"));
+                    } else {
+                        ui.colored_label(th.warn, "未设置");
+                    }
+                    let waiting_p = self.picking == Some(CoordSlot::AimAnchor);
+                    if ui
+                        .button(if waiting_p {
+                            "点击截图..."
+                        } else {
+                            "取锚点"
+                        })
+                        .clicked()
+                    {
+                        to_pick = Some(CoordSlot::AimAnchor);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("拖动死区:");
+                    let r = ui.add(
+                        egui::DragValue::new(&mut aim.drag_deadzone)
+                            .range(0.0..=160.0)
+                            .suffix(" px"),
+                    );
+                    if r.drag_started() || r.gained_focus() {
+                        undo_needed = true;
+                    }
+                    if ui
+                        .checkbox(&mut aim.boundary, "限制在屏幕边界内（开发中）")
+                        .on_hover_text("关闭后，累计偏移到达回转半径会无缝抬指/重按并保留余量；适合配合指针消隐做无限转向。")
+                        .changed()
+                    {
+                        undo_needed = true;
+                    }
+                });
+                if !aim.boundary {
+                    ui.horizontal(|ui| {
+                        ui.label("回转半径:");
+                        let r = ui.add(
+                            egui::DragValue::new(&mut aim.recenter_threshold)
+                                .range(20..=4000)
+                                .suffix(" px"),
+                        );
+                        if r.drag_started() || r.gained_focus() {
+                            undo_needed = true;
+                        }
+                        ui.label("（无边界模式下到达此半径就抬指重按）");
+                    });
+                }
+            }
 
             ui.horizontal(|ui| {
                 ui.label("灵敏度 X:");
@@ -4903,6 +9024,20 @@ impl PadApp {
                     undo_needed = true;
                 }
                 if ui.checkbox(&mut aim.invert_y, "反转 Y").changed() {
+                    undo_needed = true;
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("视角移速:");
+                let rs = ui
+                    .add(
+                        egui::Slider::new(&mut aim.move_speed, 0.2..=3.0)
+                            .suffix("x")
+                            .text(""),
+                    )
+                    .on_hover_text("同时作用于触摸拖动、开放世界和虚拟手柄右摇杆；1.0 为原速。");
+                if rs.drag_started() || rs.gained_focus() {
                     undo_needed = true;
                 }
             });
@@ -4952,49 +9087,62 @@ impl PadApp {
                 }
             });
 
+            if !aim.open_world {
+                ui.horizontal(|ui| {
+                    ui.label("按住才瞄准:");
+                    let hk = aim.hold_key;
+                    let waiting = self.waiting_key == Some(KeySlot::AimHold);
+                    let shown = if hk == 0 { None } else { Some(hk) };
+                    if Self::key_button(ui, waiting, shown).clicked() {
+                        pick_hold_key = true;
+                    }
+                    if hk != 0 && ui.small_button("清除").clicked() {
+                        aim.hold_key = 0;
+                        undo_needed = true;
+                    }
+                    if ui
+                        .small_button("用右键")
+                        .on_hover_text("开镜时才转动视角(按住右键瞄准)")
+                        .clicked()
+                    {
+                        aim.hold_key = crate::keymap::BTN_RIGHT;
+                        undo_needed = true;
+                    }
+                    ui.label("(可绑鼠标右键,开镜时才动视角)");
+                });
+            }
+
             ui.horizontal(|ui| {
-                ui.label("按住才瞄准:");
-                let hk = aim.hold_key;
-                let waiting = self.waiting_key == Some(KeySlot::AimHold);
-                let shown = if hk == 0 { None } else { Some(hk) };
+                ui.label("视角模式开关键:");
+                let tk = aim.toggle_key;
+                let waiting = self.waiting_key == Some(KeySlot::AimToggle);
+                let shown = if tk == 0 { None } else { Some(tk) };
                 if Self::key_button(ui, waiting, shown).clicked() {
-                    pick_hold_key = true;
+                    pick_toggle_key = true;
                 }
-                if hk != 0 && ui.small_button("清除").clicked() {
-                    aim.hold_key = 0;
+                if tk != 0 && ui.small_button("清除").clicked() {
+                    aim.toggle_key = 0;
                     undo_needed = true;
                 }
-                if ui
-                    .small_button("用右键")
-                    .on_hover_text("开镜时才转动视角(按住右键瞄准)")
-                    .clicked()
-                {
-                    aim.hold_key = crate::keymap::BTN_RIGHT;
+                ui.label("(只在总映射开启后可进入/退出)");
+            });
+            ui.horizontal(|ui| {
+                ui.label("按住才退出:");
+                let sk = aim.suspend_key;
+                let waiting = self.waiting_key == Some(KeySlot::AimSuspend);
+                let shown = if sk == 0 { None } else { Some(sk) };
+                if Self::key_button(ui, waiting, shown).clicked() {
+                    pick_suspend_key = true;
+                }
+                if sk != 0 && ui.small_button("清除").clicked() {
+                    aim.suspend_key = 0;
                     undo_needed = true;
                 }
-                ui.label("(可绑鼠标右键,开镜时才动视角)");
+                ui.label("(按住暂时退出 FPS,恢复普通映射并显示鼠标;松开回到 FPS)");
             });
 
-                ui.horizontal(|ui| {
-                    ui.label("FPS 开关键:");
-                    let tk = aim.toggle_key;
-                    let waiting = self.waiting_key == Some(KeySlot::AimToggle);
-                    let shown = if tk == 0 { None } else { Some(tk) };
-                    if Self::key_button(ui, waiting, shown).clicked() { pick_toggle_key = true; }
-                    if tk != 0 && ui.small_button("清除").clicked() { aim.toggle_key = 0; undo_needed = true; }
-                    ui.label("(独立启停,不再要求总开关同时打开)");
-                });
-                ui.horizontal(|ui| {
-                    ui.label("临时退出键:");
-                    let sk = aim.suspend_key;
-                    let waiting = self.waiting_key == Some(KeySlot::AimSuspend);
-                    let shown = if sk == 0 { None } else { Some(sk) };
-                    if Self::key_button(ui, waiting, shown).clicked() { pick_suspend_key = true; }
-                    if sk != 0 && ui.small_button("清除").clicked() { aim.suspend_key = 0; undo_needed = true; }
-                    ui.label("(按住暂时显示鼠标;松开回到 FPS)");
-                });
-
-            if ui.checkbox(&mut aim.capture_mouse, "进入 FPS 时隐藏系统光标")
+            if ui
+                .checkbox(&mut aim.capture_mouse, "指针消隐(视角模式下隐藏系统光标)")
                 .changed()
             {
                 undo_needed = true;
@@ -5027,56 +9175,409 @@ impl PadApp {
             self.waiting_key = Some(KeySlot::AimSuspend);
         }
         if toggled {
-            // 刚启用但还没设锚点时,自动放一个(相对坐标:右侧中部),省去手动取点
-            let placed = {
-                let mut g = self.shared.lock().unwrap();
-                let aim = &mut g.profile.aim;
-                if aim.enabled && !aim.anchor_set() {
-                    aim.anchor_x = 0.75;
-                    aim.anchor_y = 0.5;
-                    Some((aim.anchor_x, aim.anchor_y))
-                } else {
-                    None
-                }
-            };
-            if let Some((x, y)) = placed {
-                self.log(format!(
-                    "已自动放置瞄准锚点 ({:.0}%, {:.0}%),可点[取锚点]调整",
-                    x * 100.0,
-                    y * 100.0
-                ));
+            // 用户明确要求锚点默认不设置。这里只提示，不再替用户放置。
+            let needs_anchor = { self.shared.lock().unwrap().profile.aim.enabled };
+            if needs_anchor {
+                self.log("鼠标视角已启用；锚点默认未设置，请在“瞄准锚点（开发中）”中取点");
             }
+        }
+    }
+
+    fn ui_switch_keys(&mut self, ui: &mut egui::Ui) {
+        let (names, active, n) = {
+            let g = self.shared.lock().unwrap();
+            (
+                g.schemes.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+                g.active_scheme,
+                g.schemes.len(),
+            )
+        };
+        let rows = self.shared.lock().unwrap().switch_keys.clone();
+        ui.heading("切换键位");
+        ui.small("支持单键或最多两个键的组合；按键顺序无关。可在[按键组合]里启用快速切换。");
+        let mut delete = None;
+        for (i, original) in rows.iter().enumerate() {
+            let keys = original.effective_keys();
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                ui.label(format!("切换{}:", i + 1));
+                let waiting = self.waiting_key == Some(KeySlot::SwitchKey(i));
+                let shown = keys.first().copied().filter(|k| *k != 0);
+                if Self::key_button(ui, waiting, shown).clicked() {
+                    self.waiting_key = Some(KeySlot::SwitchKey(i));
+                }
+                if keys.len() >= 2 {
+                    let waiting2 = self.waiting_key == Some(KeySlot::SwitchKeySecond(i));
+                    if Self::key_button(ui, waiting2, keys.get(1).copied()).clicked() {
+                        self.waiting_key = Some(KeySlot::SwitchKeySecond(i));
+                    }
+                    if ui.button("删除组合键").clicked() {
+                        if let Some(s) = self.shared.lock().unwrap().switch_keys.get_mut(i) {
+                            s.keys.truncate(1);
+                        }
+                        changed = true;
+                    }
+                } else if ui.button("新增组合键").clicked() {
+                    if let Some(s) = self.shared.lock().unwrap().switch_keys.get_mut(i) {
+                        s.keys = vec![s.key, 0];
+                    }
+                    changed = true;
+                }
+                ui.label("方式:");
+                let mut direction = original.direction;
+                egui::ComboBox::from_id_salt(("switch_direction", i))
+                    .selected_text(match direction {
+                        SwitchDirection::Target => "指定组合",
+                        SwitchDirection::Next => "正向循环",
+                        SwitchDirection::Prev => "反向循环",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut direction, SwitchDirection::Target, "指定组合");
+                        ui.selectable_value(&mut direction, SwitchDirection::Next, "正向循环");
+                        ui.selectable_value(&mut direction, SwitchDirection::Prev, "反向循环");
+                    });
+                if direction != original.direction {
+                    if let Some(s) = self.shared.lock().unwrap().switch_keys.get_mut(i) {
+                        s.direction = direction;
+                    }
+                    changed = true;
+                }
+                if direction == SwitchDirection::Target {
+                    let mut target = original.target;
+                    let cur = names.get(target).cloned().unwrap_or_else(|| "?".into());
+                    egui::ComboBox::from_id_salt(("switch_target_other", i))
+                        .selected_text(cur)
+                        .width(112.0)
+                        .show_ui(ui, |ui| {
+                            for (j, name) in names.iter().enumerate() {
+                                ui.selectable_value(&mut target, j, name);
+                            }
+                        });
+                    if target != original.target {
+                        if let Some(s) = self.shared.lock().unwrap().switch_keys.get_mut(i) {
+                            s.target = target;
+                        }
+                        changed = true;
+                    }
+                }
+                if ui.button("删除").clicked() {
+                    delete = Some(i);
+                }
+            });
+            if changed {
+                self.scheme_dirty = true;
+            }
+        }
+        let next = if n > 1 { (active + 1) % n } else { 0 };
+        if ui.button("新增切换键位").clicked() {
+            self.shared.lock().unwrap().switch_keys.push(SwitchKey {
+                key: 0,
+                keys: Vec::new(),
+                target: next,
+                direction: SwitchDirection::Target,
+            });
+            self.scheme_dirty = true;
+        }
+        if let Some(i) = delete {
+            self.shared.lock().unwrap().switch_keys.remove(i);
+            self.scheme_dirty = true;
+            if self.waiting_key == Some(KeySlot::SwitchKey(i))
+                || self.waiting_key == Some(KeySlot::SwitchKeySecond(i))
+            {
+                self.waiting_key = None;
+            }
+        }
+    }
+
+    fn fps_text(info: &RemoteDebugInfo) -> String {
+        info.fps
+            .map(|v| format!("{v:.1} Hz"))
+            .unwrap_or_else(|| "等待刷新".to_string())
+    }
+
+    fn resolution_text(info: &RemoteDebugInfo) -> String {
+        info.resolution
+            .map(|(w, h)| format!("{w} × {h}"))
+            .unwrap_or_else(|| "等待刷新".to_string())
+    }
+
+    fn refresh_debug_info(&mut self) {
+        if self.debug_rx.is_some() {
+            return;
+        }
+        self.debug_last_query = Instant::now();
+        let serial = self.serial();
+        if serial.is_empty() {
+            self.debug_info.error = Some("未选择设备".to_string());
+            return;
+        }
+        let (tx, rx) = channel();
+        self.debug_rx = Some(rx);
+        std::thread::spawn(move || {
+            let fps = adb::display_refresh_rate(&serial).ok();
+            let resolution = adb::display_size(&serial).ok();
+            let error = if fps.is_none() || resolution.is_none() {
+                Some("部分调试信息读取失败".to_string())
+            } else {
+                None
+            };
+            let info = RemoteDebugInfo {
+                fps,
+                resolution,
+                updated_at: Some(std::time::SystemTime::now()),
+                error,
+            };
+            let _ = tx.send(Ok(info));
+        });
+    }
+
+    fn poll_debug_rx(&mut self) {
+        let mut result = None;
+        let mut disconnected = false;
+        if let Some(rx) = self.debug_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(value) => result = Some(value),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => disconnected = true,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(value) = result {
+            self.debug_rx = None;
+            match value {
+                Ok(info) => self.debug_info = info,
+                Err(error) => self.debug_info.error = Some(error),
+            }
+        } else if disconnected {
+            self.debug_rx = None;
+        }
+    }
+
+    fn maybe_refresh_debug_info(&mut self) {
+        let wanted = self.debug_overlay_open || self.debug_show_fps || self.debug_show_resolution;
+        if wanted
+            && self.debug_rx.is_none()
+            && self.debug_last_query.elapsed() >= Duration::from_secs(1)
+        {
+            self.refresh_debug_info();
+        }
+    }
+
+    fn ui_other(&mut self, ui: &mut egui::Ui) {
+        let th = self.theme();
+        self.ui_switch_keys(ui);
+        ui.separator();
+        ui.heading("鼠标消隐");
+        ui.label("设置后不管普通模式还是 FPS 模式，按一下隐藏系统鼠标，再按一下显示。");
+        let mut cursor_key = 0u16;
+        ui.horizontal(|ui| {
+            ui.label("切换键:");
+            cursor_key = self.shared.lock().unwrap().profile.cursor_toggle_key;
+            let waiting = self.waiting_key == Some(KeySlot::CursorToggle);
+            if Self::key_button(ui, waiting, (cursor_key != 0).then_some(cursor_key)).clicked() {
+                self.waiting_key = Some(KeySlot::CursorToggle);
+                self.log("请按一个键作为鼠标消隐切换键");
+            }
+            if cursor_key != 0 && ui.small_button("清除").clicked() {
+                self.push_undo();
+                self.shared.lock().unwrap().profile.cursor_toggle_key = 0;
+                self.waiting_key = None;
+            }
+            let hidden = self.cursor_hide_flag.load(Ordering::Relaxed);
+            if ui
+                .button(if hidden {
+                    "立即显示鼠标"
+                } else {
+                    "立即隐藏鼠标"
+                })
+                .clicked()
+            {
+                self.cursor_hide_flag.store(!hidden, Ordering::Relaxed);
+            }
+        });
+        let hidden = self.cursor_hide_flag.load(Ordering::Relaxed);
+        ui.colored_label(
+            if hidden { th.warn } else { th.muted },
+            if hidden {
+                "当前: 系统鼠标已消隐"
+            } else {
+                "当前: 系统鼠标可见"
+            },
+        );
+        ui.separator();
+
+        ui.heading("调试信息");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.debug_show_fps, "显示当前手机帧率/刷新率");
+            ui.checkbox(&mut self.debug_show_resolution, "显示当前手机分辨率");
+            ui.checkbox(&mut self.debug_show_aim, "显示鼠标视角位移统计");
+            if ui.button("刷新").clicked() {
+                self.refresh_debug_info();
+            }
+            let overlay_label = if self.debug_overlay_open {
+                "关闭悬浮"
+            } else {
+                "悬浮显示"
+            };
+            if ui.button(overlay_label).clicked() {
+                if !self.debug_overlay_open
+                    && !self.debug_show_fps
+                    && !self.debug_show_resolution
+                    && !self.debug_show_aim
+                {
+                    self.debug_show_fps = true;
+                    self.debug_show_resolution = true;
+                }
+                self.debug_overlay_open = !self.debug_overlay_open;
+            }
+        });
+        let info = self.debug_info.clone();
+        if self.debug_show_fps {
+            ui.label(format!("手机帧率/刷新率: {}", Self::fps_text(&info)));
+        }
+        if self.debug_show_resolution {
+            ui.label(format!("手机分辨率: {}", Self::resolution_text(&info)));
+        }
+        if self.debug_show_aim {
+            let live = self.shared.lock().unwrap().aim_live;
+            ui.label(format!(
+                "鼠标视角: 位移 {} 次，最近 ({:.1}, {:.1})",
+                live.motions, live.last_dx, live.last_dy
+            ));
+        }
+        if let Some(updated) = info.updated_at {
+            ui.small(format!("最后刷新: {}", fmt_timestamp(updated)));
+        }
+        if self.debug_rx.is_some() {
+            ui.colored_label(th.warn, "正在刷新...");
+        }
+        if let Some(error) = info.error {
+            ui.colored_label(th.danger, error);
+        }
+    }
+
+    fn ui_debug_overlay(&mut self, ctx: &egui::Context) {
+        if !self.debug_overlay_open {
+            return;
+        }
+        let info = self.debug_info.clone();
+        let live = self.shared.lock().unwrap().aim_live;
+        let mut close = false;
+        let data = DebugOverlayData {
+            show_fps: self.debug_show_fps,
+            show_resolution: self.debug_show_resolution,
+            show_aim: self.debug_show_aim,
+            fps: Self::fps_text(&info),
+            resolution: Self::resolution_text(&info),
+            aim_motions: live.motions,
+            aim_last_dx: live.last_dx,
+            aim_last_dy: live.last_dy,
+            updated: info
+                .updated_at
+                .map(fmt_timestamp)
+                .unwrap_or_else(|| "尚未刷新".to_string()),
+            error: info.error,
+        };
+        let _ = ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("scrcpy_pad_debug_overlay"),
+            egui::ViewportBuilder::default()
+                .with_title("scrcpy-pad 调试信息")
+                .with_always_on_top()
+                .with_inner_size([320.0, 150.0])
+                .with_min_inner_size([220.0, 90.0])
+                .with_resizable(true),
+            |ui, _class| {
+                ui.heading("调试信息");
+                ui.separator();
+                if data.show_fps {
+                    ui.label(format!("手机帧率/刷新率: {}", data.fps));
+                }
+                if data.show_resolution {
+                    ui.label(format!("手机分辨率: {}", data.resolution));
+                }
+                if data.show_aim {
+                    ui.label(format!(
+                        "鼠标视角: 位移 {} 次，最近 ({:.1}, {:.1})",
+                        data.aim_motions, data.aim_last_dx, data.aim_last_dy
+                    ));
+                }
+                ui.small(format!("最后刷新: {}", data.updated));
+                if let Some(error) = &data.error {
+                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+                }
+                if ui.button("关闭悬浮").clicked() {
+                    close = true;
+                }
+                if ui.input(|i| i.viewport().close_requested()) {
+                    close = true;
+                }
+            },
+        );
+        if close {
+            self.debug_overlay_open = false;
         }
     }
 
     fn ui_picker(&mut self, ui: &mut egui::Ui) {
         ui.heading("截图取点");
+        self.ui_picker_body(ui);
+    }
+
+    /// 截图取点的按钮行 + 预览画布(不含标题)。
+    /// 默认/可视化风格在"截图取点"标题下;鸿蒙风格在右侧"屏幕预览"面板里 —— 共用这一份。
+    fn ui_picker_body(&mut self, ui: &mut egui::Ui) {
+        let preview_scale_base = self
+            .shot
+            .as_ref()
+            .map(|(_, w, h)| {
+                screenshot_fit_scale(
+                    ui.available_width(),
+                    ui.ctx().viewport_rect().height(),
+                    *w,
+                    *h,
+                )
+            })
+            .unwrap_or(1.0);
         ui.horizontal(|ui| {
             let taking = self.shot_rx.is_some();
             if ui
-                .button(if taking { "截图中..." } else { "截取手机屏幕" })
+                .button(if taking {
+                    "截图中..."
+                } else {
+                    "截取手机屏幕"
+                })
                 .clicked()
                 && !taking
             {
                 self.take_screenshot();
             }
+            if ui.button("+").on_hover_text("放大截图预览").clicked() {
+                self.shot_zoom_auto = false;
+                self.shot_zoom = (self.shot_zoom * 1.2).clamp(0.25, 3.0);
+            }
+            if ui.button("-").on_hover_text("缩小截图预览").clicked() {
+                self.shot_zoom_auto = false;
+                self.shot_zoom = (self.shot_zoom / 1.2).clamp(0.25, 3.0);
+            }
+            if ui
+                .button("重置")
+                .on_hover_text("恢复默认截图大小")
+                .clicked()
+            {
+                self.shot_zoom_auto = true;
+                self.shot_zoom = 1.0;
+            }
+            ui.label(format!(
+                "{:.0}%{}",
+                preview_scale_base * self.shot_zoom * 100.0,
+                if self.shot_zoom_auto {
+                    "（自动）"
+                } else {
+                    ""
+                }
+            ));
             // 浮层显示过滤
             ui.label("显示:");
-            let sel = self.overlay_filter;
-            egui::ComboBox::from_id_salt("overlayfilter")
-                .selected_text(sel.label())
-                .show_ui(ui, |ui| {
-                    for f in [
-                        OverlayFilter::All,
-                        OverlayFilter::Keys,
-                        OverlayFilter::Wheels,
-                        OverlayFilter::PermWheels,
-                        OverlayFilter::TempWheels,
-                        OverlayFilter::Aim,
-                    ] {
-                        ui.selectable_value(&mut self.overlay_filter, f, f.label());
-                    }
-                });
+            self.overlay_filter.ui(ui);
             if self.picking.is_some() {
                 let draft_pick = self.picking.map(is_draft_slot).unwrap_or(false);
                 ui.colored_label(
@@ -5113,13 +9614,11 @@ impl PadApp {
                     let g = self.shared.lock().unwrap();
                     let m = g.profile.mapper(space);
                     match target {
-                        ResizeTarget::Bind(i) => {
-                            match g.profile.binds.get(i).map(|b| &b.action) {
-                                Some(Action::Tap { radius, .. })
-                                | Some(Action::Hold { radius, .. }) => m.len(*radius),
-                                _ => 0.0,
-                            }
-                        }
+                        ResizeTarget::Bind(i) => match g.profile.binds.get(i).map(|b| &b.action) {
+                            Some(Action::Tap { radius, .. })
+                            | Some(Action::Hold { radius, .. }) => m.len(*radius),
+                            _ => 0.0,
+                        },
                         ResizeTarget::Wheel(i) => g
                             .profile
                             .wheels
@@ -5165,13 +9664,10 @@ impl PadApp {
         let shot = self.shot.as_ref().map(|(t, w, h)| (t.id(), *w, *h));
         if let Some((tex_id, w, h)) = shot {
             let avail = ui.available_width();
-            // 缩放系数只能跟"窗口高度 + 截图尺寸"有关。以前用当前剩余高度算,
-            // 右侧多出一行轮盘设置就会让 available_height 变化,整张浮层跟着一起
-            // 缩放(这也是"摇杆突然变大"的观感来源之一);改成按窗口高度算,
-            // 窗口不变时同一张截图的缩放系数恒定。
-            let win_h = ui.ctx().content_rect().height();
-            let max_h = (win_h * 2.0).max(500.0);
-            let scale = (avail / w as f32).min(1.0).min(max_h / h as f32);
+            // 自动适应同时参考可用宽度、窗口高度和截图长宽比；窗口改变时重算，
+            // 竖屏不再只按宽度硬撑，横屏也不会顶出可视区域。
+            let base_scale = screenshot_fit_scale(avail, ui.ctx().viewport_rect().height(), w, h);
+            let scale = (base_scale * self.shot_zoom).clamp(0.05, 4.0);
             let size = egui::vec2(w as f32 * scale, h as f32 * scale);
             // 取点或修改响应范围时需要拖拽响应
             let sense = if self.resizing.is_some() {
@@ -5425,9 +9921,70 @@ fn render_config(doc: &ConfigFile) -> Result<String, String> {
     Ok(format!("{}{body}", crate::keymap::YAML_HEADER))
 }
 
+fn sanitize_saved_scrcpy_args(raw: &str) -> (String, bool) {
+    let mut out = Vec::new();
+    let mut removed = false;
+    let mut iter = raw.split_whitespace().peekable();
+    while let Some(token) = iter.next() {
+        let lower = token.to_ascii_lowercase();
+        if lower == "--mouse=uhid"
+            || lower == "--mouse=aoa"
+            || lower == "-m=uhid"
+            || lower == "-m=aoa"
+        {
+            removed = true;
+            continue;
+        }
+        if (lower == "--mouse" || lower == "-m")
+            && iter
+                .peek()
+                .is_some_and(|next| matches!(next.to_ascii_lowercase().as_str(), "uhid" | "aoa"))
+        {
+            let _ = iter.next();
+            removed = true;
+            continue;
+        }
+        out.push(token.to_string());
+    }
+    (out.join(" "), removed)
+}
+
+fn prepare_scrcpy_args_with_mode(base: &str, mode: ViewInputMode) -> String {
+    let mut args = base.trim().to_string();
+    let gamepad_mode = matches!(
+        mode,
+        ViewInputMode::VirtualGamepadContinuous | ViewInputMode::VirtualGamepadSegmented
+    );
+    if !gamepad_mode {
+        return args;
+    }
+    let before = args.clone();
+    let has_mouse = args
+        .split_whitespace()
+        .any(|arg| arg == "-M" || arg == "--mouse" || arg.starts_with("--mouse="));
+    let has_keyboard = args
+        .split_whitespace()
+        .any(|arg| arg == "--keyboard" || arg.starts_with("--keyboard="));
+    let has_gamepad = args
+        .split_whitespace()
+        .any(|arg| arg == "-G" || arg == "--gamepad" || arg.starts_with("--gamepad="));
+    if !has_mouse {
+        args.push_str(" --mouse=disabled");
+    }
+    if !has_keyboard {
+        args.push_str(" --keyboard=disabled");
+    }
+    if !has_gamepad {
+        args.push_str(" --gamepad=disabled");
+    }
+    if args != before {
+        crate::diag_info!("scrcpy", "virtual-gamepad args enabled: {}", args.trim());
+    }
+    args.trim().to_string()
+}
 /// 按记住的设置定位 scrcpy 可执行文件。返回 (可执行文件, 额外说明)。
 ///
-/// 三级兜底,专门对付"设置过了、重启还是找不到":
+/// 三级兼底,专门对付"设置过了、重启还是找不到":
 ///   ① 记住的路径本身能解析出可执行文件(**目录也算**,里面找 scrcpy.exe);
 ///   ② 到记住的目录(以及上次 exe 的所在目录)里重新找一遍
 ///      —— 换版本时目录名会变(scrcpy-win64-v3.1 → v3.3)、解压时多套一层,
@@ -5518,7 +10075,11 @@ fn set_circle_angle(path: &mut SwipePath, start: (i32, i32), end: (i32, i32), x:
 }
 
 /// 由滑动轨迹类型计算圆心与半径(仅圆形有意义;非圆形返回 None)
-fn circle_geometry(path: &SwipePath, start: (i32, i32), end: (i32, i32)) -> Option<(f32, f32, f32)> {
+fn circle_geometry(
+    path: &SwipePath,
+    start: (i32, i32),
+    end: (i32, i32),
+) -> Option<(f32, f32, f32)> {
     let SwipePath::Circle { as_diameter, .. } = path else {
         return None;
     };
@@ -5539,6 +10100,7 @@ impl EasingEditTarget {
     fn id(self) -> usize {
         match self {
             EasingEditTarget::Bind(i) => i,
+            EasingEditTarget::Combo(i) => i + 100_000,
             EasingEditTarget::New => usize::MAX,
         }
     }
@@ -5553,6 +10115,189 @@ fn is_draft_slot(slot: CoordSlot) -> bool {
             | CoordSlot::NewSwipeEnd
             | CoordSlot::NewCircleAngle
     )
+}
+
+fn combo_action_editor(
+    ui: &mut egui::Ui,
+    action: &mut Action,
+    m: &Mapper,
+    id: usize,
+    pick: &mut Option<CoordSlot>,
+    easing_edit: &mut Option<EasingEditTarget>,
+) -> bool {
+    let mut changed = false;
+    let mut kind = match action {
+        Action::Tap { .. } => 0,
+        Action::Hold { .. } => 1,
+        Action::Swipe(_) => 2,
+        Action::AndroidKey { .. } => 3,
+        Action::Macro(_) => usize::MAX,
+    };
+    ui.horizontal(|ui| {
+        ui.label("动作:");
+        if kind == usize::MAX {
+            ui.label("宏（请在宏页编辑）");
+        } else {
+            egui::ComboBox::from_id_salt(("combo_action_kind", id))
+                .selected_text(["点按", "长按", "滑动", "系统键"][kind])
+                .show_ui(ui, |ui| {
+                    for (index, name) in ["点按", "长按", "滑动", "系统键"].into_iter().enumerate()
+                    {
+                        ui.selectable_value(&mut kind, index, name);
+                    }
+                });
+        }
+    });
+    let old_kind = match action {
+        Action::Tap { .. } => 0,
+        Action::Hold { .. } => 1,
+        Action::Swipe(_) => 2,
+        Action::AndroidKey { .. } => 3,
+        Action::Macro(_) => usize::MAX,
+    };
+    if kind != usize::MAX && kind != old_kind {
+        let (x, y, radius) = match action {
+            Action::Tap { x, y, radius, .. } | Action::Hold { x, y, radius } => (*x, *y, *radius),
+            Action::Swipe(s) => (s.start.0, s.start.1, crate::keymap::DEFAULT_RADIUS),
+            Action::AndroidKey { .. } => (0.5, 0.5, crate::keymap::DEFAULT_RADIUS),
+            Action::Macro(_) => (0.5, 0.5, crate::keymap::DEFAULT_RADIUS),
+        };
+        *action = match kind {
+            0 => Action::Tap {
+                x,
+                y,
+                duration_ms: crate::keymap::DEFAULT_TAP_DURATION_MS,
+                radius,
+            },
+            1 => Action::Hold { x, y, radius },
+            2 => Action::Swipe(Swipe {
+                start: (x, y),
+                end: (x, (y + 0.2).min(1.0)),
+                duration_ms: 300,
+                easing: Easing::Linear,
+                path: SwipePath::Line,
+            }),
+            3 => Action::AndroidKey { keycode: 4 },
+            _ => Action::AndroidKey { keycode: 4 },
+        };
+        changed = true;
+    }
+
+    match action {
+        Action::Tap {
+            x,
+            y,
+            duration_ms,
+            radius,
+        } => {
+            ui.horizontal(|ui| {
+                let waiting = *pick == Some(CoordSlot::ComboPoint(id));
+                if ui
+                    .button(if waiting { "点击取点..." } else { "取点" })
+                    .clicked()
+                {
+                    *pick = Some(CoordSlot::ComboPoint(id));
+                }
+                ui.label("落点 x/y:");
+                let mut px = m.x(*x);
+                let mut py = m.y(*y);
+                if ui
+                    .add(egui::DragValue::new(&mut px).range(COORD_RANGE))
+                    .changed()
+                {
+                    *x = m.rel_x(px);
+                    changed = true;
+                }
+                if ui
+                    .add(egui::DragValue::new(&mut py).range(COORD_RANGE))
+                    .changed()
+                {
+                    *y = m.rel_y(py);
+                    changed = true;
+                }
+                ui.label("时长");
+                if ui
+                    .add(egui::DragValue::new(duration_ms).range(0..=5000))
+                    .changed()
+                {
+                    changed = true;
+                }
+                ui.label("范围");
+                let mut pr = m.len(*radius);
+                if ui
+                    .add(egui::DragValue::new(&mut pr).range(0.01..=100000.0))
+                    .changed()
+                {
+                    *radius = m.rel_len(pr);
+                    changed = true;
+                }
+            });
+        }
+        Action::Hold { x, y, radius } => {
+            ui.horizontal(|ui| {
+                let waiting = *pick == Some(CoordSlot::ComboPoint(id));
+                if ui
+                    .button(if waiting { "点击取点..." } else { "取点" })
+                    .clicked()
+                {
+                    *pick = Some(CoordSlot::ComboPoint(id));
+                }
+                ui.label("落点 x/y:");
+                let mut px = m.x(*x);
+                let mut py = m.y(*y);
+                if ui
+                    .add(egui::DragValue::new(&mut px).range(COORD_RANGE))
+                    .changed()
+                {
+                    *x = m.rel_x(px);
+                    changed = true;
+                }
+                if ui
+                    .add(egui::DragValue::new(&mut py).range(COORD_RANGE))
+                    .changed()
+                {
+                    *y = m.rel_y(py);
+                    changed = true;
+                }
+                ui.label("范围");
+                let mut pr = m.len(*radius);
+                if ui
+                    .add(egui::DragValue::new(&mut pr).range(0.01..=100000.0))
+                    .changed()
+                {
+                    *radius = m.rel_len(pr);
+                    changed = true;
+                }
+            });
+        }
+        Action::Swipe(s) => {
+            changed |= swipe_controls(
+                ui,
+                s,
+                pick,
+                easing_edit,
+                CoordSlot::ComboSwipeStart(id),
+                CoordSlot::ComboSwipeEnd(id),
+                CoordSlot::ComboCircleAngle(id),
+                EasingEditTarget::Combo(id),
+            );
+        }
+        Action::AndroidKey { keycode } => {
+            ui.horizontal(|ui| {
+                ui.label("系统 keycode:");
+                if ui
+                    .add(egui::DragValue::new(keycode).range(0..=999))
+                    .changed()
+                {
+                    changed = true;
+                }
+            });
+        }
+        Action::Macro(_) => {
+            ui.label("宏请在独立的“宏”页面编辑。");
+        }
+    }
+    changed
 }
 
 /// 渲染滑动键的编辑控件:取起点/取终点、时长、曲线、轨迹、圆形专用按钮、曲线设置。
@@ -5573,14 +10318,22 @@ fn swipe_controls(
     // 取起点 / 取终点
     let w_start = *pick == Some(slot_start);
     if ui
-        .button(if w_start { "点击取起点..." } else { "取起点" })
+        .button(if w_start {
+            "点击取起点..."
+        } else {
+            "取起点"
+        })
         .clicked()
     {
         *pick = Some(slot_start);
     }
     let w_end = *pick == Some(slot_end);
     if ui
-        .button(if w_end { "点击取终点..." } else { "取终点" })
+        .button(if w_end {
+            "点击取终点..."
+        } else {
+            "取终点"
+        })
         .clicked()
     {
         *pick = Some(slot_end);
@@ -5598,7 +10351,10 @@ fn swipe_controls(
     egui::ComboBox::from_id_salt(("swipe_easing", target.id()))
         .selected_text(cur_ease.label())
         .show_ui(ui, |ui| {
-            if ui.selectable_label(cur_ease == Easing::Linear, "默认(匀速)").clicked() {
+            if ui
+                .selectable_label(cur_ease == Easing::Linear, "默认(匀速)")
+                .clicked()
+            {
                 s.easing = Easing::Linear;
                 changed = true;
             }
@@ -5643,11 +10399,17 @@ fn swipe_controls(
     egui::ComboBox::from_id_salt(("swipe_path", target.id()))
         .selected_text(cur_path.label())
         .show_ui(ui, |ui| {
-            if ui.selectable_label(matches!(cur_path, SwipePath::Line), "默认(条形)").clicked() {
+            if ui
+                .selectable_label(matches!(cur_path, SwipePath::Line), "默认(条形)")
+                .clicked()
+            {
                 s.path = SwipePath::Line;
                 changed = true;
             }
-            if ui.selectable_label(matches!(cur_path, SwipePath::Rect), "方形").clicked() {
+            if ui
+                .selectable_label(matches!(cur_path, SwipePath::Rect), "方形")
+                .clicked()
+            {
                 s.path = SwipePath::Rect;
                 changed = true;
             }
@@ -5666,7 +10428,11 @@ fn swipe_controls(
     // 圆形专用按钮
     if let SwipePath::Circle { as_diameter, .. } = &mut s.path {
         if ui
-            .button(if *as_diameter { "视为直径" } else { "视为圆心" })
+            .button(if *as_diameter {
+                "视为直径"
+            } else {
+                "视为圆心"
+            })
             .clicked()
         {
             *as_diameter = !*as_diameter;
@@ -5674,7 +10440,11 @@ fn swipe_controls(
         }
         let w_angle = *pick == Some(slot_angle);
         if ui
-            .button(if w_angle { "点击设出发点..." } else { "设置出发点" })
+            .button(if w_angle {
+                "点击设出发点..."
+            } else {
+                "设置出发点"
+            })
             .clicked()
         {
             *pick = Some(slot_angle);
@@ -5712,21 +10482,34 @@ fn draw_wheel_card(
     let ink = theme::tone_text(tone);
     let title = format!(
         "{}{}",
-        if w.temp.is_some() { "临时摇杆" } else { "摇杆" },
+        if w.temp.is_some() {
+            "临时摇杆"
+        } else {
+            "摇杆"
+        },
         wi + 1
     );
-    let mut lines: Vec<(String, egui::Color32)> = vec![
-        (format!("上 {}", key_name(w.up)), ink),
-        (format!("下 {}", key_name(w.down)), ink),
-        (format!("左 {}", key_name(w.left)), ink),
-        (format!("右 {}", key_name(w.right)), ink),
-    ];
+    let mut lines: Vec<(String, egui::Color32)> = Vec::new();
+    lines.push((format!("类型 {}", w.kind.label()), ink));
+    for (i, (angle, key)) in w.active_dirs().into_iter().enumerate() {
+        let name = match angle.round() as i32 {
+            -90 => "上".to_string(),
+            0 => "右".to_string(),
+            90 => "下".to_string(),
+            a if a.abs() == 180 => "左".to_string(),
+            a => format!("{a}°"),
+        };
+        lines.push((format!("{} {} {}", name, i + 1, key_name(key)), ink));
+    }
     if let Some(t) = &w.temp {
         let mode = match t.mode {
             TempMode::Hold => "按住启用",
             TempMode::Toggle => "再按切换",
         };
-        lines.push((format!("启用 {} · {mode}", key_name(t.key)), ink));
+        lines.push((
+            format!("启用 {} · {mode}", key_name(t.key)),
+            theme::tone_color(th.wheel_enable, tone),
+        ));
     }
 
     let font = FontId::proportional(theme::size::LABEL_FONT);
@@ -5753,22 +10536,27 @@ fn draw_wheel_card(
     if min.x + size.x > canvas.max.x - 4.0 {
         min.x = center.x - radius - 12.0 - size.x;
     }
-    min.x = min.x.clamp(canvas.min.x + 4.0, (canvas.max.x - size.x - 4.0).max(canvas.min.x + 4.0));
-    min.y = min.y.clamp(canvas.min.y + 4.0, (canvas.max.y - size.y - 4.0).max(canvas.min.y + 4.0));
+    min.x = min.x.clamp(
+        canvas.min.x + 4.0,
+        (canvas.max.x - size.x - 4.0).max(canvas.min.x + 4.0),
+    );
+    min.y = min.y.clamp(
+        canvas.min.y + 4.0,
+        (canvas.max.y - size.y - 4.0).max(canvas.min.y + 4.0),
+    );
     let card = egui::Rect::from_min_size(min, size);
 
     // 衬底 + 一圈摇杆语义色的边,和画布上的圈一眼对应
     let edge = theme::tone_color(
-        if w.temp.is_some() { th.wheel_temp } else { th.wheel_perm },
+        if w.temp.is_some() {
+            th.wheel_temp
+        } else {
+            th.wheel_perm
+        },
         tone,
     );
     painter.rect_filled(card, 4.0, theme::plate(ink));
-    painter.rect_stroke(
-        card,
-        4.0,
-        Stroke::new(1.5, edge),
-        egui::StrokeKind::Inside,
-    );
+    painter.rect_stroke(card, 4.0, Stroke::new(1.5, edge), egui::StrokeKind::Inside);
 
     let mut y = card.min.y + pad.y;
     theme::paint_text(
@@ -5880,6 +10668,88 @@ fn draw_easing_preview(ui: &mut egui::Ui, e: Easing) {
     painter.add(egui::Shape::line(pts, egui::Stroke::new(2.0, accent)));
 }
 
+/// 宏录制结果的可读摘要。默认界面只显示摘要，原始事件由“显示录制事件”展开。
+fn macro_summary(steps: &[MacroStep]) -> String {
+    if steps.is_empty() {
+        return "空宏".to_string();
+    }
+    let mut keys = HashSet::new();
+    let mut total_ms = 0u32;
+    for step in steps {
+        keys.insert(step.code);
+        total_ms = total_ms.saturating_add(step.delay_ms);
+    }
+    format!(
+        "录制宏：{} 个事件 / {} 个键 / 约 {}ms；长按重复已合并",
+        steps.len(),
+        keys.len(),
+        total_ms
+    )
+}
+
+fn sanitize_virtual_profile(profile: &mut Profile) {
+    profile
+        .binds
+        .retain(|b| !matches!(b.action, Action::Macro(_)));
+    profile
+        .combos
+        .retain(|c| !matches!(c.action, Action::Macro(_)));
+    // 虚拟层只负责键位/轮盘坐标，不继承程序级开关与视角状态。
+    profile.toggle_key = 0;
+    profile.cursor_toggle_key = 0;
+    profile.aim = Default::default();
+}
+
+fn virtual_keyboard_lights(
+    profile: &Profile,
+) -> std::collections::HashMap<u16, (egui::Color32, String)> {
+    let th = theme::Theme::dark();
+    let mut lights = std::collections::HashMap::new();
+    for bind in &profile.binds {
+        if bind.key != 0 {
+            lights.insert(
+                bind.key,
+                (
+                    if bind.fps_only {
+                        th.key_fps
+                    } else {
+                        th.key_macro
+                    },
+                    bind.action.describe(),
+                ),
+            );
+        }
+    }
+    for wheel in &profile.wheels {
+        for (angle, key) in wheel.active_dirs() {
+            if key != 0 {
+                lights.entry(key).or_insert((
+                    if wheel.temp.is_some() {
+                        th.wheel_temp
+                    } else {
+                        th.wheel_perm
+                    },
+                    format!("虚拟轮盘方向 {angle:.0}°"),
+                ));
+            }
+        }
+    }
+    lights
+}
+
+/// 截图预览的自动适应倍率：同时限制可用宽度和窗口高度，避免竖屏铺满右侧、
+/// 横屏顶出可视区域。手动 +/- 仍在这个倍率上乘用户倍率。
+fn screenshot_fit_scale(avail_w: f32, window_h: f32, tex_w: u32, tex_h: u32) -> f32 {
+    if tex_w == 0 || tex_h == 0 {
+        return 1.0;
+    }
+    let usable_w = (avail_w * 0.94).max(120.0);
+    let usable_h = (window_h * 0.68).max(180.0);
+    (usable_w / tex_w as f32)
+        .min(usable_h / tex_h as f32)
+        .clamp(0.05, 1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5928,7 +10798,8 @@ mod tests {
     /// 检查程序是否还能把它找回来。
     #[test]
     fn remembered_scrcpy_location_survives_restart_and_move() {
-        let root = std::env::temp_dir().join(format!("scrcpy-pad-app-locate-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("scrcpy-pad-app-locate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let pkg = root.join("scrcpy-win64-v3.3.3");
         std::fs::create_dir_all(&pkg).unwrap();
@@ -5998,10 +10869,128 @@ mod tests {
             text.contains("switch_keys"),
             "字段说明里应提到多套组合相关的字段"
         );
-        let path = std::env::temp_dir().join(format!("scrcpy-pad-render-{}.yaml", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("scrcpy-pad-render-{}.yaml", std::process::id()));
         std::fs::write(&path, &text).unwrap();
         let back = read_profile_at(&path).expect("刚写出的文件必须能读回来");
         assert_eq!(back, doc, "写出去再读回来必须逐字段一致");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_uhid_is_never_auto_added() {
+        assert_eq!(
+            prepare_scrcpy_args_with_mode("--stay-awake", ViewInputMode::UhidMouse),
+            "--stay-awake"
+        );
+        assert_eq!(
+            prepare_scrcpy_args_with_mode("--stay-awake", ViewInputMode::AoaMouse),
+            "--stay-awake"
+        );
+    }
+
+    #[test]
+    fn virtual_gamepad_args_are_added_once() {
+        assert_eq!(
+            prepare_scrcpy_args_with_mode("--stay-awake", ViewInputMode::VirtualGamepadSegmented),
+            "--stay-awake --mouse=disabled --keyboard=disabled --gamepad=disabled"
+        );
+        assert_eq!(
+            prepare_scrcpy_args_with_mode(
+                "--stay-awake --mouse=disabled --keyboard=disabled --gamepad=disabled",
+                ViewInputMode::VirtualGamepadContinuous,
+            ),
+            "--stay-awake --mouse=disabled --keyboard=disabled --gamepad=disabled"
+        );
+    }
+
+    #[test]
+    fn legacy_saved_scrcpy_args_drop_uhid_mouse_capture() {
+        let (args, removed) =
+            sanitize_saved_scrcpy_args("--stay-awake --mouse=uhid --keyboard=disabled");
+        assert!(removed);
+        assert_eq!(args, "--stay-awake --keyboard=disabled");
+        let (args, removed) = sanitize_saved_scrcpy_args("--mouse aoa --stay-awake");
+        assert!(removed);
+        assert_eq!(args, "--stay-awake");
+    }
+
+    /// 风格切换请求必须是"取走即复位":main.rs 在每次 run_native 返回后都查一次,
+    /// 若不复位,则"换过风格的那次运行"之后,用户正常关闭窗口也会被再次重开
+    /// (幽灵重启)。同时确认复位后再次请求仍然有效(可以连续换风格)。
+    #[test]
+    fn style_restart_flag_is_one_shot() {
+        STYLE_RESTART.store(false, Ordering::SeqCst);
+        assert!(!take_style_restart(), "没有请求时不应触发重启");
+        STYLE_RESTART.store(true, Ordering::SeqCst);
+        assert!(take_style_restart(), "有请求时必须触发重启");
+        assert!(!take_style_restart(), "取走后必须复位");
+        STYLE_RESTART.store(true, Ordering::SeqCst);
+        assert!(take_style_restart(), "连续换风格时第二次请求仍要生效");
+    }
+
+    /// 两页默认都显示键位、组合键、永久/临时摇杆；宏/FPS 默认关闭。
+    #[test]
+    fn vk_filter_defaults_match_the_two_pages() {
+        let k = VkFilters::KEYS_PAGE;
+        assert!(k.binds && k.combos && k.wheels_perm && k.wheels_temp);
+        assert!(!k.macros && !k.fps, "宏和 FPS 默认不勾选");
+        let f = VkFilters::FPS_PAGE;
+        assert!(f.binds && f.combos && f.wheels_perm && f.wheels_temp);
+        assert!(!f.macros && !f.fps, "宏和 FPS 默认不勾选");
+    }
+
+    /// 可视化风格的三张右侧标签与三张左侧标签:名字互不重复、均不为空。
+    /// "键位"必须排在可视化右侧第一张、"键位组合"排在左侧第一张且为默认页
+    /// (用户明确要求:启动程序时默认是设置键位)。
+    #[test]
+    fn visual_tab_labels_are_distinct_and_ordered() {
+        let right = [
+            RightTab::Keys,
+            RightTab::Macro,
+            RightTab::Fps,
+            RightTab::Other,
+        ];
+        let left = [LeftTab::Schemes, LeftTab::Look, LeftTab::Diag];
+        let mut seen = std::collections::HashSet::new();
+        for t in right {
+            assert!(seen.insert(t.label()), "右侧标签重复: {}", t.label());
+        }
+        for t in left {
+            assert!(seen.insert(t.label()), "左右标签互相重复: {}", t.label());
+        }
+        assert_eq!(RightTab::default(), RightTab::Keys, "可视化右侧默认键位页");
+        assert_eq!(LeftTab::default(), LeftTab::Schemes, "左侧默认键位组合页");
+    }
+
+    #[test]
+    fn macro_recording_merges_keyboard_auto_repeat() {
+        let base = Instant::now();
+        let mut rec = MacroRecording {
+            steps: Vec::new(),
+            held: HashSet::new(),
+            last_event: base,
+            last_step_at: base,
+            idle_ms: 800,
+        };
+        PadApp::record_macro_button(&mut rec, 18, true, base);
+        PadApp::record_macro_button(&mut rec, 18, true, base + Duration::from_millis(33));
+        PadApp::record_macro_button(&mut rec, 18, true, base + Duration::from_millis(66));
+        assert_eq!(rec.steps.len(), 1, "自动重复不能变成连续按下");
+        PadApp::record_macro_button(&mut rec, 18, false, base + Duration::from_millis(100));
+        assert_eq!(rec.steps.len(), 2, "只应记录一次按下和一次抬起");
+        assert_eq!(rec.steps[1].delay_ms, 100, "抬起延迟应保留真实长按时间");
+    }
+
+    #[test]
+    fn screenshot_fit_scale_respects_window_height_and_width() {
+        let portrait = screenshot_fit_scale(600.0, 900.0, 1080, 2400);
+        assert!(portrait < 0.4 && portrait > 0.2, "竖屏应按高度限制自动缩小");
+        let landscape = screenshot_fit_scale(1200.0, 900.0, 2400, 1080);
+        assert!(
+            landscape < 0.5 && landscape > 0.1,
+            "横屏应按宽度限制自动缩小"
+        );
+        assert!(screenshot_fit_scale(0.0, 0.0, 1080, 2400) < 0.1);
     }
 }

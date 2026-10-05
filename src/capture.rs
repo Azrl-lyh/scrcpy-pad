@@ -28,10 +28,10 @@
 //!      * Linux  : `EVIOCGKEY`,直接问内核"此刻哪些键真的按着";
 //!      * Windows: `GetAsyncKeyState`,逐个问系统。
 
+use anyhow::Result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
-use anyhow::Result;
 
 /// 统一的输入事件。
 ///
@@ -50,7 +50,10 @@ impl CaptureEvent {
     /// 用于"按任意键"绑定捕获:只取按下的按键
     pub fn pressed_code(&self) -> Option<u16> {
         match *self {
-            CaptureEvent::Button { code, pressed: true } => Some(code),
+            CaptureEvent::Button {
+                code,
+                pressed: true,
+            } => Some(code),
             _ => None,
         }
     }
@@ -61,6 +64,8 @@ pub struct Capture {
     pub grab: Arc<AtomicBool>,
     /// 鼠标抓取(FPS 瞄准开启时置 true;Linux 走 EVIOCGRAB,Windows 走光标回中)
     pub mouse_grab: Arc<AtomicBool>,
+    /// 独立的光标消隐请求(不影响鼠标事件抓取/回中;Windows 使用透明系统光标)
+    pub cursor_hide: Arc<AtomicBool>,
     /// 是否检测到鼠标设备(FPS 瞄准的前提;用于界面诊断)
     pub mouse_found: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -68,26 +73,35 @@ pub struct Capture {
     /// (`GetMessage` 会阻塞,光置 stop 标志它看不到)。Linux 侧恒为 None。
     #[cfg_attr(not(windows), allow(dead_code))]
     wake_thread: Option<Arc<AtomicU32>>,
+    /// Windows hook 线程句柄。退出时必须等它真正卸载钩子后再返回，
+    /// 避免低层鼠标钩子在进程退出瞬间仍被系统调用。
+    #[cfg(windows)]
+    hook_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Capture {
     pub fn start(tx: Sender<CaptureEvent>) -> Result<Self> {
         let grab = Arc::new(AtomicBool::new(false));
         let mouse_grab = Arc::new(AtomicBool::new(false));
+        let cursor_hide = Arc::new(AtomicBool::new(false));
         let mouse_found = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
 
         #[cfg(target_os = "linux")]
-        let wake_thread = linux::start(&grab, &mouse_grab, &mouse_found, &stop, tx)?;
+        let wake_thread = linux::start(&grab, &mouse_grab, &cursor_hide, &mouse_found, &stop, tx)?;
         #[cfg(windows)]
-        let wake_thread = windows::start(&grab, &mouse_grab, &mouse_found, &stop, tx)?;
+        let (wake_thread, hook_thread) =
+            windows::start(&grab, &mouse_grab, &cursor_hide, &mouse_found, &stop, tx)?;
 
         Ok(Self {
             grab,
             mouse_grab,
+            cursor_hide,
             mouse_found,
             stop,
             wake_thread,
+            #[cfg(windows)]
+            hook_thread: Some(hook_thread),
         })
     }
 }
@@ -95,16 +109,55 @@ impl Capture {
 impl Drop for Capture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // Windows 的消息循环阻塞在 GetMessage 上,必须显式叫醒
+        self.cursor_hide.store(false, Ordering::Relaxed);
         #[cfg(windows)]
-        if let Some(tid) = &self.wake_thread {
-            let tid = tid.load(Ordering::Relaxed);
-            if tid != 0 {
-                windows::post_quit(tid);
+        windows::set_cursor_visible(true);
+        // Windows 的消息循环阻塞在 GetMessage 上,必须显式叫醒；随后等待
+        // hook 线程完成 UnhookWindowsHookEx，保证低层鼠标钩子不会拖到进程
+        // 退出阶段才被系统异步清理。
+        #[cfg(windows)]
+        {
+            if let Some(tid) = &self.wake_thread {
+                let tid = tid.load(Ordering::Relaxed);
+                if tid != 0 {
+                    windows::post_quit(tid);
+                }
+            }
+            if let Some(handle) = self.hook_thread.take() {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+                while !handle.is_finished() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                if handle.is_finished() {
+                    let _ = handle.join();
+                }
             }
         }
     }
 }
+
+/// Called from the GUI thread when capture starts/stops.  The Windows backend
+/// installs/restores transparent system cursor images, so the cursor disappears
+/// over scrcpy and any other focused window too.
+#[cfg(windows)]
+pub fn set_cursor_visible_from_ui(visible: bool) {
+    windows::set_cursor_visible(visible);
+}
+
+#[cfg(not(windows))]
+pub fn set_cursor_visible_from_ui(_visible: bool) {}
+
+/// Re-apply a NULL cursor shape after egui/window painting.  The transparent
+/// system cursor remains the global fallback across other applications.
+#[cfg(windows)]
+pub fn hide_cursor_shape_from_ui() {
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SetCursor(std::ptr::null_mut());
+    }
+}
+
+#[cfg(not(windows))]
+pub fn hide_cursor_shape_from_ui() {}
 
 // ===================================================================
 //  Windows 虚拟键码 <-> evdev 键码(平台无关的纯数据 + 纯函数)
@@ -345,7 +398,8 @@ mod vktable {
     /// 为什么值得记:用户报"某个键改键时怎么按都没反应"时,日志里直接就能看到
     /// 是哪个 vkCode 没覆盖,补一行表就能修好 —— 否则只能靠猜。
     pub fn note_unknown_vk(vk: u16) -> bool {
-        let seen = UNKNOWN_SEEN.get_or_init(|| Box::new(std::array::from_fn(|_| AtomicBool::new(false))));
+        let seen =
+            UNKNOWN_SEEN.get_or_init(|| Box::new(std::array::from_fn(|_| AtomicBool::new(false))));
         !seen[vk as usize & 0xFF].swap(true, Ordering::Relaxed)
     }
 
@@ -412,7 +466,11 @@ mod vktable {
             assert_eq!(map_vk(0x6D), Some(74), "VK_SUBTRACT -> KEY_KPMINUS");
             assert_eq!(map_vk(0x6F), Some(98), "VK_DIVIDE -> KEY_KPSLASH");
             assert_eq!(map_vk(0xAF), Some(115), "VK_VOLUME_UP -> KEY_VOLUMEUP");
-            assert_eq!(map_vk(0xB3), Some(164), "VK_MEDIA_PLAY_PAUSE -> KEY_PLAYPAUSE");
+            assert_eq!(
+                map_vk(0xB3),
+                Some(164),
+                "VK_MEDIA_PLAY_PAUSE -> KEY_PLAYPAUSE"
+            );
         }
 
         /// 左右修饰键各归各位:左右混用会让"按住才瞄准"这类门控键时灵时不灵
@@ -434,7 +492,11 @@ mod vktable {
                 assert!(got.is_some(), "{name}({code}) 反查不到 vk");
                 // 同一个 evdev 码可能有多个 vk(见表),反查回来的必须仍然映射到同一 evdev 码
                 let back = map_vk(got.unwrap());
-                assert_eq!(back, Some(code), "{name}: vk {vk:#04x} 反查后映射到了 {back:?}");
+                assert_eq!(
+                    back,
+                    Some(code),
+                    "{name}: vk {vk:#04x} 反查后映射到了 {back:?}"
+                );
             }
         }
 
@@ -540,6 +602,7 @@ mod linux {
     pub fn start(
         grab: &Arc<AtomicBool>,
         mouse_grab: &Arc<AtomicBool>,
+        _cursor_hide: &Arc<AtomicBool>,
         mouse_found: &Arc<AtomicBool>,
         stop: &Arc<AtomicBool>,
         tx: Sender<CaptureEvent>,
@@ -639,7 +702,10 @@ mod linux {
             let id = device.input_id();
             let is_kb = is_keyboard(&device);
             let is_mouse_dev = is_mouse(&device);
-            let key_count = device.supported_keys().map(|k| k.iter().count()).unwrap_or(0);
+            let key_count = device
+                .supported_keys()
+                .map(|k| k.iter().count())
+                .unwrap_or(0);
 
             if !is_kb && !is_mouse_dev {
                 // 只有排查时才需要看这些"路过"的设备;记进忽略集合,
@@ -696,7 +762,18 @@ mod linux {
             let tx2 = tx.clone();
             let stop2 = stop.clone();
             std::thread::spawn(move || {
-                device_loop(device, path, token, tx2, grab_flag, stop2, st2, is_mouse_dev);
+                // evdev 读取线程 = Linux 版"钩子线程":每台设备一条,事件即读即转。
+                crate::priority::boost(crate::priority::Class::Highest);
+                device_loop(
+                    device,
+                    path,
+                    token,
+                    tx2,
+                    grab_flag,
+                    stop2,
+                    st2,
+                    is_mouse_dev,
+                );
             });
         }
         (keyboards, mice, denied)
@@ -834,14 +911,26 @@ mod linux {
                                 {
                                     if value != 0 {
                                         let code = match (axis, value.is_positive()) {
-                                            (evdev::RelativeAxisCode::REL_WHEEL, true) => crate::keymap::BTN_WHEEL_UP,
-                                            (evdev::RelativeAxisCode::REL_WHEEL, false) => crate::keymap::BTN_WHEEL_DOWN,
-                                            (evdev::RelativeAxisCode::REL_HWHEEL, true) => crate::keymap::BTN_WHEEL_RIGHT,
+                                            (evdev::RelativeAxisCode::REL_WHEEL, true) => {
+                                                crate::keymap::BTN_WHEEL_UP
+                                            }
+                                            (evdev::RelativeAxisCode::REL_WHEEL, false) => {
+                                                crate::keymap::BTN_WHEEL_DOWN
+                                            }
+                                            (evdev::RelativeAxisCode::REL_HWHEEL, true) => {
+                                                crate::keymap::BTN_WHEEL_RIGHT
+                                            }
                                             _ => crate::keymap::BTN_WHEEL_LEFT,
                                         };
                                         for _ in 0..value.unsigned_abs().min(10) {
-                                            let _ = tx.send(CaptureEvent::Button { code, pressed: true });
-                                            let _ = tx.send(CaptureEvent::Button { code, pressed: false });
+                                            let _ = tx.send(CaptureEvent::Button {
+                                                code,
+                                                pressed: true,
+                                            });
+                                            let _ = tx.send(CaptureEvent::Button {
+                                                code,
+                                                pressed: false,
+                                            });
                                         }
                                     }
                                 }
@@ -918,7 +1007,10 @@ mod linux {
                 let had = mouse_found.load(Ordering::Relaxed);
                 mouse_found.store(mice > 0, Ordering::Relaxed);
                 if had && mice == 0 {
-                    diag_warn!("capture", "鼠标设备已全部消失(FPS 瞄准将不可用),等待重新插入");
+                    diag_warn!(
+                        "capture",
+                        "鼠标设备已全部消失(FPS 瞄准将不可用),等待重新插入"
+                    );
                 } else if !had && mice > 0 {
                     diag_info!("capture", "检测到鼠标设备({mice} 个),FPS 瞄准现在可用");
                 }
@@ -1035,7 +1127,11 @@ mod linux {
 
         // 反向(内核说按着、我们没记录)只报告不动作,且只在集合变化时报告一次,
         // 否则会每 400ms 刷一行。
-        let missed: HashSet<u16> = truth.iter().copied().filter(|c| !delivered.contains(c)).collect();
+        let missed: HashSet<u16> = truth
+            .iter()
+            .copied()
+            .filter(|c| !delivered.contains(c))
+            .collect();
         if missed != missed_before {
             if !missed.is_empty() {
                 diag_warn!(
@@ -1076,9 +1172,9 @@ mod windows {
     use crate::{diag_debug, diag_error, diag_info, diag_warn};
     use anyhow::Result;
     use std::collections::HashSet;
-    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
     use std::sync::mpsc::{Sender, channel};
-    use std::sync::{Arc, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
     use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
@@ -1087,12 +1183,15 @@ mod windows {
     };
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, GetCursorPos, GetMessageW, GetSystemMetrics, HC_ACTION, KBDLLHOOKSTRUCT,
-        MSLLHOOKSTRUCT, PostThreadMessageW, SM_CXSCREEN, SM_CYSCREEN, SetCursorPos,
-        SetWindowsHookExW, ShowCursor, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
-        WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-        WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOUSEHWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
-        WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, MSG,
+        CallNextHookEx, CreateCursor, GetCursorPos, GetMessageW, GetSystemMetrics, HC_ACTION,
+        IDC_ARROW, KBDLLHOOKSTRUCT, LoadCursorW, MSG, MSLLHOOKSTRUCT, OCR_APPSTARTING, OCR_CROSS,
+        OCR_HAND, OCR_HELP, OCR_IBEAM, OCR_NO, OCR_NORMAL, OCR_SIZEALL, OCR_SIZENESW, OCR_SIZENS,
+        OCR_SIZENWSE, OCR_SIZEWE, OCR_UP, OCR_WAIT, PostThreadMessageW, SM_CXSCREEN, SM_CYSCREEN,
+        SPI_SETCURSORS, SPIF_SENDCHANGE, SYSTEM_CURSOR_ID, SetCursor, SetCursorPos,
+        SetSystemCursor, SetWindowsHookExW, SystemParametersInfoW, UnhookWindowsHookEx,
+        WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+        WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
     };
 
     /// 抓取鼠标时,光标离屏幕中心超过该比例(相对显示器短边)才拉回中心。
@@ -1201,17 +1300,40 @@ mod windows {
         start: Instant,
     }
 
-    /// 钩子回调是普通 `extern "system" fn`,无法捕获环境,所以共享状态放静态里。
-    /// 进程内只装一次钩子,OnceLock 正合适(而且比 rdev 的 `static mut` 安全)。
-    static SHARED: OnceLock<WinShared> = OnceLock::new();
+    /// 钩子回调无法捕获环境,共享状态必须放静态里。这里不能用 `OnceLock`:
+    /// 主题切换会让 eframe 在**同一进程内关闭并重新打开窗口**,从而第二次
+    /// 调用 Capture::start；OnceLock 会保留上一次已经断开的 raw_tx,新钩子
+    /// 仍然把事件送进死队列,表现就是“映射完全失效”。
+    /// 改成原子指针；每次启动换入新的 Box。旧 Box 故意不释放,避免退出中的
+    /// 旧钩子线程仍可能读到它。
+    static SHARED_PTR: AtomicPtr<WinShared> = AtomicPtr::new(std::ptr::null_mut());
+
+    fn shared() -> Option<&'static WinShared> {
+        let ptr = SHARED_PTR.load(Ordering::Acquire);
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &*ptr })
+        }
+    }
+
+    fn install_shared(raw_tx: Sender<RawEvent>) -> *mut WinShared {
+        let shared = Box::into_raw(Box::new(WinShared {
+            raw_tx,
+            last_seen: (0..512).map(|_| AtomicU64::new(0)).collect(),
+            timing: Timing::default(),
+            start: Instant::now(),
+        }));
+        SHARED_PTR.store(shared, Ordering::Release);
+        shared
+    }
     /// 两个钩子的句柄分开存 —— rdev 当年用一个 `static mut HOOK` 装了两把,
     /// 后装的把先装的覆盖掉,于是键盘钩子永远卸不下来。
     static HOOK_KB: AtomicU64 = AtomicU64::new(0);
     static HOOK_MS: AtomicU64 = AtomicU64::new(0);
 
     fn now_ms() -> u64 {
-        SHARED
-            .get()
+        shared()
             .map(|s| s.start.elapsed().as_millis() as u64)
             .unwrap_or(0)
     }
@@ -1219,47 +1341,55 @@ mod windows {
     pub fn start(
         grab: &Arc<AtomicBool>,
         mouse_grab: &Arc<AtomicBool>,
+        cursor_hide: &Arc<AtomicBool>,
         mouse_found: &Arc<AtomicBool>,
         stop: &Arc<AtomicBool>,
         tx: Sender<CaptureEvent>,
-    ) -> Result<Option<Arc<AtomicU32>>> {
+    ) -> Result<(Option<Arc<AtomicU32>>, std::thread::JoinHandle<()>)> {
         // 键盘抓取在 Windows 上无法实现(低级钩子只能观察,不能拦截),
         // 鼠标抓取走"隐藏光标 + 回中",下面由消费线程执行
         let _ = grab;
         let (raw_tx, raw_rx) = channel::<RawEvent>();
-        SHARED
-            .set(WinShared {
-                raw_tx,
-                last_seen: (0..512).map(|_| AtomicU64::new(0)).collect(),
-                timing: Timing::default(),
-                start: Instant::now(),
-            })
-            .ok();
+        let _ = install_shared(raw_tx);
 
         let wake = Arc::new(AtomicU32::new(0));
 
         // 消费线程:算位移、维护光标、定期对账
         {
             let mouse_grab = mouse_grab.clone();
+            let cursor_hide = cursor_hide.clone();
             let mouse_found = mouse_found.clone();
             let stop = stop.clone();
             let start = Instant::now();
             let txt = tx.clone();
             std::thread::spawn(move || {
-                consumer(raw_rx, txt, mouse_grab, mouse_found, stop, start);
+                // 钩子→引擎的中转线程:轻量但要及时。
+                crate::priority::boost(crate::priority::Class::AboveNormal);
+                consumer(
+                    raw_rx,
+                    txt,
+                    mouse_grab,
+                    cursor_hide,
+                    mouse_found,
+                    stop,
+                    start,
+                );
             });
         }
 
         // 钩子线程:装钩子 + 消息循环。低级钩子必须装在跑消息循环的那个线程上。
-        {
+        let hook_thread = {
             let wake = wake.clone();
             let stop = stop.clone();
             std::thread::spawn(move || {
+                // 低级钩子回调跑在这个线程上,系统对钩子投递有低延迟预期:
+                // 提到最高优先级,满载机器上也能第一时间处理输入。
+                crate::priority::boost(crate::priority::Class::Highest);
                 install_and_pump(wake, stop);
-            });
-        }
+            })
+        };
 
-        Ok(Some(wake))
+        Ok((Some(wake), hook_thread))
     }
 
     /// 唤醒钩子线程(退出时用;`GetMessage` 阻塞,光置标志它看不见)
@@ -1340,7 +1470,7 @@ mod windows {
     unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         let began = Instant::now();
         if code == HC_ACTION as i32 {
-            if let Some(shared) = SHARED.get() {
+            if let Some(shared) = shared() {
                 let kb = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
                 let pressed = matches!(wparam as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
                 let released = matches!(wparam as u32, WM_KEYUP | WM_SYSKEYUP);
@@ -1348,10 +1478,7 @@ mod windows {
                     match vktable::map_vk(kb.vkCode as u16) {
                         Some(ev) => {
                             mark(shared, ev, pressed, began);
-                            let _ = shared.raw_tx.send(RawEvent::Key {
-                                code: ev,
-                                pressed,
-                            });
+                            let _ = shared.raw_tx.send(RawEvent::Key { code: ev, pressed });
                         }
                         None => {
                             // 首次遇到未映射的键码时记一条:用户报"这个键绑不上"时,
@@ -1377,23 +1504,33 @@ mod windows {
     unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         let began = Instant::now();
         if code == HC_ACTION as i32 {
-            if let Some(shared) = SHARED.get() {
+            if let Some(shared) = shared() {
                 let msg = wparam as u32;
                 if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
                     let ms = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
                     let delta = ((ms.mouseData >> 16) & 0xFFFF) as u16 as i16;
                     if delta != 0 {
                         let code = if msg == WM_MOUSEWHEEL {
-                            if delta > 0 { BTN_WHEEL_UP } else { BTN_WHEEL_DOWN }
+                            if delta > 0 {
+                                BTN_WHEEL_UP
+                            } else {
+                                BTN_WHEEL_DOWN
+                            }
                         } else if delta > 0 {
                             BTN_WHEEL_RIGHT
                         } else {
                             BTN_WHEEL_LEFT
                         };
                         mark(shared, code, true, began);
-                        let _ = shared.raw_tx.send(RawEvent::Key { code, pressed: true });
+                        let _ = shared.raw_tx.send(RawEvent::Key {
+                            code,
+                            pressed: true,
+                        });
                         mark(shared, code, false, began);
-                        let _ = shared.raw_tx.send(RawEvent::Key { code, pressed: false });
+                        let _ = shared.raw_tx.send(RawEvent::Key {
+                            code,
+                            pressed: false,
+                        });
                     }
                     return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
                 }
@@ -1461,10 +1598,77 @@ mod windows {
         }
     }
 
-    fn set_cursor_visible(visible: bool) {
-        // ShowCursor 内部是引用计数,必须成对调用
+    static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+    static CURSOR_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    pub(super) fn set_cursor_visible(visible: bool) {
+        let _guard = CURSOR_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        if visible {
+            // Always restore the user's configured cursor scheme.  This also
+            // repairs a stale blank cursor left by an abruptly killed run.
+            let restored = unsafe {
+                let ok =
+                    SystemParametersInfoW(SPI_SETCURSORS, 0, std::ptr::null_mut(), SPIF_SENDCHANGE);
+                SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_ARROW));
+                ok
+            };
+            if restored == 0 {
+                diag_warn!(
+                    "capture",
+                    "恢复系统光标方案失败: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            CURSOR_HIDDEN.store(false, Ordering::Release);
+            return;
+        }
+        if CURSOR_HIDDEN.load(Ordering::Acquire) {
+            return;
+        }
+
+        // ShowCursor only controls the calling thread's visible window, which
+        // is why scrcpy's window kept painting its own arrow.  Replace the
+        // system cursor images with a transparent cursor instead; this is
+        // global and does not depend on which application has focus.
+        let ids: [SYSTEM_CURSOR_ID; 14] = [
+            OCR_NORMAL,
+            OCR_IBEAM,
+            OCR_WAIT,
+            OCR_CROSS,
+            OCR_UP,
+            OCR_SIZENWSE,
+            OCR_SIZENESW,
+            OCR_SIZEWE,
+            OCR_SIZENS,
+            OCR_SIZEALL,
+            OCR_NO,
+            OCR_HAND,
+            OCR_APPSTARTING,
+            OCR_HELP,
+        ];
+        let and_mask = [0xFF_u8, 0xFF];
+        let xor_mask = [0_u8, 0];
+        let mut installed = false;
         unsafe {
-            ShowCursor(if visible { 1 } else { 0 });
+            for id in ids {
+                let cursor = CreateCursor(
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    1,
+                    1,
+                    and_mask.as_ptr().cast(),
+                    xor_mask.as_ptr().cast(),
+                );
+                if !cursor.is_null() && SetSystemCursor(cursor, id) != 0 {
+                    installed = true;
+                }
+            }
+            SetCursor(std::ptr::null_mut());
+        }
+        CURSOR_HIDDEN.store(installed, Ordering::Release);
+        if !installed {
+            diag_warn!("capture", "无法安装透明系统光标，指针消隐可能无效");
         }
     }
 
@@ -1509,6 +1713,7 @@ mod windows {
         rx: std::sync::mpsc::Receiver<RawEvent>,
         tx: Sender<CaptureEvent>,
         mouse_grab: Arc<AtomicBool>,
+        cursor_hide: Arc<AtomicBool>,
         mouse_found: Arc<AtomicBool>,
         stop: Arc<AtomicBool>,
         _start: Instant,
@@ -1525,10 +1730,13 @@ mod windows {
 
         while !stop.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(RawEvent::Key { code, pressed: down }) => {
+                Ok(RawEvent::Key {
+                    code,
+                    pressed: down,
+                }) => {
                     if down {
-            // 不断重复补发,并让真正的自动重复事件重新触发一次性动作。
-            // 关键:补发之后同步本地按下集合。否则下一次对账仍会看到这个幻影键,
+                        // 不断重复补发,并让真正的自动重复事件重新触发一次性动作。
+                        // 关键:补发之后同步本地按下集合。否则下一次对账仍会看到这个幻影键,
                         pressed.remove(&code);
                     }
                     let _ = tx.send(CaptureEvent::Button {
@@ -1537,7 +1745,7 @@ mod windows {
                     });
                 }
                 Ok(RawEvent::Move { x, y }) => {
-                    handle_move(&mut motion, &mouse_grab, x, y, &tx);
+                    handle_move(&mut motion, &mouse_grab, &cursor_hide, x, y, &tx);
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1556,10 +1764,12 @@ mod windows {
                 diag_debug!("capture", "前台窗口变化,重新取显示器中心 {:?}", c);
             }
 
-            if mouse_grab.load(Ordering::Relaxed) != motion.hiding {
-                set_cursor_visible(!mouse_grab.load(Ordering::Relaxed));
-                motion.hiding = mouse_grab.load(Ordering::Relaxed);
-                if motion.hiding {
+            let grabbing = mouse_grab.load(Ordering::Relaxed);
+            let hide_cursor = grabbing || cursor_hide.load(Ordering::Relaxed);
+            if hide_cursor != motion.hiding {
+                set_cursor_visible(!hide_cursor);
+                motion.hiding = hide_cursor;
+                if grabbing {
                     let (c, t) = monitor_center();
                     motion.center = c;
                     motion.threshold = t;
@@ -1567,20 +1777,22 @@ mod windows {
                     motion.last = Some((c.0 as f64, c.1 as f64));
                     motion.echo = Some(c);
                     diag_info!("capture", "鼠标已捕获(光标隐去并按中心回中)");
+                } else if hide_cursor {
+                    diag_info!("capture", "系统光标已由全局消隐开关隐藏");
                 } else {
-                    diag_info!("capture", "鼠标已交还给系统");
+                    diag_info!("capture", "系统光标已恢复显示");
                 }
             }
 
             if last_reconcile.elapsed() >= RECONCILE_INTERVAL {
                 last_reconcile = Instant::now();
-                if let Some(s) = SHARED.get() {
+                if let Some(s) = shared() {
                     reconcile(&mut pressed, &tx, &s.last_seen);
                 }
             }
             if last_report.elapsed() >= TIMING_REPORT_INTERVAL {
                 last_report = Instant::now();
-                if let Some(s) = SHARED.get() {
+                if let Some(s) = shared() {
                     let r = s.timing.take_report();
                     // 只在不健康时才值得占用一行日志:正常时 p99 是微秒级
                     let p99 = s.timing.quantile_nanos(0.99);
@@ -1599,7 +1811,19 @@ mod windows {
     }
 
     /// 处理一次绝对坐标移动:差分 -> 回声识别 -> 必要时回中
-    fn handle_move(motion: &mut Motion, mouse_grab: &Arc<AtomicBool>, x: f64, y: f64, tx: &Sender<CaptureEvent>) {
+    fn handle_move(
+        motion: &mut Motion,
+        mouse_grab: &Arc<AtomicBool>,
+        cursor_hide: &Arc<AtomicBool>,
+        x: f64,
+        y: f64,
+        tx: &Sender<CaptureEvent>,
+    ) {
+        if mouse_grab.load(Ordering::Relaxed) || cursor_hide.load(Ordering::Relaxed) {
+            unsafe {
+                SetCursor(std::ptr::null_mut());
+            }
+        }
         let pos = (x, y);
         let mut suppress = false;
         if let Some(e) = motion.echo {
@@ -1655,11 +1879,7 @@ mod windows {
     /// 抢先把键判死:随后向引擎补发一个 UP,而键盘自动重复的下一帧 DOWN 又被
     /// 当成全新按下,于是 Hold 触点会被反复重按。A+U+K 这类"一个持续方向 +
     /// 多个 Hold 技能"的组合正好能持续供给重复 DOWN,所以会卡成死循环。
-    fn reconcile(
-        pressed: &mut HashSet<u16>,
-        tx: &Sender<CaptureEvent>,
-        last_seen: &[AtomicU64],
-    ) {
+    fn reconcile(pressed: &mut HashSet<u16>, tx: &Sender<CaptureEvent>, last_seen: &[AtomicU64]) {
         if pressed.is_empty() {
             return;
         }
@@ -1710,15 +1930,55 @@ mod windows {
 
     #[cfg(test)]
     mod tests {
-        use super::release_is_lost;
+        use super::{RawEvent, WinShared, install_shared, release_is_lost, shared};
+        use std::sync::mpsc::channel;
+
+        #[test]
+        fn restart_replaces_windows_hook_shared_transport() {
+            let (tx1, _rx1) = channel::<RawEvent>();
+            let first = install_shared(tx1);
+            let (tx2, _rx2) = channel::<RawEvent>();
+            let second = install_shared(tx2);
+            assert_ne!(first, second);
+            assert_eq!(
+                shared().map(|s| s as *const WinShared),
+                Some(second as *const WinShared)
+            );
+            shared()
+                .unwrap()
+                .raw_tx
+                .send(RawEvent::Key {
+                    code: 17,
+                    pressed: true,
+                })
+                .unwrap();
+            assert!(matches!(
+                _rx2.recv_timeout(std::time::Duration::from_millis(100)),
+                Ok(RawEvent::Key {
+                    code: 17,
+                    pressed: true
+                })
+            ));
+        }
 
         #[test]
         fn lost_release_requires_system_up_and_grace_period() {
-            assert!(!release_is_lost(true, 100, 10_000, 1_500), "系统仍按住时不能补抬");
-            assert!(!release_is_lost(false, 9_500, 10_000, 1_500), "宽限期内不能抢在真实事件前补抬");
-            assert!(release_is_lost(false, 8_000, 10_000, 1_500), "系统抬起且超过宽限期才可补抬");
-            assert!(!release_is_lost(false, 0, 10_000, 1_500), "没有按下心跳时不能凭空补抬");
+            assert!(
+                !release_is_lost(true, 100, 10_000, 1_500),
+                "系统仍按住时不能补抬"
+            );
+            assert!(
+                !release_is_lost(false, 9_500, 10_000, 1_500),
+                "宽限期内不能抢在真实事件前补抬"
+            );
+            assert!(
+                release_is_lost(false, 8_000, 10_000, 1_500),
+                "系统抬起且超过宽限期才可补抬"
+            );
+            assert!(
+                !release_is_lost(false, 0, 10_000, 1_500),
+                "没有按下心跳时不能凭空补抬"
+            );
         }
     }
-
 }

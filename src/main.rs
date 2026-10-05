@@ -6,12 +6,18 @@ mod diag;
 mod engine;
 mod filedialog;
 mod help;
+mod keyboard;
 mod keymap;
+mod priority;
 mod settings;
 mod theme;
+mod timer;
 
 fn main() -> eframe::Result<()> {
-    // 诊断日志必须是**第一件**发生的事:紧接着 PadApp::new 就会开始
+    // 定时器精度必须最先提升:否则引擎主循环的 recv_timeout 会被量化到 ~10ms 网格,
+    // 计划动作(点按抬起/连发/宏步进)误差 ±6~10ms。见 timer.rs 的实测说明。
+    timer::raise();
+    // 诊断日志必须是**第二件**发生的事:紧接着 PadApp::new 就会开始
     // 枚举输入设备、读配置、连 adb —— 那些正是最需要留下现场的地方。
     diag::init();
     diag::install_panic_hook();
@@ -22,29 +28,53 @@ fn main() -> eframe::Result<()> {
         // 收尾必须放在这里:`selftest` 内部曾经直接 process::exit,
         // 那样会跳过 shutdown 的"正常退出"标记,于是下一次启动会误报
         // "上次运行是崩溃或被强杀"。
+        timer::restore();
         diag::shutdown();
         std::process::exit(code);
     }
 
     diag::snapshot_environment();
-    let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1180.0, 760.0])
-        .with_min_inner_size([900.0, 600.0]);
-    if let Some(icon) = app_icon() {
-        viewport = viewport.with_icon(std::sync::Arc::new(icon));
-    }
-    let options = eframe::NativeOptions {
-        viewport,
-        ..Default::default()
+    // ---- 界面风格(主题)切换的重启循环 ----
+    // 风格改动牵动整体布局,无法热应用(见 theme::UiStyle)。用户在"外观"里换风格时,
+    // 界面先关闭窗口,run_native 返回后由这里**立刻用新风格重新打开** ——
+    // 表现出来就是"关一下 UI 再打开,确保完全切换完毕"。风格存放在 look.json,
+    // 重启后 PadApp::new 自动读回,于是"上一次设的主题,下次启动还在"。
+    let result = loop {
+        let mut viewport = egui::ViewportBuilder::default()
+            .with_inner_size([1180.0, 760.0])
+            .with_min_inner_size([900.0, 600.0]);
+        if let Some(icon) = app_icon() {
+            viewport = viewport.with_icon(std::sync::Arc::new(icon));
+        }
+        let options = eframe::NativeOptions {
+            viewport,
+            ..Default::default()
+        };
+        let result = eframe::run_native(
+            "scrcpy-pad 游戏控制台",
+            options,
+            Box::new(|cc| Ok(Box::new(app::PadApp::new(cc)))),
+        );
+        // 兜底恢复系统光标方案,避免异常退出路径把透明光标遗留给桌面。
+        capture::set_cursor_visible_from_ui(true);
+        if app::take_style_restart() {
+            continue; // 风格切换:窗口已关,马上按新风格重开
+        }
+        break result;
     };
-    let result = eframe::run_native(
-        "scrcpy-pad 游戏控制台",
-        options,
-        Box::new(|cc| Ok(Box::new(app::PadApp::new(cc)))),
-    );
+    // 兜底恢复系统光标；PadApp::on_exit/Drop 已经做过一次，这里防异常路径漏掉。
+    capture::set_cursor_visible_from_ui(true);
+    // 与开头的 raise() 配对(进程退出本身也会清掉,这里显式还原更干净)。
+    timer::restore();
     // 正常退出也留一行标记:下次启动靠它判断"上次是不是崩溃/被强杀"
     diag::shutdown();
-    result
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(error) => {
+            eprintln!("scrcpy-pad 退出错误: {error}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// 程序图标:编译期直接嵌入二进制,运行时不依赖任何外部图片文件
@@ -94,7 +124,11 @@ fn selftest() -> i32 {
         check(
             "evdev 读取权限",
             evdev_ok,
-            if evdev_ok { "" } else { "→ sudo usermod -aG input $USER 后重新登录" },
+            if evdev_ok {
+                ""
+            } else {
+                "→ sudo usermod -aG input $USER 后重新登录"
+            },
         );
     }
     #[cfg(windows)]
@@ -116,21 +150,34 @@ fn selftest() -> i32 {
         check(
             "鼠标设备(REL_X/REL_Y)",
             mice > 0,
-            &format!("{mice} 个{}", if mice == 0 { " → FPS 瞄准不可用" } else { "" }),
+            &format!(
+                "{mice} 个{}",
+                if mice == 0 {
+                    " → FPS 瞄准不可用"
+                } else {
+                    ""
+                }
+            ),
         );
     }
 
     // 2. scrcpy 定位与版本
     let exe = adb::find_scrcpy();
     check("自动寻找 scrcpy", exe.is_some(), "");
-    let Some(exe) = exe else { return 1; };
+    let Some(exe) = exe else {
+        return 1;
+    };
     let ver = adb::scrcpy_version_at(&exe.display().to_string());
     check("scrcpy 版本", ver.is_some(), &format!("{ver:?}"));
-    let Some(version) = ver else { return 1; };
+    let Some(version) = ver else {
+        return 1;
+    };
 
     let server_file = adb::find_server(Some(&exe));
     check("定位 scrcpy-server", server_file.is_some(), "");
-    let Some(server_file) = server_file else { return 1; };
+    let Some(server_file) = server_file else {
+        return 1;
+    };
     let server_path = server_file.display().to_string();
 
     // 3. adb 定位(优先 scrcpy 同目录,对应 Windows 发行包同目录 adb.exe 场景)
@@ -147,7 +194,11 @@ fn selftest() -> i32 {
 
     // 4. adb 设备
     let devices = adb::list_devices();
-    check("adb 设备在线", !devices.is_empty(), &format!("({} 台)", devices.len()));
+    check(
+        "adb 设备在线",
+        !devices.is_empty(),
+        &format!("({} 台)", devices.len()),
+    );
     if devices.is_empty() {
         return 1;
     }
@@ -156,7 +207,9 @@ fn selftest() -> i32 {
     // 5. 分辨率
     let size = adb::screen_size(&serial);
     check("读取分辨率", size.is_ok(), &format!("{size:?}"));
-    let Ok((w, h)) = size else { return 1; };
+    let Ok((w, h)) = size else {
+        return 1;
+    };
 
     // 6. scrcpy-server 控制通道
     let server = adb::start_control_server(&serial, &server_path, &version, 0x1a2b3c4d, 28383);
@@ -177,17 +230,36 @@ fn selftest() -> i32 {
         }
     }
     check("TCP 连接控制通道", client.is_some(), "");
-    let Some(client) = client else { return 1; };
+    let Some(client) = client else {
+        return 1;
+    };
 
     // 7. 协议注入(hover 移动,不触碰屏幕内容)
     let mouse = u64::MAX;
-    client.send(control::ControlCmd::Touch { action: 7, pointer_id: mouse, x: 640, y: 1386 });
-    client.send(control::ControlCmd::Touch { action: 7, pointer_id: mouse, x: 700, y: 1400 });
+    client.send(control::ControlCmd::Touch {
+        action: 7,
+        pointer_id: mouse,
+        x: 640,
+        y: 1386,
+    });
+    client.send(control::ControlCmd::Touch {
+        action: 7,
+        pointer_id: mouse,
+        x: 700,
+        y: 1400,
+    });
     std::thread::sleep(std::time::Duration::from_millis(500));
     check("协议注入(hover)", client.is_connected(), "");
 
     drop(client);
     drop(server);
-    println!("{}", if failed { "存在失败项" } else { "全部通过" });
+    println!(
+        "{}",
+        if failed {
+            "存在失败项"
+        } else {
+            "全部通过"
+        }
+    );
     if failed { 1 } else { 0 }
 }

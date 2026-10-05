@@ -1,8 +1,8 @@
 //! scrcpy 4.x 控制协议客户端。
 //! 消息格式参照 scrcpy 源码 app/src/control_msg.c 的 sc_control_msg_serialize()。
 
-use anyhow::{Context, Result};
 use crate::{diag_info, diag_warn};
+use anyhow::{Context, Result};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -15,11 +15,49 @@ pub const ACTION_MOVE: u8 = 2;
 
 const TYPE_INJECT_KEYCODE: u8 = 0;
 const TYPE_INJECT_TOUCH: u8 = 2;
+const TYPE_UHID_CREATE: u8 = 12;
+const TYPE_UHID_INPUT: u8 = 13;
+const TYPE_UHID_DESTROY: u8 = 14;
 
-#[derive(Debug, Clone, Copy)]
+/// scrcpy reserves HID ids 3..=10 for gamepads; slot 0 is id 3.
+pub const GAMEPAD_HID_ID: u16 = 3;
+
+/// scrcpy's virtual Xbox-360-compatible gamepad report descriptor.
+/// Layout: four 16-bit stick axes, two 16-bit triggers, 16 buttons, hat.
+pub const GAMEPAD_REPORT_DESC: &[u8] = &[
+    0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0xA1, 0x00, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x33,
+    0x09, 0x34, 0x15, 0x00, 0x27, 0xFF, 0xFF, 0x00, 0x00, 0x75, 0x10, 0x95, 0x04, 0x81, 0x02, 0x05,
+    0x01, 0x09, 0x32, 0x09, 0x35, 0x15, 0x00, 0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x02, 0x81, 0x02,
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x15, 0x00, 0x25, 0x01, 0x95, 0x10, 0x75, 0x01, 0x81, 0x02,
+    0x05, 0x01, 0x09, 0x39, 0x15, 0x01, 0x25, 0x08, 0x75, 0x04, 0x95, 0x01, 0x81, 0x42, 0xC0, 0xC0,
+];
+
+#[derive(Debug, Clone)]
 pub enum ControlCmd {
-    Touch { action: u8, pointer_id: u64, x: u32, y: u32 },
-    Key { action: u8, keycode: u32 },
+    Touch {
+        action: u8,
+        pointer_id: u64,
+        x: u32,
+        y: u32,
+    },
+    Key {
+        action: u8,
+        keycode: u32,
+    },
+    UhidCreate {
+        id: u16,
+        vendor_id: u16,
+        product_id: u16,
+        name: String,
+        report_desc: Vec<u8>,
+    },
+    UhidInput {
+        id: u16,
+        data: Vec<u8>,
+    },
+    UhidDestroy {
+        id: u16,
+    },
 }
 
 /// 低延迟注入通道:专用写线程 + 无锁命令队列
@@ -75,6 +113,9 @@ impl ControlClient {
             let proto_h = proto_h.clone();
             let mut stream = stream.try_clone()?;
             std::thread::spawn(move || {
+                // 输入链最后一跳:只在有待发指令时运行(其余时间阻塞在 recv 上),
+                // 提到最高优先级,保证写完 socket 不被满载的游戏线程挤后。
+                crate::priority::boost(crate::priority::Class::Highest);
                 while let Ok(cmd) = rx.recv() {
                     // 每轮都从原子量取一次:坐标空间改变后立刻生效
                     let w = proto_w.load(Ordering::Relaxed) as u16;
@@ -189,6 +230,31 @@ impl ControlClient {
             keycode,
         });
     }
+
+    pub fn uhid_create(
+        &self,
+        id: u16,
+        vendor_id: u16,
+        product_id: u16,
+        name: impl Into<String>,
+        report_desc: Vec<u8>,
+    ) {
+        self.send(ControlCmd::UhidCreate {
+            id,
+            vendor_id,
+            product_id,
+            name: name.into(),
+            report_desc,
+        });
+    }
+
+    pub fn uhid_input(&self, id: u16, data: Vec<u8>) {
+        self.send(ControlCmd::UhidInput { id, data });
+    }
+
+    pub fn uhid_destroy(&self, id: u16) {
+        self.send(ControlCmd::UhidDestroy { id });
+    }
 }
 
 fn serialize(cmd: ControlCmd, w: u16, h: u16) -> Vec<u8> {
@@ -221,6 +287,42 @@ fn serialize(cmd: ControlCmd, w: u16, h: u16) -> Vec<u8> {
             buf[2..6].copy_from_slice(&keycode.to_be_bytes());
             // repeat(6..10) 与 metastate(10..14) 为 0
             buf.to_vec()
+        }
+        ControlCmd::UhidCreate {
+            id,
+            vendor_id,
+            product_id,
+            name,
+            report_desc,
+        } => {
+            let name_bytes = name.as_bytes();
+            let name_len = name_bytes.len().min(127);
+            let desc_len = report_desc.len().min(u16::MAX as usize);
+            let mut buf = Vec::with_capacity(7 + 1 + name_len + 2 + desc_len);
+            buf.push(TYPE_UHID_CREATE);
+            buf.extend_from_slice(&id.to_be_bytes());
+            buf.extend_from_slice(&vendor_id.to_be_bytes());
+            buf.extend_from_slice(&product_id.to_be_bytes());
+            buf.push(name_len as u8);
+            buf.extend_from_slice(&name_bytes[..name_len]);
+            buf.extend_from_slice(&(desc_len as u16).to_be_bytes());
+            buf.extend_from_slice(&report_desc[..desc_len]);
+            buf
+        }
+        ControlCmd::UhidInput { id, data } => {
+            let size = data.len().min(u16::MAX as usize);
+            let mut buf = Vec::with_capacity(5 + size);
+            buf.push(TYPE_UHID_INPUT);
+            buf.extend_from_slice(&id.to_be_bytes());
+            buf.extend_from_slice(&(size as u16).to_be_bytes());
+            buf.extend_from_slice(&data[..size]);
+            buf
+        }
+        ControlCmd::UhidDestroy { id } => {
+            let mut buf = Vec::with_capacity(3);
+            buf.push(TYPE_UHID_DESTROY);
+            buf.extend_from_slice(&id.to_be_bytes());
+            buf
         }
     }
 }
@@ -290,5 +392,42 @@ mod tests {
         assert_eq!(buf[1], ACTION_DOWN);
         assert_eq!(&buf[2..6], &4u32.to_be_bytes());
         assert_eq!(&buf[6..14], &[0u8; 8]);
+    }
+
+    #[test]
+    fn uhid_create_and_input_layout_matches_scrcpy() {
+        let desc = vec![0xAA, 0xBB, 0xCC];
+        let create = serialize(
+            ControlCmd::UhidCreate {
+                id: GAMEPAD_HID_ID,
+                vendor_id: 0x045E,
+                product_id: 0x028E,
+                name: "Pad".into(),
+                report_desc: desc.clone(),
+            },
+            0,
+            0,
+        );
+        assert_eq!(create[0], TYPE_UHID_CREATE);
+        assert_eq!(&create[1..3], &GAMEPAD_HID_ID.to_be_bytes());
+        assert_eq!(&create[3..5], &0x045Eu16.to_be_bytes());
+        assert_eq!(&create[5..7], &0x028Eu16.to_be_bytes());
+        assert_eq!(create[7], 3);
+        assert_eq!(&create[8..11], b"Pad");
+        assert_eq!(&create[11..13], &(desc.len() as u16).to_be_bytes());
+        assert_eq!(&create[13..], &desc);
+
+        let input = serialize(
+            ControlCmd::UhidInput {
+                id: GAMEPAD_HID_ID,
+                data: vec![0x01, 0x02, 0x03],
+            },
+            0,
+            0,
+        );
+        assert_eq!(
+            input,
+            vec![TYPE_UHID_INPUT, 0x00, 0x03, 0x00, 0x03, 0x01, 0x02, 0x03]
+        );
     }
 }

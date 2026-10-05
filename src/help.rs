@@ -76,10 +76,7 @@ impl HelpWindow {
                     .exact_size(INDEX_WIDTH)
                     // 索引条的底色跟窗口一致:子面板默认取的是 `panel_fill`
                     // (主界面那层,背景图开着时更透),压在窗口里会显得比正文更"飘"。
-                    .frame(
-                        egui::Frame::side_top_panel(ui.style())
-                            .fill(ui.visuals().window_fill),
-                    )
+                    .frame(egui::Frame::side_top_panel(ui.style()).fill(ui.visuals().window_fill))
                     .show(ui, |ui| {
                         ui.strong("章节");
                         ui.separator();
@@ -403,7 +400,7 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egui::{pos2, vec2, PointerButton, Rect};
+    use egui::{PointerButton, Rect, pos2, vec2};
 
     /// 窗口宽度(测试里的屏幕够大,窗口不会被挤)
     const WIN_W: f32 = 900.0;
@@ -500,8 +497,10 @@ mod tests {
 
         // egui 会跳过视口外的 Label(见 widgets/label.rs 里的 is_rect_visible),
         // 所以能收集到的就是"首屏"画出来的字
-        let body: Vec<&(String, Rect)> =
-            texts.iter().filter(|(_, r)| r.min.x > INDEX_WIDTH).collect();
+        let body: Vec<&(String, Rect)> = texts
+            .iter()
+            .filter(|(_, r)| r.min.x > INDEX_WIDTH)
+            .collect();
         assert!(!body.is_empty(), "正文一个字都没画出来");
 
         let widest = body.iter().map(|(_, r)| r.width()).fold(0.0f32, f32::max);
@@ -554,7 +553,13 @@ mod tests {
 
         // 按下、抬起分两帧,跟真实点击一致
         let p = idx.center();
-        run(&ctx, &mut w, &mut open, &th, vec![egui::Event::PointerMoved(p)]);
+        run(
+            &ctx,
+            &mut w,
+            &mut open,
+            &th,
+            vec![egui::Event::PointerMoved(p)],
+        );
         let mut ev = Vec::new();
         click(&mut ev, p, true);
         run(&ctx, &mut w, &mut open, &th, ev);

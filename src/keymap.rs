@@ -54,8 +54,63 @@ pub fn mouse_aux_name(code: u16) -> Option<&'static str> {
 fn default_tap_duration_ms() -> u32 {
     DEFAULT_TAP_DURATION_MS
 }
+fn default_swipe_duration_ms() -> u32 {
+    300
+}
 fn default_radius() -> f32 {
     DEFAULT_RADIUS
+}
+fn default_capture_mouse() -> bool {
+    true
+}
+
+fn default_move_speed() -> f32 {
+    1.0
+}
+
+fn default_open_world_radius() -> f32 {
+    0.22
+}
+
+fn default_open_world_smoothing() -> f32 {
+    0.85
+}
+
+fn default_drag_deadzone() -> f32 {
+    0.0
+}
+
+fn default_boundary() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewInputMode {
+    /// Universal compatibility: relative mouse values drive a touch drag.
+    #[default]
+    TouchDrag,
+    /// Legacy scrcpy UHID mouse value; automatically migrated to TouchDrag.
+    UhidMouse,
+    /// Legacy scrcpy AOA mouse value; automatically migrated to TouchDrag.
+    AoaMouse,
+    /// Inject a virtual HID gamepad and drive its right stick from mouse motion.
+    VirtualGamepadContinuous,
+    /// Like continuous gamepad mode, but recenter at the stick limit and carry
+    /// the excess, producing human-swipe-like segmented camera turns.
+    VirtualGamepadSegmented,
+}
+
+impl ViewInputMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TouchDrag => "触摸拖动（通用）",
+            Self::UhidMouse => "UHID 相对鼠标（已移除，旧配置自动迁移）",
+            Self::AoaMouse => "AOA 相对鼠标（已移除，旧配置自动迁移）",
+            Self::VirtualGamepadContinuous => "虚拟手柄右摇杆（连续）",
+            Self::VirtualGamepadSegmented => "虚拟手柄右摇杆（分段回中）",
+        }
+    }
 }
 fn default_version() -> u32 {
     1
@@ -122,11 +177,7 @@ impl Mapper {
 
     /// 长度(半径等,按屏幕宽度换算):配置值 -> 像素
     pub fn len(&self, v: f32) -> f32 {
-        if self.legacy {
-            v
-        } else {
-            v * self.w
-        }
+        if self.legacy { v } else { v * self.w }
     }
 
     /// 像素坐标 -> 配置值(取点时用)
@@ -148,11 +199,7 @@ impl Mapper {
 
     /// 像素长度 -> 配置值
     pub fn rel_len(&self, px: f32) -> f32 {
-        if self.legacy {
-            px
-        } else {
-            px / self.w
-        }
+        if self.legacy { px } else { px / self.w }
     }
 }
 
@@ -170,12 +217,7 @@ pub enum Easing {
     /// 钟形曲线(缓入缓出):起止都慢、中间快(默认 3,即 smoothstep)
     Smooth { power: f32 },
     /// 贝塞尔曲线:由两个控制点决定形状(默认 0.42,0,0.58,1 = ease-in-out)
-    Bezier {
-        x1: f32,
-        y1: f32,
-        x2: f32,
-        y2: f32,
-    },
+    Bezier { x1: f32, y1: f32, x2: f32, y2: f32 },
 }
 
 impl Default for Easing {
@@ -254,10 +296,7 @@ pub enum SwipePath {
     Rect,
     /// 圆形:as_diameter=true 起点终点为直径两端;false 起点为圆心、终点到起点为半径
     /// start_angle 为划圈出发点相对圆心的角度(弧度)
-    Circle {
-        as_diameter: bool,
-        start_angle: f32,
-    },
+    Circle { as_diameter: bool, start_angle: f32 },
 }
 
 impl Default for SwipePath {
@@ -298,13 +337,7 @@ pub fn swipe_points(
 fn rect_points(start: (i32, i32), end: (i32, i32)) -> Vec<(i32, i32)> {
     let (x0, y0) = start;
     let (x1, y1) = end;
-    vec![
-        (x0, y0),
-        (x1, y0),
-        (x1, y1),
-        (x0, y1),
-        (x0, y0),
-    ]
+    vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
 }
 
 /// 圆形轨迹采样。返回 samples 个点(含闭合回出发点)。
@@ -338,6 +371,125 @@ fn circle_points(
         .collect()
 }
 
+/// 宏中的一个按键事件。`delay_ms` 是相对上一个事件的等待时间。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MacroStep {
+    pub code: u16,
+    pub pressed: bool,
+    #[serde(default)]
+    pub delay_ms: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MacroKeyMode {
+    #[default]
+    Tap,
+    Hold,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MacroWheelPart {
+    #[default]
+    Up,
+    Down,
+    Left,
+    Right,
+    Custom(usize),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MacroInstruction {
+    Delay {
+        #[serde(default)]
+        ms: u32,
+    },
+    Key {
+        code: u16,
+        #[serde(default)]
+        mode: MacroKeyMode,
+        #[serde(default = "default_tap_duration_ms")]
+        duration_ms: u32,
+        #[serde(default)]
+        delay_ms: u32,
+    },
+    Combo {
+        keys: Vec<u16>,
+        #[serde(default = "default_tap_duration_ms")]
+        duration_ms: u32,
+        #[serde(default)]
+        delay_ms: u32,
+    },
+    Wheel {
+        wheel: usize,
+        #[serde(default)]
+        part: MacroWheelPart,
+        #[serde(default = "default_tap_duration_ms")]
+        duration_ms: u32,
+        #[serde(default)]
+        delay_ms: u32,
+    },
+    Fps {
+        on: bool,
+        #[serde(default)]
+        delay_ms: u32,
+    },
+    Click {
+        x: f32,
+        y: f32,
+        #[serde(default = "default_tap_duration_ms")]
+        duration_ms: u32,
+        #[serde(default)]
+        delay_ms: u32,
+    },
+    Swipe {
+        start_x: f32,
+        start_y: f32,
+        end_x: f32,
+        end_y: f32,
+        #[serde(default = "default_swipe_duration_ms")]
+        duration_ms: u32,
+        #[serde(default)]
+        delay_ms: u32,
+    },
+    Macro {
+        action: Box<MacroAction>,
+        #[serde(default)]
+        delay_ms: u32,
+    },
+}
+
+impl MacroInstruction {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Delay { .. } => "间隔",
+            Self::Key { .. } => "按键",
+            Self::Combo { .. } => "组合键",
+            Self::Wheel { .. } => "轮盘",
+            Self::Fps { .. } => "FPS",
+            Self::Click { .. } => "点击",
+            Self::Swipe { .. } => "滑动",
+            Self::Macro { .. } => "宏",
+        }
+    }
+}
+
+/// 录制宏保存原始事件；设置宏保存语义操作组合。两者可单独使用。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct MacroAction {
+    /// 用户录制得到的原始按键事件（已合并自动重复）。
+    #[serde(default)]
+    pub steps: Vec<MacroStep>,
+    /// 用户设置的语义操作组合。
+    #[serde(default)]
+    pub instructions: Vec<MacroInstruction>,
+    /// 扩展宏：可选的虚拟键位层。设置后，录制步骤和按键/组合键/轮盘
+    /// 设置步骤都按这套虚拟映射解析后再注入。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_profile: Option<Box<Profile>>,
+}
 // ============================ 动作 ============================
 
 /// 单个按键绑定的动作。
@@ -370,6 +522,8 @@ pub enum Action {
     Swipe(Swipe),
     /// 注入 Android 系统键(如返回=4, 主页=3)
     AndroidKey { keycode: u32 },
+    /// 录制并回放的宏（开发中）。第一版依赖已有键位。
+    Macro(MacroAction),
 }
 
 impl Action {
@@ -379,6 +533,7 @@ impl Action {
             Action::Hold { .. } => "长按",
             Action::Swipe(_) => "滑动",
             Action::AndroidKey { .. } => "系统键",
+            Action::Macro(_) => "宏（开发中）",
         }
     }
 
@@ -386,10 +541,7 @@ impl Action {
     pub fn describe(&self) -> String {
         match self {
             Action::Tap {
-                x,
-                y,
-                duration_ms,
-                ..
+                x, y, duration_ms, ..
             } => {
                 if *duration_ms == 0 {
                     format!("点按 {},{} / 按住切换", pct(*x), pct(*y))
@@ -407,6 +559,20 @@ impl Action {
                 s.path.label()
             ),
             Action::AndroidKey { keycode } => format!("系统键 keycode={keycode}"),
+            Action::Macro(mac) => {
+                if !mac.steps.is_empty() && !mac.instructions.is_empty() {
+                    format!(
+                        "宏 / {} 个录制事件 + {} 个设置操作",
+                        mac.steps.len(),
+                        mac.instructions.len()
+                    )
+                } else if !mac.instructions.is_empty() {
+                    format!("设置宏 / {} 个操作", mac.instructions.len())
+                } else {
+                    let total: u32 = mac.steps.iter().map(|s| s.delay_ms).sum();
+                    format!("录制宏 / {} 个事件 / 约 {}ms", mac.steps.len(), total)
+                }
+            }
         }
     }
 }
@@ -476,6 +642,19 @@ pub struct KeyBind {
     pub fps_only: bool,
 }
 
+/// A simultaneous chord such as Ctrl+R.  The action fires when all `keys`
+/// are held at the same time, and a Hold/System action releases when any
+/// component key is released.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KeyCombo {
+    /// Physical evdev codes; at least two keys are required.
+    pub keys: Vec<u16>,
+    pub action: Action,
+    /// Only active while FPS/open-world view mode is running.
+    #[serde(default)]
+    pub fps_only: bool,
+}
+
 /// 轮盘方向冲突时的处理方式。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -497,6 +676,32 @@ impl WheelMode {
     }
 }
 
+/// 轮盘类型：标准四向 / 自定义方向 / 执行轮盘（先点中心再滑到方向）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WheelKind {
+    #[default]
+    Standard,
+    Custom,
+    Execute,
+}
+
+impl WheelKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Standard => "标准四向",
+            Self::Custom => "自定义方向",
+            Self::Execute => "执行轮盘（开发中）",
+        }
+    }
+}
+
+/// 自定义轮盘的一个方向。0°=右，-90°=上，顺时针为正。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WheelDirection {
+    pub angle_deg: f32,
+    pub key: u16,
+}
 /// 临时摇杆的启用模式
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TempMode {
@@ -542,6 +747,13 @@ fn default_wheel_scope() -> f32 {
     DEFAULT_WHEEL_SCOPE
 }
 
+fn default_center_radius() -> f32 {
+    NEW_WHEEL_RADIUS_PX * 0.45 / REFERENCE_SCREEN_W
+}
+
+fn default_execute_duration() -> u32 {
+    90
+}
 /// 把任意输入(含手工编辑的 json)收敛到合法范围
 pub fn clamp_scope(v: f32) -> f32 {
     if v.is_finite() {
@@ -578,9 +790,200 @@ pub struct Wheel {
     /// 老配置没有这个字段,反序列化后为 1.0,行为与旧版逐一致。
     #[serde(default = "default_wheel_scope")]
     pub scope: f32,
+    /// 轮盘类型。缺省为标准，保证旧配置行为不变。
+    #[serde(default)]
+    pub kind: WheelKind,
+    /// 自定义/执行轮盘的方向，最多 8 个。标准轮盘继续使用 up/down/left/right。
+    #[serde(default)]
+    pub directions: Vec<WheelDirection>,
+    /// 执行轮盘的中心有效区域半径（相对屏宽）。
+    #[serde(default = "default_center_radius")]
+    pub center_radius: f32,
+    /// 执行轮盘从中心到目标位置的滑动时间。
+    #[serde(default = "default_execute_duration")]
+    pub execute_duration_ms: u32,
     /// None=永久摇杆;Some=临时摇杆(按启用键期间方向键归摇杆)
     #[serde(default)]
     pub temp: Option<TempWheel>,
+}
+
+/// 轮盘"生效方向"的定长容器(最多 8 个)——栈上,零堆分配。
+///
+/// 为什么不用 `Vec`:引擎对**每个按键事件 × 每个生效轮盘**都要做一次方向匹配
+/// (`engine.rs` 的方向键扫描与对账),而 `active_dirs()` 的结果最长只有 8 项。
+/// 旧实现每次调用都 `vec![]/collect()` 一次堆分配,实测每事件多花 ~42ns
+/// (2 个永久轮盘,`hotpath-bench.md`);换成定长拷贝后归零。
+#[derive(Debug, Clone, Copy)]
+pub struct ActiveDirs {
+    buf: [(f32, u16); 8],
+    len: usize,
+}
+
+impl ActiveDirs {
+    fn new() -> Self {
+        Self {
+            buf: [(0.0, 0); 8],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, dir: (f32, u16)) {
+        if self.len < self.buf.len() {
+            self.buf[self.len] = dir;
+            self.len += 1;
+        }
+    }
+
+    pub fn as_slice(&self) -> &[(f32, u16)] {
+        &self.buf[..self.len]
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, (f32, u16)> {
+        self.as_slice().iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn get(&self, index: usize) -> Option<&(f32, u16)> {
+        self.as_slice().get(index)
+    }
+
+    pub fn first(&self) -> Option<&(f32, u16)> {
+        self.as_slice().first()
+    }
+
+    /// 需要独立 `Vec` 的冷路径(界面、测试)使用;热路径请直接用上面的借用接口。
+    pub fn to_vec(&self) -> Vec<(f32, u16)> {
+        self.as_slice().to_vec()
+    }
+}
+
+impl<'a> IntoIterator for &'a ActiveDirs {
+    type Item = &'a (f32, u16);
+    type IntoIter = std::slice::Iter<'a, (f32, u16)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+impl IntoIterator for ActiveDirs {
+    type Item = (f32, u16);
+    type IntoIter = ActiveDirsIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        ActiveDirsIter { dirs: self, pos: 0 }
+    }
+}
+
+/// [`ActiveDirs`] 的按值迭代器(栈上,零分配)。
+pub struct ActiveDirsIter {
+    dirs: ActiveDirs,
+    pos: usize,
+}
+
+impl Iterator for ActiveDirsIter {
+    type Item = (f32, u16);
+
+    fn next(&mut self) -> Option<(f32, u16)> {
+        if self.pos < self.dirs.len {
+            let item = self.dirs.buf[self.pos];
+            self.pos += 1;
+            Some(item)
+        } else {
+            None
+        }
+    }
+}
+
+/// 切换键"实际按键"的定长集合(最多 2 个)——来源同 [`ActiveDirs`]:
+/// 组合键门控对每个按键事件都要扫描 `switch_keys`(`engine.rs` ingest_button),
+/// 旧实现每条切换键一次 `Vec` 分配,实测 +38.8ns/事件。
+#[derive(Debug, Clone, Copy)]
+pub struct EffectiveKeys {
+    buf: [u16; 2],
+    len: usize,
+}
+
+impl EffectiveKeys {
+    fn new() -> Self {
+        Self { buf: [0; 2], len: 0 }
+    }
+
+    fn push(&mut self, key: u16) {
+        if self.len < self.buf.len() {
+            self.buf[self.len] = key;
+            self.len += 1;
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u16] {
+        &self.buf[..self.len]
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, u16> {
+        self.as_slice().iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn get(&self, index: usize) -> Option<&u16> {
+        self.as_slice().get(index)
+    }
+
+    pub fn first(&self) -> Option<&u16> {
+        self.as_slice().first()
+    }
+
+    pub fn contains(&self, key: &u16) -> bool {
+        self.as_slice().contains(key)
+    }
+
+    /// 需要排序/去重/存储的冷路径(配置规范化、界面)使用。
+    pub fn to_vec(&self) -> Vec<u16> {
+        self.as_slice().to_vec()
+    }
+}
+
+impl IntoIterator for EffectiveKeys {
+    type Item = u16;
+    type IntoIter = EffectiveKeysIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        EffectiveKeysIter { keys: self, pos: 0 }
+    }
+}
+
+/// [`EffectiveKeys`] 的按值迭代器(栈上,零分配)。
+pub struct EffectiveKeysIter {
+    keys: EffectiveKeys,
+    pos: usize,
+}
+
+impl Iterator for EffectiveKeysIter {
+    type Item = u16;
+
+    fn next(&mut self) -> Option<u16> {
+        if self.pos < self.keys.len {
+            let item = self.keys.buf[self.pos];
+            self.pos += 1;
+            Some(item)
+        } else {
+            None
+        }
+    }
 }
 
 impl Wheel {
@@ -595,6 +998,79 @@ impl Wheel {
     /// 影响范围系数(已收敛到合法范围)
     pub fn scope(&self) -> f32 {
         clamp_scope(self.scope)
+    }
+
+    /// 当前生效的方向集合。标准轮盘返回四向；其它类型返回自定义方向。
+    /// 返回定长栈拷贝(零分配),见 [`ActiveDirs`]。
+    pub fn active_dirs(&self) -> ActiveDirs {
+        let mut out = ActiveDirs::new();
+        match self.kind {
+            WheelKind::Standard => {
+                out.push((-90.0, self.up));
+                out.push((90.0, self.down));
+                out.push((180.0, self.left));
+                out.push((0.0, self.right));
+            }
+            WheelKind::Custom | WheelKind::Execute => {
+                if self.directions.is_empty() {
+                    out.push((-90.0, self.up));
+                    out.push((0.0, self.right));
+                    out.push((90.0, self.down));
+                    out.push((180.0, self.left));
+                } else {
+                    for d in self.directions.iter().take(8) {
+                        out.push((d.angle_deg, d.key));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub fn owns_key(&self, code: u16) -> bool {
+        self.temp.as_ref().is_some_and(|t| t.key == code)
+            || self.active_dirs().iter().any(|(_, key)| *key == code)
+    }
+
+    /// 切到自定义/执行轮盘时，用标准四向初始化自定义方向，保留旧配置语义。
+    pub fn ensure_custom_directions(&mut self) {
+        if self.directions.is_empty() {
+            self.directions = vec![
+                WheelDirection {
+                    angle_deg: -90.0,
+                    key: self.up,
+                },
+                WheelDirection {
+                    angle_deg: 0.0,
+                    key: self.right,
+                },
+                WheelDirection {
+                    angle_deg: 90.0,
+                    key: self.down,
+                },
+                WheelDirection {
+                    angle_deg: 180.0,
+                    key: self.left,
+                },
+            ];
+        }
+    }
+
+    /// 设置自定义方向数量，保留已存在的前几个方向。
+    pub fn set_direction_count(&mut self, count: usize) {
+        self.ensure_custom_directions();
+        let count = count.clamp(2, 8);
+        while self.directions.len() > count {
+            self.directions.pop();
+        }
+        while self.directions.len() < count {
+            let k = self.directions.len() as f32;
+            let angle = -90.0 + k * 360.0 / count as f32;
+            self.directions.push(WheelDirection {
+                angle_deg: angle,
+                key: 0,
+            });
+        }
     }
 
     /// 新建摇杆:圆心落在给定位置上,半径固定为
@@ -613,6 +1089,10 @@ impl Wheel {
             radius: m.rel_len(NEW_WHEEL_RADIUS_PX),
             scope: DEFAULT_WHEEL_SCOPE,
             mode: WheelMode::Classic,
+            kind: WheelKind::Standard,
+            directions: Vec::new(),
+            center_radius: default_center_radius(),
+            execute_duration_ms: default_execute_duration(),
             temp: None,
         }
     }
@@ -688,7 +1168,16 @@ pub struct Profile {
     pub name: String,
     /// 映射总开关的切换键,默认 F8 = 66
     pub toggle_key: u16,
+    /// 全局鼠标消隐切换键：按一下隐藏系统光标，再按一下恢复；不依赖 FPS。
+    #[serde(default)]
+    pub cursor_toggle_key: u16,
     pub binds: Vec<KeyBind>,
+    /// Optional chord recognition.  When disabled, `combos` stays gray and
+    /// has no effect on the normal single-key path.
+    #[serde(default)]
+    pub combos_enabled: bool,
+    #[serde(default)]
+    pub combos: Vec<KeyCombo>,
     pub wheels: Vec<Wheel>,
     /// FPS 鼠标视角瞄准(旧配置缺省为未启用)
     #[serde(default)]
@@ -743,6 +1232,9 @@ pub struct Aim {
     pub anchor_y: f32,
     pub sensitivity_x: f32,
     pub sensitivity_y: f32,
+    /// Global multiplier applied to mouse movement before any view-input mode.
+    #[serde(default = "default_move_speed")]
+    pub move_speed: f32,
     pub invert_y: bool,
     pub recenter: RecenterMode,
     /// 静止归中:停止移动多久后归中(毫秒)
@@ -751,14 +1243,34 @@ pub struct Aim {
     pub recenter_threshold: i32,
     /// 需要按住才瞄准的鼠标键(evdev 码;0 = 始终瞄准)
     pub hold_key: u16,
-    /// 进入 FPS 模式后是否捕获鼠标(隐藏/冻结系统光标)
+    /// FPS 模式指针消隐:是否捕获鼠标(隐藏/冻结系统光标),默认开启
+    #[serde(default = "default_capture_mouse")]
     pub capture_mouse: bool,
     /// 进入/退出 FPS 模式的独立切换键(0 = 未绑定,可用界面按钮启停)
     #[serde(default)]
     pub toggle_key: u16,
-    /// 按住时暂时退出 FPS 模式并把系统光标还给鼠标(0 = 未绑定)
+    /// “按住才退出”:按住时暂时退出 FPS、恢复普通映射并显示鼠标(0 = 未绑定)
     #[serde(default)]
     pub suspend_key: u16,
+    /// 开放世界模式:不需要射击/开镜,持续把相对鼠标位移映射为水平转向。
+    #[serde(default)]
+    pub open_world: bool,
+    /// 开放世界水平回中半径(相对屏幕宽度)。越过该半径时无缝换手,保留超出量。
+    #[serde(default = "default_open_world_radius")]
+    pub open_world_radius: f32,
+    /// 开放世界位移平滑系数:1.0 为完全直通,越小越平滑但越跟手迟。
+    #[serde(default = "default_open_world_smoothing")]
+    pub open_world_smoothing: f32,
+    /// 鼠标拖动死区(设备像素):累计偏移在这个范围内不注入 touch_move。
+    /// 目的:模拟手指按下后的小幅抖动，不让视角跟着鼠标噪声乱晃。
+    #[serde(default = "default_drag_deadzone")]
+    pub drag_deadzone: f32,
+    /// 是否有屏幕边界。false = 无边界，到达回转半径后无缝抬指/重按并保留余量。
+    #[serde(default = "default_boundary")]
+    pub boundary: bool,
+    /// 鼠标视角输入通道。旧 UHID/AOA 配置读取后会迁移为通用触摸拖动。
+    #[serde(default)]
+    pub input_mode: ViewInputMode,
 }
 
 impl Default for Aim {
@@ -769,6 +1281,7 @@ impl Default for Aim {
             anchor_y: 0.0,
             sensitivity_x: 2.0,
             sensitivity_y: 2.0,
+            move_speed: default_move_speed(),
             invert_y: false,
             recenter: RecenterMode::Idle,
             recenter_idle_ms: 120,
@@ -777,6 +1290,12 @@ impl Default for Aim {
             capture_mouse: true,
             toggle_key: 0,
             suspend_key: 0,
+            open_world: false,
+            open_world_radius: default_open_world_radius(),
+            open_world_smoothing: default_open_world_smoothing(),
+            drag_deadzone: default_drag_deadzone(),
+            boundary: default_boundary(),
+            input_mode: ViewInputMode::TouchDrag,
         }
     }
 }
@@ -795,7 +1314,10 @@ impl Default for Profile {
             screen: None,
             name: "默认配置".into(),
             toggle_key: 66, // KEY_F8
+            cursor_toggle_key: 0,
             binds: Vec::new(),
+            combos_enabled: false,
+            combos: Vec::new(),
             wheels: vec![Wheel {
                 up: 17,    // W
                 down: 31,  // S
@@ -808,6 +1330,10 @@ impl Default for Profile {
                 radius: default_wheel_radius(),
                 scope: DEFAULT_WHEEL_SCOPE,
                 mode: WheelMode::Classic,
+                kind: WheelKind::Standard,
+                directions: Vec::new(),
+                center_radius: default_center_radius(),
+                execute_duration_ms: default_execute_duration(),
                 temp: None,
             }],
             aim: Aim::default(),
@@ -837,12 +1363,47 @@ impl Profile {
 ///
 /// 与总开关键、轮盘启用键同属"功能键":按下它不会触发任何普通绑定,
 /// 切换动作由引擎完成(它独占触点状态,能保证先抬起旧组合的触点再换车)。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchDirection {
+    #[default]
+    Target,
+    Next,
+    Prev,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SwitchKey {
-    /// 触发切换的物理键(evdev 码;鼠标键共用同一码空间)
+    /// 旧配置的单键触发码；新配置使用 `keys`，正常化时会把旧值搬进去。
+    #[serde(default)]
     pub key: u16,
+    /// 切换组合键，最多两个；顺序不影响匹配。
+    #[serde(default)]
+    pub keys: Vec<u16>,
     /// 目标组合在 `schemes` 里的下标
+    #[serde(default)]
     pub target: usize,
+    /// Target=切到指定组合；Next/Prev=按组合表循环。
+    #[serde(default)]
+    pub direction: SwitchDirection,
+}
+
+impl SwitchKey {
+    /// 实际生效的切换按键(旧字段单键或新字段组合,最多 2 个)。
+    /// 返回定长栈拷贝(零分配),见 [`EffectiveKeys`]。
+    pub fn effective_keys(&self) -> EffectiveKeys {
+        let mut out = EffectiveKeys::new();
+        if self.keys.is_empty() {
+            if self.key != 0 {
+                out.push(self.key);
+            }
+        } else {
+            for k in self.keys.iter().copied().filter(|k| *k != 0).take(2) {
+                out.push(k);
+            }
+        }
+        out
+    }
 }
 
 /// 配置文件(YAML)的根:一份文件里装若干套"按键组合",外加把它们串起来的切换键。
@@ -862,6 +1423,9 @@ pub struct ConfigFile {
     /// 切换键表
     #[serde(default)]
     pub switch_keys: Vec<SwitchKey>,
+    /// 只有打开时才允许 switch_keys 真正切换组合；关闭时仍可编辑。
+    #[serde(default)]
+    pub fast_switch_enabled: bool,
     /// 全部按键组合(至少一套)
     #[serde(default)]
     pub schemes: Vec<Profile>,
@@ -877,6 +1441,7 @@ impl Default for ConfigFile {
             format_version: PROFILE_VERSION,
             active: 0,
             switch_keys: Vec::new(),
+            fast_switch_enabled: false,
             schemes: vec![Profile::default()],
         }
     }
@@ -913,6 +1478,37 @@ impl ConfigFile {
             changed = true;
         }
         for p in self.schemes.iter_mut() {
+            if matches!(
+                p.aim.input_mode,
+                ViewInputMode::UhidMouse | ViewInputMode::AoaMouse
+            ) {
+                p.aim.input_mode = ViewInputMode::TouchDrag;
+                changed = true;
+            }
+            if !p.aim.move_speed.is_finite() {
+                p.aim.move_speed = 1.0;
+                changed = true;
+            } else {
+                let speed = p.aim.move_speed.clamp(0.2, 3.0);
+                if speed != p.aim.move_speed {
+                    p.aim.move_speed = speed;
+                    changed = true;
+                }
+            }
+            p.combos
+                .retain(|combo| combo.keys.len() >= 2 && combo.keys.iter().all(|key| *key != 0));
+            for combo in &mut p.combos {
+                let mut seen = Vec::new();
+                combo.keys.retain(|key| {
+                    if seen.contains(key) {
+                        false
+                    } else {
+                        seen.push(*key);
+                        true
+                    }
+                });
+            }
+            p.combos.retain(|combo| combo.keys.len() >= 2);
             if p.format_version != PROFILE_VERSION {
                 p.format_version = PROFILE_VERSION;
                 changed = true;
@@ -928,12 +1524,20 @@ impl ConfigFile {
         }
         let n = self.schemes.len();
         let before = self.switch_keys.len();
-        let mut seen: Vec<u16> = Vec::with_capacity(before);
+        let mut seen: Vec<Vec<u16>> = Vec::with_capacity(before);
         self.switch_keys.retain(|s| {
-            if s.key == 0 || s.target >= n || seen.contains(&s.key) {
+            let mut keys = s.effective_keys().to_vec(); // 冷路径(配置规范化):需要排序与去重
+            if keys.is_empty() {
                 return false;
             }
-            seen.push(s.key);
+            keys.sort_unstable();
+            if s.direction == SwitchDirection::Target && s.target >= n {
+                return false;
+            }
+            if seen.contains(&keys) {
+                return false;
+            }
+            seen.push(keys);
             true
         });
         if self.switch_keys.len() != before {
@@ -957,9 +1561,12 @@ pub const YAML_HEADER: &str = r#"# =============================================
 #
 # format_version : 配置格式版本(2 = 相对坐标)。不要手改。
 # active         : 启动时生效的组合下标(0 起)。切换键按下后也会更新它。
-# switch_keys    : 切换键表。按下 key 就把当前组合换成 schemes[target]。
-#   - key        : 物理键的 evdev 码(例:66=F8,67=F9;鼠标左/右/中=272/273/274)
-#     target     : 目标组合下标(0 起)
+# fast_switch_enabled : 是否启用快速切换(默认 false)。关闭时仍保留下面设置，但不生效。
+# switch_keys    : 切换键表。支持单键或最多两个键的组合(顺序无关)。
+#   - key        : 旧版单键字段，兼容旧配置。
+#     keys       : 新配置的多键字段，最多两个 evdev 码。
+#     direction  : target / next / prev；next=正向循环，prev=反向循环。
+#     target     : direction=target 时的目标组合下标(0 起)。
 # schemes        : 全部按键组合,至少有一套。每套字段如下:
 #   name         : 组合名(界面左侧可改,切换时按它提示)
 #                  每套里另有一份 format_version,由程序自动维护:
@@ -970,6 +1577,11 @@ pub const YAML_HEADER: &str = r#"# =============================================
 #     - key      : 物理键(evdev 码;鼠标左/右/中=272/273/274,滚轮=277上/278下/279左/280右)
 #       action   : 动作,取值见下
 #       fps_only : true 时仅在 FPS 模式生效/显示(鼠标技能键建议开启)
+#   combos_enabled : 是否启用组合键(默认 false)。关闭时 combos 保留但全部失效。
+#   combos        : 组合键列表。keys[0] 是前缀键,后续 keys 与前缀同时按住才触发:
+#     - keys      : 物理键 evdev 码数组,至少两个;例如 [29, 19] = Ctrl + R
+#       action    : 组合触发时执行的动作(与 binds.action 相同)
+#       fps_only  : true 时只在视角模式运行期间生效
 #   wheels       : 虚拟摇杆(轮盘)列表
 #     up/down/left/right : 四个方向的物理键(evdev 码)
 #     cx, cy     : 摇杆中心(相对坐标 0..1)
@@ -977,16 +1589,23 @@ pub const YAML_HEADER: &str = r#"# =============================================
 #     scope      : 影响范围倍数(手指实际被推离中心的距离 = radius × scope)
 #     mode       : classic(经典)/sensitive(灵敏,同轴后按覆盖)
 #     temp       : 可选。临时轮盘:key = 启用键(evdev 码),mode = hold|toggle
-#   aim          : 鼠标瞄准(FPS 视角)
+#   aim          : 鼠标视角(FPS / 开放世界)
 #     enabled / anchor_x / anchor_y : 是否启用 + 手指落下的锚点(相对坐标)
 #     sensitivity_x / sensitivity_y : 每 1 个鼠标计数对应的设备像素
+#     move_speed : view speed multiplier (0.2..3.0, default 1.0; touch/open-world/gamepad)
 #     invert_y   : 是否反转纵向
 #     recenter   : 归中策略 idle|threshold|never
 #     recenter_idle_ms / recenter_threshold : 静止归中时长 / 阈值归中的偏移阈值
 #     hold_key   : 仅当该鼠标键按住时才瞄准(evdev 码;0 = 始终瞄准)
-#     capture_mouse : 瞄准时是否冻结/隐藏系统光标
+#     capture_mouse : FPS 模式指针消隐(默认 true)
 #     toggle_key : 独立启停 FPS 模式的按键(0 = 未绑定)
-#     suspend_key: 按住暂时退出 FPS 并显示光标的按键(0 = 未绑定)
+#     suspend_key: “按住才退出”,按住时暂时退出 FPS、恢复普通映射并显示光标(0 = 未绑定)
+#     open_world : true 时启用开放世界视角模式(不要求射击/开镜,无限水平转向)
+#     open_world_radius : 水平触摸拖动带的回中半径(相对屏幕宽度,默认 0.22)
+#     open_world_smoothing : 位移平滑系数(0.15~1.0,默认 0.85)
+#     input_mode : touch_drag(universal touch drag) / virtual_gamepad_continuous /
+#                  virtual_gamepad_segmented (Xbox 360 HID right stick; segmented recenters at limit)
+#                  legacy uhid_mouse / aoa_mouse are migrated to touch_drag.
 #   look         : 外观(配色/密度/背景图),随组合一起保存
 #
 # 动作(action)四种写法(注意类型用 YAML 标签标出,即 !Tap 这种写法;
@@ -1017,6 +1636,7 @@ fn pixels_fit_space(profile: &Profile, space: (u32, u32)) -> bool {
                 points.push(s.end);
             }
             Action::AndroidKey { .. } => {}
+            Action::Macro(_) => {}
         }
     }
     for wl in &profile.wheels {
@@ -1055,6 +1675,7 @@ pub fn upgrade_profile(profile: &mut Profile, space: (u32, u32)) -> bool {
                 s.end = (rel_x(s.end.0), rel_y(s.end.1));
             }
             Action::AndroidKey { .. } => {}
+            Action::Macro(_) => {}
         }
     }
     for wheel in &mut profile.wheels {
@@ -1092,6 +1713,14 @@ mod tests {
 
     /// 回归:响应范围缩放必须真的改变半径(曾经因为复位阈值写成绝对差而完全失效)
     #[test]
+    fn legacy_uhid_view_mode_migrates_to_touch_drag() {
+        let mut doc = ConfigFile::default();
+        doc.schemes[0].aim.input_mode = ViewInputMode::UhidMouse;
+        assert!(doc.normalize());
+        assert_eq!(doc.schemes[0].aim.input_mode, ViewInputMode::TouchDrag);
+    }
+
+    #[test]
     fn synthetic_wheel_names_are_stable() {
         assert_eq!(mouse_aux_name(BTN_WHEEL_UP), Some("BTN_WHEEL_UP"));
         assert_eq!(mouse_aux_name(BTN_WHEEL_DOWN), Some("BTN_WHEEL_DOWN"));
@@ -1101,9 +1730,14 @@ mod tests {
 
     #[test]
     fn legacy_keybind_defaults_to_global_and_wheel_defaults_to_classic() {
-        let bind: KeyBind = serde_json::from_str(r#"{"key":30,"action":{"Hold":{"x":0.1,"y":0.2,"radius":0.03}}}"#).unwrap();
+        let bind: KeyBind =
+            serde_json::from_str(r#"{"key":30,"action":{"Hold":{"x":0.1,"y":0.2,"radius":0.03}}}"#)
+                .unwrap();
         assert!(!bind.fps_only);
-        let wheel: Wheel = serde_json::from_str(r#"{"up":17,"down":31,"left":30,"right":32,"cx":0.1,"cy":0.2,"radius":0.03}"#).unwrap();
+        let wheel: Wheel = serde_json::from_str(
+            r#"{"up":17,"down":31,"left":30,"right":32,"cx":0.1,"cy":0.2,"radius":0.03}"#,
+        )
+        .unwrap();
         assert_eq!(wheel.mode, WheelMode::Classic);
     }
 
@@ -1144,11 +1778,14 @@ mod tests {
         // 竖屏空间(宽 1280):横屏的 x=2462 装不进去 —— 必须拒绝升级
         assert!(!upgrade_profile(&mut p, (1280, 2772)));
         assert_eq!(p.format_version, 1, "不匹配时不得升级");
-        assert_eq!(p.binds[0].action, Action::Hold {
-            x: 2462.0,
-            y: 1038.0,
-            radius: 35.2,
-        });
+        assert_eq!(
+            p.binds[0].action,
+            Action::Hold {
+                x: 2462.0,
+                y: 1038.0,
+                radius: 35.2,
+            }
+        );
         // 横屏空间(宽 2772):装得下 —— 正常升级为相对坐标,且位置不变
         assert!(upgrade_profile(&mut p, (2772, 1280)));
         assert_eq!(p.format_version, PROFILE_VERSION);
@@ -1188,6 +1825,10 @@ mod tests {
                 radius: 120.0,
                 scope: DEFAULT_WHEEL_SCOPE,
                 mode: WheelMode::Classic,
+                kind: WheelKind::Standard,
+                directions: Vec::new(),
+                center_radius: default_center_radius(),
+                execute_duration_ms: default_execute_duration(),
                 temp: None,
             }],
             ..Profile::default()
@@ -1196,6 +1837,10 @@ mod tests {
         p.aim.anchor_y = 1200.0;
 
         assert_eq!(p.coord_unit(), CoordUnit::Pixel);
+        assert_eq!(
+            p.aim.move_speed, 1.0,
+            "old aim configs default to 1.0x speed"
+        );
         assert!(upgrade_profile(&mut p, (1080, 2400)));
         assert_eq!(p.format_version, PROFILE_VERSION);
         assert!(!upgrade_profile(&mut p, (1080, 2400)), "不应重复升级");
@@ -1292,7 +1937,11 @@ mod tests {
         assert!((big.push_px(&m) - m.len(w.radius) * 2.0).abs() < 1e-3);
 
         // 越界与非法值被 clamp(SCOPE_MIN..=SCOPE_MAX)
-        assert_eq!(clamp_scope(0.0), SCOPE_MIN, "0 会让摇杆完全推不动,必须抬到下限");
+        assert_eq!(
+            clamp_scope(0.0),
+            SCOPE_MIN,
+            "0 会让摇杆完全推不动,必须抬到下限"
+        );
         assert_eq!(clamp_scope(-3.0), SCOPE_MIN);
         assert_eq!(clamp_scope(99.0), SCOPE_MAX);
         assert_eq!(clamp_scope(f32::NAN), DEFAULT_WHEEL_SCOPE);
@@ -1316,6 +1965,10 @@ mod tests {
             radius: 0.111,
             scope: 1.5,
             mode: WheelMode::Classic,
+            kind: WheelKind::Standard,
+            directions: Vec::new(),
+            center_radius: default_center_radius(),
+            execute_duration_ms: default_execute_duration(),
             temp: None,
         };
         let m = Mapper::new(CoordUnit::Rel, (1080, 2400));
@@ -1344,8 +1997,16 @@ mod tests {
                 space.1,
                 NEW_WHEEL_RADIUS_PX
             );
-            assert_eq!(w.scope(), DEFAULT_WHEEL_SCOPE, "新建摇杆的影响范围默认为 1.0");
-            assert_eq!((w.up, w.down, w.left, w.right), (17, 31, 30, 32), "方向键默认 WASD");
+            assert_eq!(
+                w.scope(),
+                DEFAULT_WHEEL_SCOPE,
+                "新建摇杆的影响范围默认为 1.0"
+            );
+            assert_eq!(
+                (w.up, w.down, w.left, w.right),
+                (17, 31, 30, 32),
+                "方向键默认 WASD"
+            );
             assert!(w.temp.is_none(), "新建摇杆默认是永久摇杆");
         }
 
@@ -1396,9 +2057,18 @@ mod tests {
         let mut doc = ConfigFile {
             format_version: PROFILE_VERSION,
             active: 1,
+            fast_switch_enabled: false,
             switch_keys: vec![
-                SwitchKey { key: 67, target: 0 },
-                SwitchKey { key: 68, target: 1 },
+                SwitchKey {
+                    key: 67,
+                    target: 0,
+                    ..Default::default()
+                },
+                SwitchKey {
+                    key: 68,
+                    target: 1,
+                    ..Default::default()
+                },
             ],
             schemes: vec![Profile::default(), {
                 let mut p = Profile::default();
@@ -1449,10 +2119,26 @@ mod tests {
         let mut doc = ConfigFile {
             active: 9, // 越界
             switch_keys: vec![
-                SwitchKey { key: 0, target: 0 },   // 未设置
-                SwitchKey { key: 67, target: 9 },  // 指向不存在的组合
-                SwitchKey { key: 68, target: 0 },  // 正常
-                SwitchKey { key: 68, target: 1 },  // 同键重复(保留第一条)
+                SwitchKey {
+                    key: 0,
+                    target: 0,
+                    ..Default::default()
+                }, // 未设置
+                SwitchKey {
+                    key: 67,
+                    target: 9,
+                    ..Default::default()
+                }, // 指向不存在的组合
+                SwitchKey {
+                    key: 68,
+                    target: 0,
+                    ..Default::default()
+                }, // 正常
+                SwitchKey {
+                    key: 68,
+                    target: 1,
+                    ..Default::default()
+                }, // 同键重复(保留第一条)
             ],
             ..ConfigFile::default()
         };
@@ -1460,7 +2146,11 @@ mod tests {
         assert_eq!(doc.active, 0, "active 越界应钳回 0");
         assert_eq!(
             doc.switch_keys,
-            vec![SwitchKey { key: 68, target: 0 }],
+            vec![SwitchKey {
+                key: 68,
+                target: 0,
+                ..Default::default()
+            }],
             "无效/重复的切换键应被剔除"
         );
         assert!(!doc.normalize(), "规整过一次之后就该自洽了");

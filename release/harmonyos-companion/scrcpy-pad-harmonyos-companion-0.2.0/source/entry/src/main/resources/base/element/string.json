@@ -1,0 +1,9 @@
+{
+  "string": [
+    { "name": "module_desc", "value": "scrcpy-pad 鸿蒙版主模块" },
+    { "name": "EntryAbility_desc", "value": "键位映射控制台" },
+    { "name": "EntryAbility_label", "value": "scrcpy-pad" },
+    { "name": "AccessibilityAbility_desc", "value": "接收实体键并注入触摸手势" },
+    { "name": "AccessibilityAbility_label", "value": "scrcpy-pad 键位引擎" }
+  ]
+}

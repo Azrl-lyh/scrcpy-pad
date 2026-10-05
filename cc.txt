@@ -1,0 +1,9 @@
+﻿cargo : [1m[92m    Checking[0m scrcpy-pad v0.1.4 (D:\GitHub\scrcpy-pad-developing-yaml)
+At line:15 char:1844
++ ...  cargo fmt --all; cargo check --bin scrcpy-pad --offline 2>&1 | Out-F ...
++                       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([1m[92m    Ch...eveloping-yaml):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+[1m[92m    Finished[0m ]8;;https://doc.rust-lang.org/cargo/reference/profiles.html#default-profiles\`dev` profile 
+[unoptimized + debuginfo]]8;;\ target(s) in 0.88s

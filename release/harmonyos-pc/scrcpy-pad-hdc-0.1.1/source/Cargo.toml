@@ -1,0 +1,32 @@
+[package]
+name = "scrcpy-pad-hdc"
+version = "0.1.0"
+edition = "2024"
+description = "PC-side HDC backend and probe for HarmonyOS scrcpy-pad"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0.104"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+serde_norway = "0.9"
+directories = "6.0.0"
+eframe = { version = "=0.36.1", default-features = false, features = ["glow", "default_fonts"] }
+egui = "=0.36.1"
+ecolor = "=0.36.1"
+emath = "=0.36.1"
+epaint = "=0.36.1"
+epaint_default_fonts = "=0.36.1"
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
+
+[[bin]]
+name = "hdc-pad-gui"
+path = "src/bin/gui.rs"
+
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_Graphics_Gdi"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.13.2"
+libc = "0.2"

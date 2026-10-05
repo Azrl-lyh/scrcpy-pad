@@ -173,7 +173,9 @@ pub fn init() {
         ));
     }
     if prev_abnormal {
-        write_raw("# 上一份日志**没有**以正常退出标记结尾 —— 上次运行是崩溃或被强杀,请检查其中是否有 ERROR。");
+        write_raw(
+            "# 上一份日志**没有**以正常退出标记结尾 —— 上次运行是崩溃或被强杀,请检查其中是否有 ERROR。",
+        );
     }
     flush();
     // 落盘线程必须在头部写完、且任何 `log()` 之前起好,否则最早的几行
@@ -199,9 +201,7 @@ fn header_lines() -> Vec<String> {
             "# 级别 {} ({source});改成更详细:设环境变量 {ENV_LEVEL}=debug/trace,",
             level.name()
         ),
-        format!(
-            "#   或在 settings.json 里写 \"log_level\": \"debug\"。文件每次启动整体重写。"
-        ),
+        format!("#   或在 settings.json 里写 \"log_level\": \"debug\"。文件每次启动整体重写。"),
         format!("# 文件: {}", lock().path.display()),
         format!("# 起始时间: {}", fmt_time(now_secs())),
         "# 时间戳: [+相对启动毫秒][绝对本地时间]  —— 相对时间用于分析延迟/竞态,".to_string(),
@@ -328,10 +328,12 @@ fn write_raw(line: &str) {
 fn spawn_flusher() {
     std::thread::Builder::new()
         .name("diag-flush".into())
-        .spawn(|| loop {
-            std::thread::sleep(FLUSH_INTERVAL);
-            // 缓冲区为空时 BufWriter::flush 不会发起系统调用,所以空转几乎不花钱
-            flush();
+        .spawn(|| {
+            loop {
+                std::thread::sleep(FLUSH_INTERVAL);
+                // 缓冲区为空时 BufWriter::flush 不会发起系统调用,所以空转几乎不花钱
+                flush();
+            }
         })
         .ok();
 }
@@ -511,7 +513,12 @@ fn os_description() -> String {
 /// 很多"我这儿抓不到按键"的差异都出在这里。
 fn session_description() -> String {
     let mut parts = Vec::new();
-    for key in ["XDG_SESSION_TYPE", "WAYLAND_DISPLAY", "DISPLAY", "DESKTOP_SESSION"] {
+    for key in [
+        "XDG_SESSION_TYPE",
+        "WAYLAND_DISPLAY",
+        "DISPLAY",
+        "DESKTOP_SESSION",
+    ] {
         if let Ok(v) = std::env::var(key) {
             if !v.trim().is_empty() {
                 parts.push(format!("{key}={v}"));
@@ -536,7 +543,10 @@ fn user_and_groups() -> String {
     let mut gids: Vec<u32> = Vec::new();
     for line in status.lines() {
         if let Some(v) = line.strip_prefix("Uid:") {
-            uid = v.split_whitespace().next().and_then(|s| s.parse::<u32>().ok());
+            uid = v
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u32>().ok());
         } else if let Some(v) = line.strip_prefix("Groups:") {
             gids = v
                 .split_whitespace()

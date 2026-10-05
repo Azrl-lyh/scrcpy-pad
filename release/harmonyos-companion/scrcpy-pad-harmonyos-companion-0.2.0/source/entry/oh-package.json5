@@ -1,0 +1,9 @@
+{
+  "name": "entry",
+  "version": "0.2.0",
+  "description": "scrcpy-pad HarmonyOS entry module",
+  "main": "",
+  "author": "Azrl-lyh",
+  "license": "MIT",
+  "dependencies": {}
+}

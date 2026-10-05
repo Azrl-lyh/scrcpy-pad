@@ -80,18 +80,45 @@ LAUNCHER
 }
 
 build_linux() {
-    command -v cargo >/dev/null 2>&1 || die "未找到 cargo,请先安装 Rust: https://rustup.rs"
-    info "构建 Linux (x86_64-unknown-linux-gnu) ..."
-    (cd "$ROOT" && cargo build --release)
-    [ -f "$ROOT/target/release/$PKG" ] || die "构建产物缺失: target/release/$PKG"
+    local baseline="2.31"
+    command -v cargo >/dev/null 2>&1 || die "cargo not found; install Rust from https://rustup.rs"
+    command -v ldd >/dev/null 2>&1 || die "ldd not found; install libc-bin"
+
+    local libc_ver
+    libc_ver="$(ldd --version 2>/dev/null | awk 'NR == 1 { print $NF }')"
+    if [ -z "$libc_ver" ]; then
+        die "cannot detect glibc version with ldd --version"
+    fi
+    if [ "$(printf '%s\n%s\n' "$baseline" "$libc_ver" | sort -V | tail -n 1)" != "$baseline" ] \
+        && [ "${SCRCPY_PAD_ALLOW_NEW_GLIBC:-0}" != "1" ]; then
+        die "glibc $libc_ver is newer than baseline $baseline; build Linux in Ubuntu 20.04 or set SCRCPY_PAD_ALLOW_NEW_GLIBC=1"
+    fi
+
+    local target_dir="${CARGO_TARGET_DIR:-$ROOT/target-linux-glibc231}"
+    info "build Linux (x86_64-unknown-linux-gnu, glibc <= $baseline) ..."
+    (cd "$ROOT" && CARGO_TARGET_DIR="$target_dir" cargo build --release --locked)
+    local exe="$target_dir/release/$PKG"
+    [ -f "$exe" ] || die "missing build artifact: $exe"
+
+    local max_glibc
+    if command -v readelf >/dev/null 2>&1; then
+        max_glibc="$(readelf --version-info "$exe" | grep -o 'GLIBC_[0-9.]*' | sed 's/^GLIBC_//' | sort -V | tail -n 1)"
+        [ -n "$max_glibc" ] || die "cannot read GLIBC symbol versions from $exe"
+        if [ "$(printf '%s\n%s\n' "$baseline" "$max_glibc" | sort -V | tail -n 1)" != "$baseline" ]; then
+            die "artifact requires GLIBC_$max_glibc, above baseline $baseline"
+        fi
+        info "GLIBC baseline check passed: max GLIBC_$max_glibc"
+    else
+        warn "readelf not found; GLIBC symbol check skipped"
+    fi
 
     rm -rf "$LINUX_DIR"
     mkdir -p "$LINUX_DIR"
-    cp -f "$ROOT/target/release/$PKG" "$LINUX_DIR/$PKG"
+    cp -f "$exe" "$LINUX_DIR/$PKG"
     chmod +x "$LINUX_DIR/$PKG"
     copy_common "$LINUX_DIR"
     write_linux_launcher "$LINUX_DIR"
-    info "Linux 包就绪: linux-x86_64/"
+    info "Linux package ready: linux-x86_64/"
 }
 
 # ---------------------------------------------------------------- Windows

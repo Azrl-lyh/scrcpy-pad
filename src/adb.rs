@@ -1,7 +1,10 @@
 use anyhow::{Context, Result, bail};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+use std::sync::mpsc::{self, Receiver};
+use std::time::{Duration, Instant};
 
 /// 进程内选定的 adb 可执行文件(通常为绝对路径;未设置时回退 PATH 中的 "adb")
 static ADB_BIN: Mutex<Option<String>> = Mutex::new(None);
@@ -102,6 +105,78 @@ pub fn display_size(serial: &str) -> Result<(u32, u32)> {
         }
     }
     screen_size(serial)
+}
+
+/// 当前显示器刷新率（Hz），用于“其他功能 -> 调试信息”。
+///
+/// Android 没有统一公开的“游戏实时 FPS”查询接口。这里优先读取
+/// SurfaceFlinger 的刷新周期；失败时回退到 `dumpsys display` 的 refreshRate。
+pub fn display_refresh_rate(serial: &str) -> Result<f32> {
+    if let Ok(out) = adb_cmd(Some(serial))
+        .args(["shell", "dumpsys", "SurfaceFlinger", "--latency"])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if let Some(fps) = parse_refresh_rate_latency(&stdout) {
+            return Ok(fps);
+        }
+    }
+    let out = adb_cmd(Some(serial))
+        .args(["shell", "dumpsys", "display"])
+        .output()
+        .context("执行 adb shell dumpsys display 失败")?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    parse_refresh_rate_text(&stdout).context("无法从设备输出解析刷新率")
+}
+
+fn parse_refresh_rate_latency(text: &str) -> Option<f32> {
+    let first = text
+        .lines()
+        .find_map(|line| line.trim().parse::<f64>().ok());
+    if let Some(period) = first {
+        if (1_000.0..=100_000_000.0).contains(&period) {
+            let fps = 1_000_000_000.0 / period;
+            if (1.0..=1000.0).contains(&fps) {
+                return Some(fps as f32);
+            }
+        }
+    }
+    let timestamps: Vec<u64> = text
+        .lines()
+        .filter_map(|line| line.split(',').next()?.trim().parse().ok())
+        .filter(|v: &u64| *v > 1_000_000)
+        .collect();
+    if timestamps.len() >= 2 {
+        let first = timestamps[0];
+        let last = *timestamps.last().unwrap();
+        if last > first {
+            let fps = (timestamps.len() - 1) as f64 * 1_000_000_000.0 / (last - first) as f64;
+            if (1.0..=1000.0).contains(&fps) {
+                return Some(fps as f32);
+            }
+        }
+    }
+    None
+}
+
+fn parse_refresh_rate_text(text: &str) -> Option<f32> {
+    for key in ["refreshRate=", "fps="] {
+        if let Some(value) = parse_float_after(text, key) {
+            if (1.0..=1000.0).contains(&value) {
+                return Some(value as f32);
+            }
+        }
+    }
+    None
+}
+
+fn parse_float_after(text: &str, key: &str) -> Option<f32> {
+    let start = text.find(key)? + key.len();
+    let rest = text[start..].trim_start();
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
 /// 从 `dumpsys window displays` 输出中取当前显示尺寸。
@@ -302,13 +377,19 @@ fn find_scrcpy_portable_under(base: &Path) -> Option<PathBuf> {
     if let Some(parent) = base.parent() {
         roots.push(parent.to_path_buf());
     }
-    roots.into_iter().find_map(|root| find_scrcpy_under(&root, 3))
+    roots
+        .into_iter()
+        .find_map(|root| find_scrcpy_under(&root, 3))
 }
 
 /// 目录名是否以 "scrcpy" 开头(不区分大小写)
 fn is_scrcpy_dir_name(p: &Path) -> bool {
     p.file_name()
-        .map(|n| n.to_string_lossy().to_ascii_lowercase().starts_with("scrcpy"))
+        .map(|n| {
+            n.to_string_lossy()
+                .to_ascii_lowercase()
+                .starts_with("scrcpy")
+        })
         .unwrap_or(false)
 }
 
@@ -354,7 +435,11 @@ fn find_file_recursive(dir: &Path, name: &str, depth: usize) -> Option<PathBuf> 
 
 /// 各平台 scrcpy 可执行文件名(Windows 必须带 .exe 才能在 PATH 中命中)
 pub fn scrcpy_exe_name() -> &'static str {
-    if cfg!(windows) { "scrcpy.exe" } else { "scrcpy" }
+    if cfg!(windows) {
+        "scrcpy.exe"
+    } else {
+        "scrcpy"
+    }
 }
 
 /// 手动指定的可执行文件:非空且确实存在时返回它。
@@ -396,9 +481,7 @@ pub fn find_adb(scrcpy_exe: Option<&Path>) -> Option<PathBuf> {
             v.push(PathBuf::from(&lo).join(r"Android\Sdk\platform-tools\adb.exe"));
         }
         if let Some(home) = std::env::var_os("USERPROFILE") {
-            v.push(
-                PathBuf::from(&home).join(r"AppData\Local\Android\Sdk\platform-tools\adb.exe"),
-            );
+            v.push(PathBuf::from(&home).join(r"AppData\Local\Android\Sdk\platform-tools\adb.exe"));
         }
         v
     } else {
@@ -419,7 +502,10 @@ pub fn find_server(scrcpy_path: Option<&Path>) -> Option<PathBuf> {
         }
     }
     if cfg!(target_os = "linux") {
-        for s in ["/usr/share/scrcpy/scrcpy-server", "/usr/local/share/scrcpy/scrcpy-server"] {
+        for s in [
+            "/usr/share/scrcpy/scrcpy-server",
+            "/usr/local/share/scrcpy/scrcpy-server",
+        ] {
             let p = PathBuf::from(s);
             if p.is_file() {
                 return Some(p);
@@ -506,28 +592,36 @@ pub fn start_control_server(
 
     // 先建立 forward,再启动 server(server 会 listen 并等待 accept)
     let st = adb_cmd(Some(serial))
-        .args(["forward", &format!("tcp:{port}"), &format!("localabstract:{socket_name}")])
+        .args([
+            "forward",
+            &format!("tcp:{port}"),
+            &format!("localabstract:{socket_name}"),
+        ])
         .output()
         .context("adb forward 失败")?;
     if !st.status.success() {
-        bail!(
-            "adb forward 失败: {}",
-            String::from_utf8_lossy(&st.stderr)
-        );
+        bail!("adb forward 失败: {}", String::from_utf8_lossy(&st.stderr));
     }
 
     let args = format!(
         "CLASSPATH={DEVICE_JAR} app_process / com.genymobile.scrcpy.Server {version} \
          scid={scid:08x} tunnel_forward=true video=false audio=false control=true \
          send_device_meta=false send_frame_meta=false send_stream_meta=false \
-         send_dummy_byte=true cleanup=false power_on=false log_level=warn"
+         send_dummy_byte=true cleanup=true power_on=false log_level=warn"
     );
-    let child = adb_cmd(Some(serial))
+    let mut child = adb_cmd(Some(serial))
         .args(["shell", &args])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .context("启动 scrcpy-server 失败")?;
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                crate::diag_warn!("scrcpy-server", "{line}");
+            }
+        });
+    }
 
     Ok(ControlServer {
         child,
@@ -544,28 +638,148 @@ pub struct ControlServer {
 
 impl Drop for ControlServer {
     fn drop(&mut self) {
+        // 退出清理必须是有界的：kill 后只轮询 try_wait，绝不无条件 wait。
+        let deadline = Instant::now() + Duration::from_millis(800);
         let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = adb_cmd(Some(&self.serial))
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(_) => break,
+            }
+        }
+        // adb forward 清理同样设置超时，避免 adb server 异常时把 GUI 退出卡住。
+        if let Ok(mut child) = adb_cmd(Some(&self.serial))
             .args(["forward", "--remove", &format!("tcp:{}", self.port)])
-            .output();
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            let deadline = Instant::now() + Duration::from_millis(600);
+            while Instant::now() < deadline {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                    Err(_) => break,
+                }
+            }
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+            }
+        }
     }
 }
 
-/// 启动常规 scrcpy 窗口(独立子进程,关闭本程序时不强杀,由用户自行关闭窗口)
-pub fn launch_scrcpy(exe: &str, serial: &str, extra_args: &str) -> Result<Child> {
+fn split_args(input: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in input.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch.is_whitespace() {
+            if !current.is_empty() {
+                result.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    if !current.is_empty() {
+        result.push(current);
+    }
+    result
+}
+
+/// 启动常规 scrcpy 窗口。子进程 stdout/stderr 会逐行写入 diagnostics.log，
+/// 同时监控退出码，避免 GUI 只显示“已启动”而实际参数错误导致进程秒退。
+pub fn launch_scrcpy(exe: &str, serial: &str, extra_args: &str) -> Result<Receiver<String>> {
     let exe = if exe.trim().is_empty() { "scrcpy" } else { exe };
     let mut cmd = Command::new(exe);
     if !serial.is_empty() {
         cmd.args(["-s", serial]);
     }
-    for a in extra_args.split_whitespace() {
+    let args = split_args(extra_args);
+    for a in &args {
         cmd.arg(a);
     }
-    cmd.stdout(Stdio::null())
-        .stderr(Stdio::null())
+    let command_line = format!(
+        "{} -s {}{}",
+        exe,
+        serial,
+        if args.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", args.join(" "))
+        }
+    );
+    crate::diag_info!("scrcpy", "启动: {command_line}");
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
-        .context("启动 scrcpy 失败")
+        .with_context(|| format!("启动 scrcpy 失败: {exe}"))?;
+    let pid = child.id();
+    let (tx, rx) = mpsc::channel();
+    if let Some(stdout) = child.stdout.take() {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                crate::diag_info!("scrcpy", "stdout: {line}");
+                let _ = tx.send(format!("scrcpy stdout: {line}"));
+            }
+        });
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                crate::diag_warn!("scrcpy", "stderr: {line}");
+                let _ = tx.send(format!("scrcpy stderr: {line}"));
+            }
+        });
+    }
+    std::thread::spawn(move || {
+        let message = match child.wait() {
+            Ok(status) if status.success() => {
+                crate::diag_info!("scrcpy", "进程 {pid} 正常退出: {status}");
+                format!("scrcpy 已退出（正常，{status}）")
+            }
+            Ok(status) => {
+                crate::diag_warn!("scrcpy", "进程 {pid} 异常退出: {status}");
+                format!(
+                    "scrcpy 异常退出（{status}）。请查看 diagnostics.log 中 scrcpy 的 stderr 输出"
+                )
+            }
+            Err(error) => {
+                crate::diag_warn!("scrcpy", "进程 {pid} 等待失败: {error}");
+                format!("无法获取 scrcpy 退出状态: {error}")
+            }
+        };
+        let _ = tx.send(message);
+    });
+    Ok(rx)
 }
 
 /// 让设备重新走一遍 audio policy,把音频转发"叫醒"。
@@ -641,8 +855,7 @@ mod tests {
     /// 而旧逻辑只接受 `is_file()`,目录会被当作死路径直接丢掉。
     #[test]
     fn explicit_path_accepts_a_directory() {
-        let root =
-            std::env::temp_dir().join(format!("scrcpy-pad-test-dir-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("scrcpy-pad-test-dir-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         // 官方发行包布局:exe/server/adb 同目录
         let pkg = root.join("scrcpy-win64-v3.3.3");
@@ -653,9 +866,15 @@ mod tests {
         std::fs::write(pkg.join(adb_exe_name()), b"x").unwrap();
 
         // 1) 给目录 -> 解析出目录里的 exe
-        assert_eq!(find_scrcpy_explicit(&pkg.display().to_string()), Some(exe.clone()));
+        assert_eq!(
+            find_scrcpy_explicit(&pkg.display().to_string()),
+            Some(exe.clone())
+        );
         // 2) 给 exe 本身 -> 原样返回
-        assert_eq!(find_scrcpy_explicit(&exe.display().to_string()), Some(exe.clone()));
+        assert_eq!(
+            find_scrcpy_explicit(&exe.display().to_string()),
+            Some(exe.clone())
+        );
         // 3) 目录里再多套一层也能找到(解压时多一层文件夹是常事)
         let outer = root.join("解压出来的文件夹");
         let nested = outer.join("再套一层").join("scrcpy-win64-v9.9");
@@ -675,10 +894,14 @@ mod tests {
         );
 
         // 5) 同目录推导:server 与 adb 都能从 scrcpy 的位置补齐
-        assert_eq!(find_server(Some(&exe)).map(|p| p.file_name().unwrap().to_owned()),
-                   Some("scrcpy-server".into()));
-        assert_eq!(find_adb(Some(&exe)).map(|p| p.file_name().unwrap().to_owned()),
-                   Some(adb_exe_name().into()));
+        assert_eq!(
+            find_server(Some(&exe)).map(|p| p.file_name().unwrap().to_owned()),
+            Some("scrcpy-server".into())
+        );
+        assert_eq!(
+            find_adb(Some(&exe)).map(|p| p.file_name().unwrap().to_owned()),
+            Some(adb_exe_name().into())
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -699,7 +922,10 @@ mod tests {
         // 直接给发行包目录
         assert_eq!(find_scrcpy_under(&pkg, 3), Some(exe.clone()));
         // 给外面那层(名字完全不像 scrcpy)
-        assert_eq!(find_scrcpy_under(&root.join("一个文件夹"), 3), Some(exe.clone()));
+        assert_eq!(
+            find_scrcpy_under(&root.join("一个文件夹"), 3),
+            Some(exe.clone())
+        );
         // 给最外层大目录
         assert_eq!(find_scrcpy_under(&root, 3), Some(exe.clone()));
         // 非 scrcpy 命名的目录里即便有同名 exe 也不能被认成 scrcpy 包
@@ -720,6 +946,30 @@ mod tests {
     }
 
     /// 横屏设备上 wm size 是自然方向(1280x2772),真实坐标空间应从 cur= 取到 2772x1280
+    #[test]
+    fn scrcpy_argument_splitter_respects_quotes_and_spaces() {
+        assert_eq!(
+            split_args("--stay-awake --window-title \"Game Window\" --max-size=1920"),
+            vec![
+                "--stay-awake",
+                "--window-title",
+                "Game Window",
+                "--max-size=1920"
+            ]
+        );
+        assert_eq!(split_args("a\\ b \"c d\""), vec!["a b", "c d"]);
+    }
+
+    #[test]
+    fn parses_refresh_rate_from_latency_and_display_text() {
+        assert!((parse_refresh_rate_latency("16666666\n").unwrap() - 60.0).abs() < 0.01);
+        assert!(
+            (parse_refresh_rate_text("mDisplayInfo refreshRate=120.0 fps=120.0").unwrap() - 120.0)
+                .abs()
+                < 0.01
+        );
+    }
+
     #[test]
     fn parse_display_size_prefers_current_orientation() {
         let out = "  Display: mDisplayId=0\n\
