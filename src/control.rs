@@ -3,11 +3,11 @@
 
 use crate::{diag_info, diag_warn};
 use anyhow::{Context, Result};
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 pub const ACTION_DOWN: u8 = 0;
 pub const ACTION_UP: u8 = 1;
@@ -60,9 +60,165 @@ pub enum ControlCmd {
     },
 }
 
-/// 低延迟注入通道:专用写线程 + 无锁命令队列
+/// Move 类命令允许的最大排队深度(W1-3)。达到它说明设备端/转发通道已经堵了:
+/// 位移是绝对坐标语义,"丢旧保新"不改变指针最终位置;而**重放**一长串过期位移
+/// 才是真的坏事 —— 指针会先沿陈旧路径划过一遍再追上当前位置。
+const MOVE_BACKLOG_LIMIT: usize = 256;
+
+/// 一次 `write_all` 最多拼多少条命令(见写线程里的攒批说明)。
+/// 64 足够覆盖"一次按下引发的 down+move+滑动插值"这种突发,又不至于让
+/// 单次写入的字节数失控(触摸 32B、按键 12B 量级 → 一次 write 最多 ~2KB)。
+const WRITE_BATCH_LIMIT: usize = 64;
+
+/// 控制队列的实时快照(诊断面板用)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QueueStats {
+    pub depth: usize,
+    pub peak: usize,
+    pub dropped: u64,
+}
+
+/// 控制命令队列(W1-3):替代原来的无界 `mpsc`。
+///
+/// 与 mpsc 的差别只有两点,都是"看得见 + 压得住":
+/// 1. **深度可见**:发送方随时能读到当前/峰值深度与丢弃计数(诊断面板显示);
+/// 2. **Move 类丢旧保新**:排队深度达到 `MOVE_BACKLOG_LIMIT` 时,新的
+///    `ACTION_MOVE` 顶掉**同一触点最旧的那条** —— 每个来源(瞄准/轮盘/宏/
+///    手柄)有自己的 `pointer_id`,互不干扰,顺序也不乱。
+///
+/// 其余命令(按下/抬起/按键/UHID)一条都不丢:它们是边沿语义,丢了就是
+/// 卡键或丢操作 —— 宁可积压,不可失序。
+struct CmdQueue {
+    q: Mutex<VecDeque<ControlCmd>>,
+    cv: Condvar,
+    peak: AtomicUsize,
+    dropped: AtomicU64,
+    /// 已被写线程取走、但**还没写进 socket** 的命令条数(攒批的本地缓冲)。
+    ///
+    /// 攒批把最多 `WRITE_BATCH_LIMIT` 条命令从队列挪进了写线程自己的 `buf`,
+    /// 那批命令还在途 —— 不算进来的话:①诊断面板的"深度"会在最该看的时候
+    /// (socket 卡住、写线程堵在 `write_all` 上)少报一整个批次;②"丢旧保新"
+    /// 的在途上限会从 256 放宽到 256+64,卡顿恢复后多写出几十条过期位移。
+    /// 只由写线程改(取一条 +1、写完一批 -= n),`push` 在锁内读。
+    inflight: AtomicUsize,
+    /// 客户端销毁后置位:消费者"取空 + 已关闭"即退出(等价于 mpsc 的断开)
+    closed: AtomicBool,
+}
+
+impl CmdQueue {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            q: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+            peak: AtomicUsize::new(0),
+            dropped: AtomicU64::new(0),
+            inflight: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+        })
+    }
+
+    fn push(&self, cmd: ControlCmd) {
+        // 锁中毒不放弃:注入路径不能因为某个持锁线程 panic 就全线卡死
+        let mut q = self.q.lock().unwrap_or_else(|e| e.into_inner());
+        let mut dropped_now = None;
+        let move_pid = match &cmd {
+            ControlCmd::Touch {
+                action: ACTION_MOVE,
+                pointer_id,
+                ..
+            } => Some(*pointer_id),
+            _ => None,
+        };
+        // 在途量 = 队列里 + 写线程手里还没落 socket 的那一批(见 `inflight`)
+        let backlog = q.len() + self.inflight.load(Ordering::Relaxed);
+        if let Some(pid) = move_pid.filter(|_| backlog >= MOVE_BACKLOG_LIMIT) {
+            let oldest = q.iter().position(|c| {
+                matches!(
+                    c,
+                    ControlCmd::Touch { action: ACTION_MOVE, pointer_id, .. } if *pointer_id == pid
+                )
+            });
+            if let Some(i) = oldest {
+                q.remove(i);
+                dropped_now = Some(self.dropped.fetch_add(1, Ordering::Relaxed) + 1);
+            }
+        }
+        q.push_back(cmd);
+        // 峰值记"在途量"(队列 + 写线程手里的那批):面板上这两个数就是用户
+        // 判断"堵在我们这一侧还是设备侧"的依据,不能少算一整个批次。
+        self.peak.fetch_max(
+            q.len() + self.inflight.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        drop(q);
+        self.cv.notify_one();
+        // 日志放在锁外:diag 的写盘不能拖住持锁的注入路径。
+        // 首次与每 1000 条各记一次,免得持续积压时把日志刷爆。
+        if let Some(n) = dropped_now.filter(|n| *n == 1 || n % 1000 == 0) {
+            diag_warn!(
+                "control",
+                "控制队列积压(≥{MOVE_BACKLOG_LIMIT}):累计丢弃 {n} 条过期 Move(保新)——设备端或转发通道变慢"
+            );
+        }
+    }
+
+    /// 阻塞取一条;`None` = 队列已关闭且取空(客户端已销毁)。
+    ///
+    /// 取走即计入 `inflight`(它还没写进 socket),写完由 `written()` 冲销 ——
+    /// 于是 `depth` 在"取走"这一步不下降(总数不变),只在真正写完后下降。
+    fn pop(&self) -> Option<ControlCmd> {
+        let mut q = self.q.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(c) = q.pop_front() {
+                self.inflight.fetch_add(1, Ordering::Relaxed);
+                return Some(c);
+            }
+            if self.closed.load(Ordering::Relaxed) {
+                return None;
+            }
+            q = self.cv.wait(q).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// 非阻塞取一条(攒批用):拿不到就返回 None,绝不等。
+    fn try_pop(&self) -> Option<ControlCmd> {
+        let mut q = self.q.lock().unwrap_or_else(|e| e.into_inner());
+        let c = q.pop_front();
+        if c.is_some() {
+            self.inflight.fetch_add(1, Ordering::Relaxed);
+        }
+        c
+    }
+
+    /// 写线程报账:这一批 `n` 条已经离开本地(写完,或写失败被丢弃),
+    /// 从在途量里冲销。
+    fn written(&self, n: usize) {
+        self.inflight.fetch_sub(n, Ordering::Relaxed);
+    }
+
+    /// 客户端销毁:唤醒写线程,让它取空后自行退出
+    fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+        self.cv.notify_all();
+    }
+
+    /// 诊断快照。`depth` **现算**:队列里的 + 写线程手里还没落 socket 的那批
+    /// (见 `inflight`)—— 攒批之后"队列长度"不再是"还没发出去的条数",而面板上
+    /// 那个数要回答的正是后者。取一次锁的代价可以忽略(与 `push` 同一把锁,
+    /// 界面每帧至多问一次)。
+    fn stats(&self) -> QueueStats {
+        let queued = self.q.lock().unwrap_or_else(|e| e.into_inner()).len();
+        QueueStats {
+            depth: queued + self.inflight.load(Ordering::Relaxed),
+            peak: self.peak.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// 低延迟注入通道:专用写线程 + 命令队列(深度可见、Move 类丢旧保新,W1-3)
 pub struct ControlClient {
-    tx: Sender<ControlCmd>,
+    queue: Arc<CmdQueue>,
     connected: Arc<AtomicBool>,
     /// 设备屏幕宽(逻辑像素),用于瞄准偏移的边界钳制
     pub screen_w: u32,
@@ -100,28 +256,63 @@ impl ControlClient {
             Err(e) => anyhow::bail!("等待 dummy 字节失败: {e}"),
         }
         stream.set_read_timeout(None).ok();
+        // 写入看门狗(2026-10-06):设备端 server 若卡住不读(系统繁忙/进程被冻),
+        // TCP 发送缓冲填满后 `write_all` 会**无限**阻塞 —— 输入全堆在队列里,
+        // 用户看到的是"延迟暴涨、按键无反应",而通道表面上还"连着",永远不会
+        // 触发断线路径。给写操作设上限:超时即视为链路故障(与写失败同路),
+        // 由界面层的自动重连在秒级内把通道拉起来。
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_millis(2000)))
+            .ok();
 
         let connected = Arc::new(AtomicBool::new(true));
         let proto_w = Arc::new(AtomicU32::new(screen_w));
         let proto_h = Arc::new(AtomicU32::new(screen_h));
-        let (tx, rx) = channel::<ControlCmd>();
+        let queue = CmdQueue::new();
 
         // 写线程:把控制消息序列化后写入 socket
         {
             let connected = connected.clone();
             let proto_w = proto_w.clone();
             let proto_h = proto_h.clone();
+            let queue = queue.clone();
             let mut stream = stream.try_clone()?;
             std::thread::spawn(move || {
-                // 输入链最后一跳:只在有待发指令时运行(其余时间阻塞在 recv 上),
+                // 输入链最后一跳:只在有待发指令时运行(其余时间阻塞在队列上),
                 // 提到最高优先级,保证写完 socket 不被满载的游戏线程挤后。
                 crate::priority::boost(crate::priority::Class::Highest);
-                while let Ok(cmd) = rx.recv() {
-                    // 每轮都从原子量取一次:坐标空间改变后立刻生效
-                    let w = proto_w.load(Ordering::Relaxed) as u16;
-                    let h = proto_h.load(Ordering::Relaxed) as u16;
-                    let buf = serialize(cmd, w, h);
-                    if let Err(e) = stream.write_all(&buf) {
+                while let Some(cmd) = queue.pop() {
+                    // 攒批(2026-10-06 延迟修复):一次唤醒把队列里**已经排好**的
+                    // 命令合成一次 `write_all`。一条一写在 Nagle 已关的连接上等于
+                    // 一个 TCP 报文 + 一次系统调用;投屏开着时这些报文还要和视频流
+                    // 一起挤 adbd 的转发,报文数就是排队延迟。攒批不改变顺序
+                    // (FIFO 原样拼接),也不增加延迟:队列里没有第二条时行为与
+                    // 旧实现逐字相同。
+                    //
+                    // 宽高**每条各读一次**(旧实现就是逐条读的):批里可能夹着
+                    // `set_screen`(转屏/截图校正),用批次开头那一份会把之后的
+                    // 命令按旧坐标空间换算 —— 服务端启用视频/`--new-display` 时
+                    // `PositionMapper` 会因此把它们缩放错位。
+                    let mut buf = serialize(
+                        cmd,
+                        proto_w.load(Ordering::Relaxed) as u16,
+                        proto_h.load(Ordering::Relaxed) as u16,
+                    );
+                    let mut n = 1usize;
+                    while n < WRITE_BATCH_LIMIT {
+                        let Some(more) = queue.try_pop() else { break };
+                        buf.extend_from_slice(&serialize(
+                            more,
+                            proto_w.load(Ordering::Relaxed) as u16,
+                            proto_h.load(Ordering::Relaxed) as u16,
+                        ));
+                        n += 1;
+                    }
+                    let res = stream.write_all(&buf);
+                    // 这一批无论结果如何都已离开本地(写成功或随失败丢弃),
+                    // 先冲销在途量再处理错误 —— 否则失败路径会把在途量漏掉。
+                    queue.written(n);
+                    if let Err(e) = res {
                         connected.store(false, Ordering::Relaxed);
                         // 写入失败是最容易被忽略的故障:命令全部静默丢弃,
                         // 用户只看到"按键没反应"。把 errno 留下来。
@@ -169,13 +360,18 @@ impl ControlClient {
             "控制通道已建立: 端口 {port},坐标空间 {screen_w}x{screen_h}"
         );
         Ok(Self {
-            tx,
+            queue,
             connected,
             screen_w,
             screen_h,
             proto_w,
             proto_h,
         })
+    }
+
+    /// 队列深度快照(W1-3,诊断面板显示用)
+    pub fn queue_stats(&self) -> QueueStats {
+        self.queue.stats()
     }
 
     pub fn is_connected(&self) -> bool {
@@ -194,7 +390,7 @@ impl ControlClient {
     }
 
     pub fn send(&self, cmd: ControlCmd) {
-        let _ = self.tx.send(cmd);
+        self.queue.push(cmd);
     }
 
     pub fn touch_down(&self, pointer_id: u64, x: i32, y: i32) {
@@ -254,6 +450,39 @@ impl ControlClient {
 
     pub fn uhid_destroy(&self, id: u16) {
         self.send(ControlCmd::UhidDestroy { id });
+    }
+}
+
+#[cfg(test)]
+impl ControlClient {
+    /// 测试用:不建 TCP、不建写线程,指令留在队列里,由 [`Self::take_cmds`] 取走。
+    ///
+    /// 引擎单测要断言的是"派发之后注入了什么"(`ControlCmd`,与写线程序列化的
+    /// 是同一份数据),不必真的接一个 socket —— 同步、无线程、无时序抖动。
+    pub(crate) fn for_test(screen_w: u32, screen_h: u32) -> Self {
+        Self {
+            queue: CmdQueue::new(),
+            connected: Arc::new(AtomicBool::new(true)),
+            screen_w,
+            screen_h,
+            proto_w: Arc::new(AtomicU32::new(screen_w)),
+            proto_h: Arc::new(AtomicU32::new(screen_h)),
+        }
+    }
+
+    /// 取走队列里当前积压的全部指令(测试用;`for_test` 没有消费者线程)。
+    pub(crate) fn take_cmds(&self) -> Vec<ControlCmd> {
+        let mut q = self.queue.q.lock().unwrap_or_else(|e| e.into_inner());
+        let out: Vec<ControlCmd> = q.drain(..).collect();
+        out
+    }
+}
+
+impl Drop for ControlClient {
+    fn drop(&mut self) {
+        // 关队列 = 通知写线程退出。等价于旧实现里"所有 Sender 被丢弃"的断开,
+        // 但它是显式的:断线重连会新建客户端,旧写线程必须能干净退出。
+        self.queue.close();
     }
 }
 
@@ -429,5 +658,166 @@ mod tests {
             input,
             vec![TYPE_UHID_INPUT, 0x00, 0x03, 0x00, 0x03, 0x01, 0x02, 0x03]
         );
+    }
+
+    // ---- W1-3:控制队列的深度可见与 Move 类丢旧保新 ----
+
+    fn mv(pid: u64, x: u32) -> ControlCmd {
+        ControlCmd::Touch {
+            action: ACTION_MOVE,
+            pointer_id: pid,
+            x,
+            y: 0,
+        }
+    }
+
+    fn key(k: u32) -> ControlCmd {
+        ControlCmd::Key {
+            action: ACTION_DOWN,
+            keycode: k,
+        }
+    }
+
+    /// 未达上限时一条不丢、顺序不变:队列的基础行为必须与旧的 mpsc 完全一致
+    #[test]
+    fn queue_preserves_fifo_order_below_the_limit() {
+        let q = CmdQueue::new();
+        q.push(mv(7, 1));
+        q.push(key(4));
+        match q.pop() {
+            Some(ControlCmd::Touch { action, x, .. }) => {
+                assert_eq!((action, x), (ACTION_MOVE, 1));
+            }
+            other => panic!("应为第一条 Move,实得 {other:?}"),
+        }
+        assert!(matches!(q.pop(), Some(ControlCmd::Key { .. })));
+        assert_eq!(q.stats().dropped, 0);
+    }
+
+    /// 达到上限后:同触点最旧的一条被顶掉,深度净增 0;
+    /// 另一个触点没有可顶掉的条目,不受影响
+    #[test]
+    fn move_backlog_drops_the_oldest_of_the_same_pointer_only() {
+        let q = CmdQueue::new();
+        for i in 0..MOVE_BACKLOG_LIMIT as u32 {
+            q.push(mv(7, i));
+        }
+        q.push(mv(9, 1000));
+        assert_eq!(q.stats().depth, MOVE_BACKLOG_LIMIT + 1);
+        assert_eq!(q.stats().dropped, 0, "别的触点不该被牵连");
+
+        q.push(mv(7, 999));
+        let st = q.stats();
+        assert_eq!(st.depth, MOVE_BACKLOG_LIMIT + 1, "顶掉一条又入队一条");
+        assert_eq!(st.dropped, 1);
+        assert!(st.peak > MOVE_BACKLOG_LIMIT, "峰值不能被后续丢弃盖掉");
+
+        q.close();
+        let mut entries: Vec<(u64, u32)> = Vec::new();
+        while let Some(c) = q.pop() {
+            if let ControlCmd::Touch { pointer_id, x, .. } = c {
+                entries.push((pointer_id, x));
+            }
+        }
+        assert!(!entries.contains(&(7, 0)), "被顶掉的必须是同触点最旧的一条");
+        assert!(entries.contains(&(7, 1)), "其余同触点的条目必须保留");
+        assert!(entries.contains(&(9, 1000)), "别的触点不受影响");
+        assert!(entries.contains(&(7, 999)), "新来的那条必须在");
+        assert_eq!(entries.len(), MOVE_BACKLOG_LIMIT + 1);
+    }
+
+    /// 攒批把命令先挪进写线程手里:`depth` 必须报"还没写进 socket 的条数"
+    /// (队列 + 在途),否则 socket 卡住、写线程堵在 `write_all` 上时,面板会
+    /// 少报一整个批次 —— 而那两个数正是用户判断"堵在我们这侧还是设备侧"的依据。
+    #[test]
+    fn queue_depth_counts_commands_already_handed_to_the_writer() {
+        let q = CmdQueue::new();
+        q.push(mv(7, 1));
+        q.push(mv(7, 2));
+        assert_eq!(q.stats().depth, 2);
+        let first = q.pop().expect("队列非空");
+        assert!(matches!(first, ControlCmd::Touch { .. }));
+        assert_eq!(q.stats().depth, 2, "被写线程取走 ≠ 已经写出去");
+        q.written(1);
+        assert_eq!(q.stats().depth, 1, "写完一条才冲销一条");
+        let second = q.pop().expect("队列还有一条");
+        assert!(matches!(second, ControlCmd::Touch { .. }));
+        assert_eq!(q.stats().depth, 1, "取走第二条:总数仍不变");
+        q.written(1);
+        assert_eq!(q.stats().depth, 0);
+
+        // 在途量也要计入"丢旧保新"的上限:否则队列自己没到 256 就不顶掉,
+        // 卡顿恢复后会多写出几十条过期位移。
+        let q2 = CmdQueue::new();
+        for i in 0..MOVE_BACKLOG_LIMIT as u32 {
+            q2.push(mv(7, i));
+        }
+        let inflight_one = q2.pop().expect("队列非空"); // x=0 交给写线程,还没写
+        assert_eq!(q2.stats().depth, MOVE_BACKLOG_LIMIT, "在途的那条照算");
+        q2.push(mv(7, 7777));
+        assert_eq!(
+            q2.stats().dropped,
+            1,
+            "队列 255 + 在途 1 = 到上限,应当顶掉最旧一条"
+        );
+        q2.close();
+        let mut xs: Vec<u32> = Vec::new();
+        if let ControlCmd::Touch { x, .. } = inflight_one {
+            xs.push(x);
+        }
+        while let Some(c) = q2.pop() {
+            if let ControlCmd::Touch { x, .. } = c {
+                xs.push(x);
+            }
+        }
+        assert!(!xs.contains(&1), "被顶掉的应是队列里最旧的一条(x=1)");
+        assert!(
+            xs.contains(&0) && xs.contains(&7777),
+            "在途与新来的都必须保留"
+        );
+    }
+
+    /// 按下/抬起/按键是边沿语义:任何时候都不许丢,顶掉只发生在 Move 类身上
+    #[test]
+    fn edge_commands_are_never_dropped() {
+        let q = CmdQueue::new();
+        for i in 0..MOVE_BACKLOG_LIMIT as u32 {
+            q.push(mv(7, i));
+        }
+        q.push(ControlCmd::Touch {
+            action: ACTION_DOWN,
+            pointer_id: 7,
+            x: 42,
+            y: 43,
+        });
+        q.push(key(4));
+        q.push(mv(7, 5000)); // 顶掉最旧的一条 Move
+        assert_eq!(q.stats().dropped, 1);
+
+        q.close();
+        let (mut has_down, mut has_key) = (false, false);
+        while let Some(c) = q.pop() {
+            match c {
+                ControlCmd::Touch {
+                    action: ACTION_DOWN,
+                    x: 42,
+                    ..
+                } => has_down = true,
+                ControlCmd::Key { keycode: 4, .. } => has_key = true,
+                _ => {}
+            }
+        }
+        assert!(has_down, "按下必须留在队列里");
+        assert!(has_key, "按键必须留在队列里");
+    }
+
+    /// 关闭后:已入队的命令仍能取完,然后 pop 返回 None(写线程据此退出)
+    #[test]
+    fn close_drains_then_returns_none() {
+        let q = CmdQueue::new();
+        q.push(key(9));
+        q.close();
+        assert!(matches!(q.pop(), Some(ControlCmd::Key { keycode: 9, .. })));
+        assert!(q.pop().is_none(), "取空 + 已关闭 = 写线程退出信号");
     }
 }

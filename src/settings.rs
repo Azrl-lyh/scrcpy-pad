@@ -41,6 +41,10 @@ pub struct Settings {
     /// scrcpy 启动参数(为空则用程序内置默认值)
     #[serde(default)]
     pub scrcpy_args: String,
+    /// 「其他功能 → 手动 adb 命令」命令栏的内容:token 之间以空格连接
+    /// (引号片段保持原样,读回时按同样规则拆开)。
+    #[serde(default)]
+    pub adb_command: String,
     /// 上次使用的设备序列号(重连同一台手机时优先选中)
     #[serde(default)]
     pub selected_serial: String,
@@ -51,6 +55,16 @@ pub struct Settings {
     /// 环境变量 `SCRCPY_PAD_LOG` 优先于本字段(临时排查用,不必改文件)。
     #[serde(default)]
     pub log_level: String,
+    /// 当前在用的键位配置文件路径(W0-9);None = 还没记过(用默认的 profile.yaml)。
+    ///
+    /// 为什么需要:用户在 [配置] 里另选/新建的文件在此之前只活在内存里 ——
+    /// "我选的配置重启后不见了"是必然现象,程序每次都回到默认 profile.yaml。
+    ///
+    /// 为什么**不受 [记住路径] 开关管辖**:那条开关的语义是"scrcpy 装在哪"
+    /// (本机环境信息,不该跟着配置发给别人);而"我在编辑哪一份配置"换了却不记得,
+    /// 重启后打开的是另一份文件,用户会以为改动丢了 —— 这是正确性问题,不是偏好。
+    #[serde(default)]
+    pub profile_path: Option<String>,
     /// 最后写入时间(epoch 秒,仅供用户查看,不参与逻辑)
     #[serde(default)]
     pub saved_at: u64,
@@ -70,8 +84,10 @@ impl Default for Settings {
             server_path: String::new(),
             adb_path: String::new(),
             scrcpy_args: String::new(),
+            adb_command: String::new(),
             selected_serial: String::new(),
             log_level: String::new(),
+            profile_path: None,
             saved_at: 0,
         }
     }
@@ -87,6 +103,9 @@ impl Settings {
     }
 
     /// 清空全部路径(保留 remember_paths 与启动参数)
+    ///
+    /// 注意**不清** `profile_path`:它记的是"我在编辑哪一份配置",
+    /// 不是"scrcpy 装在哪",与 [记住路径] 开关无关(参见该字段的说明)。
     pub fn clear_paths(&mut self) {
         self.scrcpy_path.clear();
         self.scrcpy_dir.clear();
@@ -299,7 +318,8 @@ impl SettingsCache {
             Ok(t) => t,
             Err(e) => return Some(Err(std::io::Error::other(e.to_string()))),
         };
-        let res = std::fs::write(&path, text);
+        // 原子写盘(W0-9):写到一半被杀进程也不会留下半截 settings.json
+        let res = crate::app::write_atomic(&path, &text);
         if res.is_ok() {
             self.saved = Some(want);
             self.warned = false;
@@ -316,16 +336,32 @@ pub fn path() -> PathBuf {
 /// 读取设置;文件不存在、内容损坏或读取失败时返回 None(调用方用默认值)。
 ///
 /// 这里走程序里唯一那份"容忍 BOM 的配置文件读取"(见
-/// [`crate::app::read_config_text`]):Windows 编辑器加上的 BOM 曾经会让
+/// [`crate::app::read_config_text_graded`]):Windows 编辑器加上的 BOM 曾经会让
 /// 整份设置被当成损坏而退回默认值,进而在下一次落盘时被覆盖掉。
+///
+/// 失败分级(W0-9):文件不存在 = 首次运行,静默;读不动(权限/被占用)= 打日志;
+/// 解析失败 = 打日志 + 留带时间戳的 `.broken` 备份(不再每次覆盖同一份)。
+/// 本函数在启动早期(界面尚未建好)运行,所以提示走 `eprintln!` + diag,
+/// 不经过 PadApp 的日志区。
 pub fn load() -> Option<Settings> {
     let path = path();
-    let text = crate::app::read_config_text(&path)?;
+    let text = match crate::app::read_config_text_graded(&path) {
+        Ok(Some(t)) => t,
+        Ok(None) => return None,
+        Err(e) => {
+            crate::diag_warn!("settings", "{e},改用默认设置");
+            return None;
+        }
+    };
     match serde_json::from_str::<Settings>(&text) {
         Ok(s) => Some(s),
         Err(e) => {
-            eprintln!("[settings] {} 解析失败({e}),改用默认设置", path.display());
-            crate::app::backup_broken_config(&path);
+            let mut msg = format!("{} 解析失败({e}),改用默认设置", path.display());
+            match crate::app::backup_broken_config(&path) {
+                Ok(b) => msg.push_str(&format!(";原文件已备份为 {}", b.display())),
+                Err(be) => msg.push_str(&format!(";备份也失败({be})")),
+            }
+            crate::diag_error!("settings", "{msg}");
             None
         }
     }
@@ -351,7 +387,25 @@ mod tests {
         assert!(s.remember_paths, "缺省应视为记住");
         assert_eq!(s.scrcpy_path, "/usr/bin/scrcpy");
         assert_eq!(s.scrcpy_args, "");
+        assert_eq!(s.adb_command, "", "老文件没有命令栏字段,缺省为空");
         assert_eq!(s.scrcpy_dir, "", "老文件没有目录字段,缺省为空");
+        assert!(
+            s.profile_path.is_none(),
+            "老文件没有配置路径字段 -> 视为没记过(用默认 profile.yaml)"
+        );
+    }
+
+    /// W0-9:记住的配置文件路径必须能原样存取(重启后 app 靠它把配置读回来)
+    #[test]
+    fn profile_path_roundtrips_through_json() {
+        let s = Settings {
+            profile_path: Some(r"D:\配置\我的键位.yaml".into()),
+            ..Settings::default()
+        };
+        let text = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.profile_path, s.profile_path);
+        assert_eq!(back, s, "除 profile_path 外也不该有字段被改动");
     }
 
     /// 死路径必须被清空 —— 留着它会让 [启动 scrcpy] 直接失败,
@@ -371,14 +425,25 @@ mod tests {
             scrcpy_dir: String::new(),
             remember_paths: true,
             scrcpy_args: "--stay-awake".into(),
+            adb_command: "shell settings get global low_power".into(),
             selected_serial: " ABC123 ".into(),
             log_level: String::new(),
+            profile_path: Some("/tmp/我的配置.yaml".into()),
             saved_at: 0,
         };
         assert!(s.sanitize(), "存在死路径时 sanitize 应报告改动");
         assert_eq!(s.scrcpy_path, "", "不存在的文件必须清空");
         assert_eq!(s.selected_serial, "ABC123", "序列号应去掉首尾空白");
         assert_eq!(s.scrcpy_args, "--stay-awake", "启动参数不受影响");
+        assert_eq!(
+            s.adb_command, "shell settings get global low_power",
+            "命令栏内容不属于路径清理范围,必须原样保留"
+        );
+        assert_eq!(
+            s.profile_path.as_deref(),
+            Some("/tmp/我的配置.yaml"),
+            "sanitize 不该动『在编辑哪一份配置』这条记忆"
+        );
         // 死路径的所在目录存在 -> 必须被记下来供启动时重新寻找
         assert_eq!(
             PathBuf::from(&s.scrcpy_dir),

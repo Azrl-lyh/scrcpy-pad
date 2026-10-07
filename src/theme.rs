@@ -13,21 +13,25 @@ use serde::{Deserialize, Serialize};
 //
 // "风格"与"配色"是两个维度:
 //   - 配色(Preset):深色/浅色/Nord/Catppuccin,四种配色在所有风格下都保留;
-//   - 风格(UiStyle):整体布局与观感 —— 默认(现有界面)/鸿蒙(卡片式)/可视化(虚拟键盘)。
+//   - 风格(UiStyle):整体布局与观感 —— 默认(现有界面)/可视化(虚拟键盘)。
 //
 // 风格改动牵动整体布局(按键布局、信息展示都会变),无法像配色那样每帧热应用,
 // 因此切换风格需要**关闭再重开 UI**(见 app::request_style_restart / main.rs 的重启循环),
 // 重启后从 look.json 读回上一次的风格 —— "用户上一次设的主题,下次启动还在"。
 
 /// 界面风格(主题)。新增风格时:补枚举 + label + apply_style 里的分支 + 界面选择器。
+///
+/// 历史上还有第三种"鸿蒙"风格(仿 `harmonyos-pc` 的独立卡片式界面),2026-10-06
+/// 按用户决策(D1-部分C)删除:可视化 ≈ 默认 + 显示键位,维护代价小得多,
+/// 而鸿蒙是一整套独立布局(它才是 UI 分支爆炸的主要来源)。
+/// **老配置兼容**:旧的 `style: 鸿蒙/Harmony` 会被下面的 alias 静默降级为默认风格,
+/// 绝不因为删了一个枚举值让老用户的配置读不出来。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum UiStyle {
     /// 默认:现有界面布局(左配置+日志 / 右四标签页)
     #[default]
+    #[serde(alias = "Harmony", alias = "鸿蒙")]
     Default,
-    /// 鸿蒙:仿 harmonyos/ 目录下 HarmonyOS App 的卡片式观感
-    /// (深蓝底 + 圆角卡片 + 天蓝强调,只求"像",不求面面俱到)
-    Harmony,
     /// 可视化:虚拟键盘/鼠标取键 + 键位亮起的编辑界面
     Visual,
 }
@@ -36,41 +40,11 @@ impl UiStyle {
     pub fn label(self) -> &'static str {
         match self {
             UiStyle::Default => "默认",
-            UiStyle::Harmony => "鸿蒙",
             UiStyle::Visual => "可视化",
         }
     }
 
-    pub const ALL: [UiStyle; 3] = [UiStyle::Default, UiStyle::Harmony, UiStyle::Visual];
-}
-
-/// 鸿蒙风格配色:**照本仓库 `harmonyos-pc`(scrcpy-pad HarmonyOS HDC)那套浅色 UI** ——
-/// 浅灰页面底 + 白色卡片 + 细描边 + 蓝色主色 + 深色正文。
-/// 这不是"默认界面的换色",而是一套独立的界面语言(见 app.rs 的 layout_harmony)。
-pub mod harmony {
-    use egui::Color32;
-
-    /// 页面底(#F4F7FB,浅灰蓝)
-    pub const BG: Color32 = Color32::from_rgb(244, 247, 251);
-    /// 卡片 / 面板底(白)
-    pub const CARD: Color32 = Color32::from_rgb(255, 255, 255);
-    /// 次级控件底(#EEF3F9)
-    pub const BTN: Color32 = Color32::from_rgb(238, 243, 249);
-    /// 输入框底(#ECF1F7)
-    pub const INPUT: Color32 = Color32::from_rgb(236, 241, 247);
-    /// 分隔线 / 细描边(#DEE5EE)
-    pub const LINE: Color32 = Color32::from_rgb(222, 229, 238);
-    /// 正文(#182230) / 次要说明(#69778B)
-    pub const TEXT: Color32 = Color32::from_rgb(24, 34, 48);
-    pub const MUTED: Color32 = Color32::from_rgb(105, 119, 139);
-    /// 主色(#2384FF) / 成功 / 警告 / 危险
-    pub const PRIMARY: Color32 = Color32::from_rgb(35, 132, 255);
-    pub const OK: Color32 = Color32::from_rgb(22, 163, 74);
-    pub const WARN: Color32 = Color32::from_rgb(217, 119, 6);
-    pub const DANGER: Color32 = Color32::from_rgb(220, 38, 38);
-    /// 卡片圆角(14px)与控件圆角(8px)
-    pub const CARD_ROUND: f32 = 14.0;
-    pub const CTRL_ROUND: f32 = 8.0;
+    pub const ALL: [UiStyle; 2] = [UiStyle::Default, UiStyle::Visual];
 }
 
 /// 浮层/控件常用尺寸(默认档)
@@ -345,8 +319,9 @@ impl BgFit {
 /// 外观设置(随配置保存;缺省即保持原来的深色观感)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Look {
-    /// 界面风格(默认/鸿蒙/可视化)。切换需重启 UI,见 [`UiStyle`]。
-    /// 老配置没有该字段,缺省 [`UiStyle::Default`] —— 与旧版观感一致。
+    /// 界面风格(默认/可视化)。切换需重启 UI,见 [`UiStyle`]。
+    /// 老配置没有该字段,缺省 [`UiStyle::Default`] —— 与旧版观感一致;
+    /// 写着已删除的 `Harmony`/`鸿蒙` 也会落到 [`UiStyle::Default`](见那里的 alias)。
     #[serde(default)]
     pub style: UiStyle,
     #[serde(default)]
@@ -409,19 +384,7 @@ impl Default for Look {
 
 impl Look {
     pub fn theme(&self) -> Theme {
-        let mut t = self.preset.theme();
-        if self.style == UiStyle::Harmony {
-            // 鸿蒙风格固定用 HDC 应用那一套语义色(浅色底上的蓝/绿/橙/红),
-            // 否则深色预设的浮层色放在白卡片上会看不清。
-            t.ok = harmony::OK;
-            t.warn = harmony::WARN;
-            t.danger = harmony::DANGER;
-            t.accent = harmony::PRIMARY;
-            t.key_fps = harmony::PRIMARY;
-            t.key_fps_fill = t.key_fps.gamma_multiply(0.35);
-            t.muted = harmony::MUTED;
-        }
-        t
+        self.preset.theme()
     }
 
     /// 是否配置了背景图
@@ -438,30 +401,22 @@ impl Look {
 /// 把配色 + 几何应用到 egui 样式。
 /// `bg_active` 为真时面板半透明,让背景图透出来(仍受 `panel_alpha` 控制)。
 pub fn apply_style(style: &mut egui::Style, look: &Look, bg_active: bool) {
-    // 鸿蒙风格是**浅色界面**(照 harmonyos-pc 的 HDC UI),不受深色预设影响;
-    // 默认/可视化风格仍按预设选深/浅。
-    let mut visuals = if look.style == UiStyle::Harmony || !look.preset.is_dark() {
+    let mut visuals = if !look.preset.is_dark() {
         egui::Visuals::light()
     } else {
         egui::Visuals::dark()
     };
     let theme = look.theme();
 
-    // ---- 界面风格:面板/弹窗底色与圆角按风格取值 ----
-    // 默认/可视化:沿用四种配色各自的 panel/window;
-    // 鸿蒙:浅灰页面底 #F4F7FB + 白卡片 #FFFFFF + 8px 控件圆角(照 HDC UI)。
-    // 语义色(键位圈/成功/警告等)由 Look::theme 给出(鸿蒙时固定 HDC 那套)。
-    let (panel, window, round) = match look.style {
-        UiStyle::Harmony => (harmony::BG, harmony::CARD, harmony::CTRL_ROUND),
-        UiStyle::Default | UiStyle::Visual => {
-            let round = if look.density == Density::Compact {
-                2.0
-            } else {
-                4.0
-            };
-            (look.preset.panel(), look.preset.window(), round)
-        }
+    // ---- 界面风格:面板/弹窗底色与圆角 ----
+    // 沿用四种配色各自的 panel/window;语义色(键位圈/成功/警告等)由 Look::theme 给出。
+    // (历史上这里还有一条"鸿蒙"分支,用一套独立的浅色卡片配色,已按用户决策删除。)
+    let round = if look.density == Density::Compact {
+        2.0
+    } else {
+        4.0
     };
+    let (panel, window) = (look.preset.panel(), look.preset.window());
 
     visuals.panel_fill = if bg_active {
         with_alpha(panel, look.panel_alpha)
@@ -473,70 +428,32 @@ pub fn apply_style(style: &mut egui::Style, look: &Look, bg_active: bool) {
     } else {
         window
     };
-    visuals.extreme_bg_color = if look.style == UiStyle::Harmony {
-        // 输入框/可编辑区:比页面底再实一点的浅灰蓝(#ECF1F7)
-        harmony::INPUT
-    } else if bg_active {
+    visuals.extreme_bg_color = if bg_active {
         with_alpha(panel, look.panel_alpha)
     } else {
         panel
     };
-    // 强调色:鸿蒙固定 HDC 蓝;其余风格用配色的语义强调色
-    let accent = if look.style == UiStyle::Harmony {
-        harmony::PRIMARY
-    } else {
-        theme.accent
-    };
-    visuals.selection.bg_fill = if look.style == UiStyle::Harmony {
-        with_alpha(harmony::PRIMARY, 60)
-    } else {
-        accent.gamma_multiply(0.45)
-    };
+    let accent = theme.accent;
+    visuals.selection.bg_fill = accent.gamma_multiply(0.45);
     visuals.hyperlink_color = accent;
     visuals.widgets.active.bg_fill = accent.gamma_multiply(0.55);
     visuals.widgets.hovered.bg_fill = accent.gamma_multiply(0.28);
-    if look.style == UiStyle::Harmony {
-        // 照 harmonyos-pc 的 configure_style:近白控件底 + 蓝色悬停/按下 + 深色文字。
-        // 这些值直接对齐 HDC UI,不再"凭感觉调"。
-        visuals.widgets.active.bg_fill = harmony::PRIMARY.gamma_multiply(0.5);
-        visuals.widgets.hovered.bg_fill = harmony::PRIMARY.gamma_multiply(0.15);
-        visuals.widgets.inactive.bg_fill = harmony::BTN;
-        visuals.widgets.inactive.weak_bg_fill = harmony::BTN;
-        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, harmony::TEXT);
-        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, harmony::LINE);
-        visuals.widgets.noninteractive.bg_fill = harmony::CARD;
-        visuals.widgets.noninteractive.weak_bg_fill = harmony::CARD;
-        visuals.override_text_color = Some(harmony::TEXT);
-        visuals.window_stroke = egui::Stroke::new(1.0, harmony::LINE);
-    }
 
     let (row, gap) = look.density.factors();
     style.visuals = visuals;
-    if look.style == UiStyle::Harmony {
-        // 保留 HDC UI 的宽松基线，但让“控件密度”真正生效。
-        style.spacing.item_spacing = egui::vec2(9.0 * gap, 8.0 * row);
-        style.spacing.button_padding = egui::vec2(12.0 * gap, 7.0 * row);
-        style.spacing.interact_size.y = 30.0 * row;
-        style.spacing.scroll.bar_width = (7.0 * gap).clamp(5.0, 11.0);
-    } else {
-        style.spacing.item_spacing = egui::vec2(6.0 * gap, 4.0 * gap);
-        style.spacing.button_padding = egui::vec2(6.0 * gap, 3.0 * row);
-        style.spacing.interact_size.y = 20.0 * row;
-        style.spacing.scroll.bar_width = 8.0 * gap;
-    }
-    // 几何:圆角(鸿蒙风格控件统一 8px 圆角,卡片 14px 由 app::harmony_card 画)
+    style.spacing.item_spacing = egui::vec2(6.0 * gap, 4.0 * gap);
+    style.spacing.button_padding = egui::vec2(6.0 * gap, 3.0 * row);
+    style.spacing.interact_size.y = 20.0 * row;
+    style.spacing.scroll.bar_width = 8.0 * gap;
+    // 几何:控件圆角随密度
     let cr = egui::CornerRadius::from(round);
     style.visuals.widgets.noninteractive.corner_radius = cr;
     style.visuals.widgets.inactive.corner_radius = cr;
     style.visuals.widgets.hovered.corner_radius = cr;
     style.visuals.widgets.active.corner_radius = cr;
     style.visuals.window_corner_radius = egui::CornerRadius::from(round + 2.0);
-    // 字号:按密度整体缩放(鸿蒙固定 1.0)
-    let base = if look.style == UiStyle::Harmony {
-        14.0 * row
-    } else {
-        14.0 * row
-    };
+    // 字号:按密度整体缩放
+    let base = 14.0 * row;
     style.text_styles = [
         (
             TextStyle::Heading,
@@ -787,10 +704,31 @@ mod tests {
         assert_eq!(look.style, UiStyle::Default);
         // 新字段能正常序列化/读回(主题记忆依赖它)
         let mut l2 = look.clone();
-        l2.style = UiStyle::Harmony;
+        l2.style = UiStyle::Visual;
         let text = serde_json::to_string(&l2).unwrap();
         let l3: Look = serde_json::from_str(&text).unwrap();
-        assert_eq!(l3.style, UiStyle::Harmony);
+        assert_eq!(l3.style, UiStyle::Visual);
+    }
+
+    /// 老配置里的鸿蒙风格必须**静默降级为默认**(2026-10-06 删除该风格,W2-7):
+    /// 老用户的 look.json / 配置 YAML 里可能还写着 `Harmony`,读不出来就等于
+    /// "我的配置文件坏了" —— 绝不能因为删一个枚举值发生这种事。
+    #[test]
+    fn legacy_harmony_style_degrades_to_default() {
+        for text in [
+            r#"{ "style": "Harmony" }"#,
+            r#"{ "style": "鸿蒙" }"#,
+            r#"{ "style": "Default" }"#,
+        ] {
+            let look: Look = serde_json::from_str(text).unwrap_or_else(|e| {
+                panic!("老配置 {text} 必须能读出来,却报错: {e}");
+            });
+            assert_eq!(look.style, UiStyle::Default, "{text} 应降级为默认风格");
+        }
+        // 落盘时写回的是新枚举名(下次启动不会再出现 Harmony)
+        let text = serde_json::to_string(&Look::default()).unwrap();
+        assert!(text.contains("\"Default\""), "应写回 Default: {text}");
+        assert!(!text.contains("Harmony"));
     }
 
     /// 每一个风格都要能落盘/读回,且名字互不相同、不为空 ——
@@ -805,72 +743,14 @@ mod tests {
             assert!(!s.label().is_empty());
             assert!(labels.insert(s.label()), "风格名重复: {}", s.label());
         }
-        // 三种风格(默认/鸿蒙/可视化)都要在册,新增风格时同步补上
-        assert_eq!(UiStyle::ALL.len(), 3);
+        // 两种风格(默认/可视化)都要在册,新增风格时同步补上
+        assert_eq!(UiStyle::ALL.len(), 2);
         assert_eq!(UiStyle::default(), UiStyle::Default);
-    }
-
-    /// 鸿蒙风格必须真的把"页面底 / 卡片底 / 控件底 / 圆角"换成 HDC UI 那套浅色值 ——
-    /// "像鸿蒙"的关键就是这几处;改坏了这里第一时间能发现。
-    /// 同时确认:深色预设不会顶掉鸿蒙的浅色界面,两个维度互不干扰。
-    #[test]
-    fn harmony_style_applies_card_geometry() {
-        let mut style = egui::Style::default();
-        apply_style(
-            &mut style,
-            &Look {
-                style: UiStyle::Harmony,
-                ..Default::default()
-            },
-            false,
-        );
-        assert_eq!(style.visuals.panel_fill, harmony::BG);
-        assert_eq!(style.visuals.window_fill, harmony::CARD);
-        assert_eq!(style.visuals.extreme_bg_color, harmony::INPUT);
-        assert_eq!(style.visuals.widgets.inactive.bg_fill, harmony::BTN);
         assert_eq!(
-            style.visuals.widgets.inactive.corner_radius,
-            egui::CornerRadius::same(harmony::CTRL_ROUND as u8),
-            "鸿蒙风格控件应统一 8px 圆角"
+            UiStyle::ALL,
+            [UiStyle::Default, UiStyle::Visual],
+            "界面选择器按 ALL 的顺序展示"
         );
-
-        // 深色预设 + 鸿蒙风格:仍是浅色界面(鸿蒙是一套完整 UI,不是换色)
-        let mut dark_preset = egui::Style::default();
-        apply_style(
-            &mut dark_preset,
-            &Look {
-                style: UiStyle::Harmony,
-                preset: Preset::Dark,
-                ..Default::default()
-            },
-            false,
-        );
-        assert_eq!(
-            dark_preset.visuals.panel_fill,
-            harmony::BG,
-            "风格决定界面底色,预设不该把它顶掉"
-        );
-        assert_eq!(dark_preset.visuals.widgets.inactive.bg_fill, harmony::BTN);
-    }
-
-    /// 鸿蒙风格下 `Look::theme()` 必须换成 HDC 那套语义色
-    /// (浅色底上用深色预设的浮层色会看不清);默认风格不受影响。
-    #[test]
-    fn harmony_look_uses_hdc_semantics() {
-        let look = Look {
-            style: UiStyle::Harmony,
-            preset: Preset::Dark,
-            ..Default::default()
-        };
-        let t = look.theme();
-        assert_eq!(t.ok, harmony::OK);
-        assert_eq!(t.warn, harmony::WARN);
-        assert_eq!(t.danger, harmony::DANGER);
-        assert_eq!(t.accent, harmony::PRIMARY);
-        assert_eq!(t.muted, harmony::MUTED);
-
-        let d = Look::default().theme();
-        assert_eq!(d.accent, Theme::dark().accent, "默认风格语义色不该被改动");
     }
 
     /// 默认风格的几何/面板底必须与旧版一致(4px 圆角 + 预设面板色),
@@ -884,7 +764,28 @@ mod tests {
             style.visuals.widgets.inactive.corner_radius,
             egui::CornerRadius::same(4)
         );
-        assert_ne!(style.visuals.panel_fill, harmony::BG);
+    }
+
+    /// 可视化风格与默认风格共用同一套几何/底色(它变的是"画什么",不是"怎么配色")——
+    /// 删掉鸿蒙之后,这条保证"剩下的两种风格不会各自长出一套配色分支"。
+    #[test]
+    fn visual_style_shares_default_geometry() {
+        let mut a = egui::Style::default();
+        let mut b = egui::Style::default();
+        apply_style(&mut a, &Look::default(), false);
+        apply_style(
+            &mut b,
+            &Look {
+                style: UiStyle::Visual,
+                ..Default::default()
+            },
+            false,
+        );
+        assert_eq!(a.visuals.panel_fill, b.visuals.panel_fill);
+        assert_eq!(
+            a.visuals.widgets.inactive.corner_radius,
+            b.visuals.widgets.inactive.corner_radius
+        );
     }
 
     /// 老配置(没有 overlay_tone 字段)读入后必须是 0.0 —— 观感与旧版逐一致

@@ -1,0 +1,38 @@
+# clippy 告警基线（(文件, 消息) 对，36 对；2026-10-06 W2-5 建立）
+# 本机口径：Windows + 当时的 stable rustc。更新规则见 clippy_diff.py 的文档注释。
+src\adb.rs: warning: casting to the same type is unnecessary (`f32` -> `f32`)
+src\adb.rs: warning: this `if` statement can be collapsed
+src\adb.rs: warning: this manual char comparison can be written more succinctly
+src\app.rs: warning: clamp-like pattern without using clamp function
+src\app.rs: warning: creating a new box
+src\app.rs: warning: doc list item without indentation
+src\app.rs: warning: the loop variable `i` is used to index `names`
+src\app.rs: warning: this `if` statement can be collapsed
+src\app.rs: warning: this function has too many arguments (8/7)
+src\app.rs: warning: this function has too many arguments (9/7)
+src\app.rs: warning: this let-binding has unit value
+src\capture.rs: warning: this `if` statement can be collapsed
+src\capture.rs: warning: this function has too many arguments (8/7)
+src\control.rs: warning: `(-1i32)` is never greater than `0` and has therefore no effect
+src\control.rs: warning: `(-5i32)` is never greater than `0` and has therefore no effect
+src\control.rs: warning: `x` is never smaller than `0` and has therefore no effect
+src\control.rs: warning: `y` is never smaller than `0` and has therefore no effect
+src\diag.rs: warning: this `if` statement can be collapsed
+src\diag.rs: warning: useless use of `format!`
+src\engine.rs: warning: doc list item without indentation
+src\engine.rs: warning: field assignment outside of initializer for an instance created with Default::default()
+src\engine.rs: warning: manually filling a slice
+src\engine.rs: warning: this `if` statement can be collapsed
+src\engine.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler
+src\engine.rs: warning: this function has too many arguments (10/7)
+src\engine.rs: warning: this function has too many arguments (8/7)
+src\engine.rs: warning: this function has too many arguments (13/7)
+src\engine.rs: warning: unnecessary use of `clone` to create a slice from a reference
+src\engine.rs: warning: using `contains()` instead of `iter().any()` is more efficient
+src\keyboard.rs: warning: doc list item without indentation
+src\keymap.rs: warning: field assignment outside of initializer for an instance created with Default::default()
+src\keymap.rs: warning: methods with the following characteristics: (`to_*` and `self` type is `Copy`) usually take `self` by value
+src\keymap.rs: warning: this `impl` can be derived
+src\settings.rs: warning: field assignment outside of initializer for an instance created with Default::default()
+src\settings.rs: warning: this `if` statement can be collapsed
+src\settings.rs: warning: this `impl` can be derived

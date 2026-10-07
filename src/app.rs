@@ -1,12 +1,14 @@
 use crate::adb::{self, ControlServer};
+use crate::adbcmd;
 use crate::capture::{Capture, CaptureEvent};
 use crate::control::ControlClient;
-use crate::engine::{Shared, SharedState};
+use crate::engine::{Shared, SharedState, lock_shared};
 use crate::keyboard;
 use crate::keymap::{
-    Action, ConfigFile, Easing, KeyBind, KeyCombo, MacroAction, MacroInstruction, MacroKeyMode,
-    MacroStep, MacroWheelPart, Mapper, Profile, RecenterMode, Swipe, SwipePath, SwitchDirection,
-    SwitchKey, TempMode, TempWheel, ViewInputMode, Wheel, WheelKind, WheelMode, key_name,
+    Action, Aim, ConfigFile, Easing, KeyBind, KeyCombo, MacroAction, MacroInstruction, MacroStep,
+    MacroWheelPart, Mapper, Profile, RecenterMode, SWIPE_SAMPLES, Swipe, SwipePath,
+    SwitchDirection, SwitchKey, TempMode, TempWheel, ViewInputMode, Wheel, WheelKind, WheelMode,
+    key_name,
 };
 use crate::settings;
 use crate::settings::{Settings, SettingsCache};
@@ -30,8 +32,7 @@ const LICENSE_TEXT: &str = include_str!("../LICENSE");
 const BASE_SCRCPY_ARGS: &str = "--stay-awake";
 
 /// 新增键位时的动作类型选项,顺序与 `Draft::kind` 一致。
-/// 滑动 / 系统键仍在开发中,名字上直接标出来。
-const KIND_NAMES: [&str; 4] = ["点按", "长按", "滑动（开发中）", "系统键（开发中）"];
+const KIND_NAMES: [&str; 4] = ["点按", "长按", "滑动", "系统键"];
 
 /// 坐标编辑框的取值范围:**允许负值、允许超出屏幕**。
 /// 键位本来就允许落在画面外(比如横屏的布局在竖屏下显示、截图尺寸与布局方向不同),
@@ -41,9 +42,19 @@ const COORD_RANGE: std::ops::RangeInclusive<i32> = -8192..=8192;
 /// 撤销栈深度(步数)。整份配置快照,50 步足以覆盖一次调参过程。
 const UNDO_DEPTH: usize = 50;
 
+/// 调试信息轮询间隔。2026-10-07(用户第 4 条)从 1s 放宽到 2s:
+/// 每一轮 = 后台 adb.exe spawn(dumpsys),开着调试弹窗打游戏时它按秒
+/// 打断手感。诊断价值(帧率/刷新率走势)在 2s 粒度上不受影响。
+const DEBUG_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 分辨率查询的刷新周期。手机分辨率基本不变,没必要跟着轮询走 ——
+/// `dumpsys window displays` 是这组查询里最重的一条,单独降到 30s 一次:
+/// 稳态只剩"每 2s 一次 SurfaceFlinger 延迟查询"。
+const DEBUG_SIZE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
 // ============================ 界面风格切换的重启标志 ============================
 //
-// 风格(默认/鸿蒙/可视化)牵动整体布局,不能像配色那样每帧热应用
+// 风格(默认/可视化)牵动整体布局,不能像配色那样每帧热应用
 // (见 theme::UiStyle 的说明)。切换流程:
 //   1. ui_look 里的风格选择器改动 -> request_style_restart():
 //      把新风格写进 shared.profile.look 并立即落盘(look.json),
@@ -239,6 +250,8 @@ enum KeySlot {
     AimToggle,
     /// 按住暂时退出 FPS 并显示鼠标
     AimSuspend,
+    /// 压枪/后坐力补偿的触发键(V2-1;K2er 原文:一般是鼠标左键)
+    RecoilTrigger,
     /// 切换键位(第 i 行:按下该键即切到它指向的那套组合)
     SwitchKey(usize),
     /// 切换键位的第二个组合键（最多两个）
@@ -284,6 +297,11 @@ enum CoordSlot {
     ComboSwipeStart(usize),
     ComboSwipeEnd(usize),
     ComboCircleAngle(usize),
+    /// 宏页"点击"步骤的落点(W2-8:宏也能从截图上取点,不必手输 0..1)。
+    MacroClickPoint(usize),
+    /// 宏页"滑动"步骤的起点/终点
+    MacroSwipeStart(usize),
+    MacroSwipeEnd(usize),
 }
 
 /// 正在"修改响应范围"的目标。键位的响应圈和轮盘的半径用的是同一套交互
@@ -332,52 +350,6 @@ impl LeftTab {
             Self::Diag => "诊断",
         }
     }
-}
-
-/// 鸿蒙风格的左侧导航页(照 harmonyos-pc 的 HDC UI:图标 + 文字,选中项淡蓝底)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum HPage {
-    /// 连接与设备:设备、连接、启动 scrcpy、三件套路径
-    #[default]
-    Connect,
-    /// 按键映射:配置 + 键位列表 + 组合键
-    Keys,
-    /// 宏
-    Macro,
-    /// 虚拟轮盘
-    Wheels,
-    /// FPS 模式(鼠标瞄准)
-    Fps,
-    /// 外观
-    Look,
-    /// 诊断(自检 + 日志)
-    Diag,
-}
-
-impl HPage {
-    /// (图标, 标题)。图标用字形代替图形资源,不额外引依赖;
-    /// 只挑基础几何/常用符号(U+25A0-25CF 与 ⌨ 在 CJK 字体里都有,不会变方框)。
-    fn icon_title(self) -> (&'static str, &'static str) {
-        match self {
-            Self::Connect => ("●", "连接与设备"),
-            Self::Keys => ("⌨", "按键映射"),
-            Self::Macro => ("▶", "宏"),
-            Self::Wheels => ("◎", "虚拟轮盘"),
-            Self::Fps => ("◇", "FPS 模式"),
-            Self::Look => ("◆", "外观"),
-            Self::Diag => ("■", "诊断"),
-        }
-    }
-
-    const ALL: [HPage; 7] = [
-        Self::Connect,
-        Self::Keys,
-        Self::Macro,
-        Self::Wheels,
-        Self::Fps,
-        Self::Look,
-        Self::Diag,
-    ];
 }
 
 /// 可视化风格:虚拟键盘"显示哪几类已设置的键"的五个勾选。
@@ -579,6 +551,8 @@ struct DebugOverlayData {
     show_resolution: bool,
     show_aim: bool,
     fps: String,
+    /// 真实投屏帧率(scrcpy --print-fps 实况;与面板刷新率分开显示)
+    stream_fps: String,
     resolution: String,
     aim_motions: u64,
     aim_last_dx: f32,
@@ -597,6 +571,17 @@ struct MacroRecording {
     /// 的持续时间会准确落在后续抬起步骤上。
     last_step_at: Instant,
     idle_ms: u32,
+}
+
+impl MacroRecording {
+    /// 是否到达空闲自动停止条件。
+    ///
+    /// 关键不变量（用户 2026-10-07 再次强调）：**录制从第一个按键开始才算**。
+    /// 点[开始录制]之后到第一个按键之间的空档既不算进宏、也不跑空闲计时 ——
+    /// 否则用户想两秒再动手，录制会在"一个键都没按"的状态下自己悄悄结束。
+    fn should_auto_stop(&self) -> bool {
+        !self.steps.is_empty() && self.last_event.elapsed().as_millis() >= self.idle_ms as u128
+    }
 }
 
 /// 扩展宏编辑窗口的临时状态；窗口关闭/取消时直接丢弃，不触碰原宏。
@@ -647,7 +632,6 @@ impl MacroInstructionKind {
         match self {
             Self::Key => MacroInstruction::Key {
                 code: 0,
-                mode: MacroKeyMode::Tap,
                 duration_ms: crate::keymap::DEFAULT_TAP_DURATION_MS,
                 delay_ms: 0,
             },
@@ -811,9 +795,19 @@ impl LumaGrid {
     }
 }
 
+/// 「手动 adb 命令」助手窗口的临时状态(打开期间有效,关窗丢弃)。
+struct AdbHelperState {
+    search: String,
+    /// 内置库条目下标(过滤后仍保持指向 full list,避免搜索改变选中含义)
+    selected: usize,
+}
+
 pub struct PadApp {
     shared: SharedState,
     grab_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// 「拦截系统默认行为」掩码(见 capture::swallow_bit):每帧按 映射开关 ×
+    /// 独占键盘 × 当前绑定 预先算好,钩子回调只读一次原子量。
+    swallow_flag: Arc<std::sync::atomic::AtomicU8>,
     /// 鼠标抓取开关(FPS 瞄准期间冻结/隐藏系统光标)
     mouse_grab_flag: Arc<std::sync::atomic::AtomicBool>,
     /// 独立的全局鼠标消隐开关(不依赖 FPS，可由快捷键或“其他功能”按钮切换)
@@ -824,6 +818,15 @@ pub struct PadApp {
     cursor_hidden_prev: bool,
     /// 是否检测到鼠标设备(FPS 瞄准面板用于提示)
     mouse_found_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// 捕获层延迟是否超标(钩子回调 p99 > 5ms;引擎状态区据此警示)
+    hook_lag_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// 钩子心跳结论(W1-4):0=正常,1=消息泵 ≥3s 无响应,2=钩子失效过、
+    /// 已自愈重装。与 hook_lag 共用引擎状态区的告警通道;Linux 恒为 0。
+    hb_flag: Arc<std::sync::atomic::AtomicU8>,
+    /// Windows 低级钩子安装结果(bit0=键盘,bit1=鼠标;0=未知;W0-11)。
+    /// 自检面板据此红字提示"按键捕获不可用" —— 在这之前装钩子失败只有
+    /// 诊断日志知道,用户看到的是"按了没反应"却毫无线索。Linux 恒为 0。
+    hook_ok_flag: Arc<std::sync::atomic::AtomicU8>,
     /// 上一帧的映射开关状态:由关到开时重新确认当前屏幕方向(坐标空间)
     enabled_prev: bool,
     /// 后台查询"当前显示器尺寸"的结果(屏幕方向随时会变)
@@ -877,6 +880,17 @@ pub struct PadApp {
 
     server: Option<ControlServer>,
     connect_rx: Option<Receiver<Result<(ControlServer, ControlClient), String>>>,
+    /// 控制通道自动重连(2026-10-06 真机反馈):EOF/写失败后注入全线失效,
+    /// 旧实现在界面上干等用户手动点[连接控制] —— 战斗中等于整个手柄失灵
+    /// (真机日志里断出过 4 分钟空窗)。`reconnect_armed` = 用户想要连接
+    /// (连上过或手动发起过;点[断开]即取消)。
+    reconnect_armed: bool,
+    /// 自动重连已尝试次数(成功后清零;超过上限停止并提示,点[连接控制]重来)
+    reconnect_attempts: u32,
+    /// 下一次自动重连的时刻(退避排程;None = 不在重连中)
+    reconnect_due: Option<Instant>,
+    /// scrcpy --print-fps 最近一次输出现值 + 时刻(真实投屏帧率,界面显示用)
+    stream_fps: Option<(f32, Instant)>,
 
     waiting_key: Option<KeySlot>,
     picking: Option<CoordSlot>,
@@ -905,15 +919,13 @@ pub struct PadApp {
     /// 组合切换会用 YAML 里的 look 整体替换 profile(老 YAML 没有 style 字段),
     /// 所以这里单独存一份,并每帧回写共享配置(见 `stamp_style`)。
     style: theme::UiStyle,
-    /// 鸿蒙风格:左侧导航当前页(照 harmonyos-pc 的 HDC UI 重新排布)
-    h_page: HPage,
     /// 可视化风格:虚拟键盘上方五个显示开关(键位页与 FPS 页各一套,
     /// 两页的**显示能力完全一样**,只是默认值不同:见 VkFilters)
     vk_filters: VkFilters,
     vk_fps_filters: VkFilters,
     /// 可视化风格:当前在键盘下方操作栏里编辑的目标(见 VkSel)
     vk_sel: Option<VkSel>,
-    /// 宏录制器（开发中）。
+    /// 宏录制器。
     macro_recording: Option<MacroRecording>,
     /// 宏页：当前录制/待添加的宏步骤。
     macro_page_steps: Vec<MacroStep>,
@@ -933,6 +945,9 @@ pub struct PadApp {
     macro_idle_ms: u32,
     /// 宏页：是否展开显示原始录制事件（默认只显示结果摘要）。
     macro_show_events: bool,
+    /// 录制过程中点[显示步骤]后常开:不看摘要,直接看逐条步骤(用户 2026-10-07 要求
+    /// "先看步骤再决定保存",不必等保存后的[展开])。
+    macro_show_recording_steps: bool,
     /// 已录宏列表中展开的宏索引。
     macro_expanded: Option<usize>,
     /// 当前载入编辑区的是哪一条宏；可视化下列表按钮据此变成“取消编辑”。
@@ -956,6 +971,9 @@ pub struct PadApp {
     debug_info: RemoteDebugInfo,
     debug_rx: Option<Receiver<Result<RemoteDebugInfo, String>>>,
     debug_last_query: Instant,
+    /// 上一次**成功**取到分辨率(手机屏幕尺寸)的时刻。None = 还没取到过。
+    /// 分辨率按 [`DEBUG_SIZE_TTL`] 降频,轮询轮次里没查时沿用旧值。
+    debug_size_at: Option<Instant>,
     /// 在画布上点开的摇杆(显示它的四个方向键);None = 未点开
     wheel_info: Option<usize>,
 
@@ -973,6 +991,26 @@ pub struct PadApp {
     license_open: bool,
     /// scrcpy 参数助手窗口状态(None=未打开;每次打开重建默认参数)
     args_helper: Option<ArgHelp>,
+    /// 手动 adb 命令:命令栏(token 列表;加入时查冲突、单击可移除)
+    adb_bar: Vec<String>,
+    /// 手动 adb 命令:待加入参数的输入框
+    adb_add_input: String,
+    /// 手动 adb 命令:最近一条提示(true=成功/绿色)
+    adb_msg: Option<(bool, String)>,
+    /// 手动 adb 命令:助手窗口状态(None=未打开)
+    adb_helper: Option<AdbHelperState>,
+    /// 手动 adb 命令:用户自建预设(与内置预设同列在一个下拉里)
+    adb_user_presets: Vec<adbcmd::UserPreset>,
+    /// 预设下拉当前选中项;下标 < 内置预设数 时指内置预设
+    adb_preset_sel: Option<usize>,
+    /// 「另存当前为预设」命名行是否展开
+    adb_preset_save_open: bool,
+    adb_preset_name: String,
+    /// 正在执行的 adb 命令(None=空闲)
+    adb_run: Option<adbcmd::AdbRun>,
+    adb_run_started: Option<Instant>,
+    /// 最近一次执行的结果(显示在输出区)
+    adb_last: Option<adbcmd::AdbRunOutcome>,
     dialog: Option<crate::filedialog::FileDialogHandle>,
     dialog_purpose: DialogPurpose,
     loginfo_rx: Option<Receiver<adb::DeviceInfo>>,
@@ -1162,15 +1200,76 @@ impl PadApp {
         // while cursor capture was active.
         crate::capture::set_cursor_visible_from_ui(true);
 
+        // 程序级设置(scrcpy 三件套路径等):与 profile.yaml / look.json 同目录的 settings.json。
+        // 有了它,scrcpy 目录即使不在程序同级,重启后也仍然记得,不必每次重新寻找。
+        // 必须放在读取键位配置**之前**:里面还记着"上次选用的是哪一份配置"(W0-9)。
+        let mut saved = settings::load().unwrap_or_default(); // 先留一份"文件里原本写了什么":关掉[记住路径]时写回的内容要以它为准,
+        // 而且落盘判定也必须以磁盘上的真实内容为基准(否则"关掉开关"这一动作
+        // 永远写不出去,下次启动又变回"记住")。
+        let loaded_raw = saved.clone();
+        // 日志级别:环境变量优先(临时排查不必改文件),否则用 settings.json 里的设置。
+        // 放在这里是因为 diag 已经在 main() 最开始初始化好了,那时还没读到设置文件。
+        if std::env::var(crate::diag::ENV_LEVEL).is_err() {
+            crate::diag::set_level_from_str(&saved.log_level, "settings.json");
+        }
+        if !saved.remember_paths {
+            // 用户关掉了"记住路径":不采用其中的路径,但仍保留启动参数一类的偏好
+            saved.clear_paths();
+        }
+        let remembered = saved.clone();
+        // 记住的路径可能早已被移动/删除:清掉死路径,但**保留它的位置线索**
+        // (所在目录会记进 scrcpy_dir),启动时能在那一带重新找回 scrcpy
+        if saved.sanitize() && saved.remember_paths {
+            eprintln!(
+                "[settings] 已修正 settings.json 里的路径(死路径转为目录线索): {}",
+                settings::path().display()
+            );
+        }
+        let (saved_args, legacy_mouse_args_removed) =
+            sanitize_saved_scrcpy_args(&saved.scrcpy_args);
+        let settings_cache = SettingsCache::new(loaded_raw.clone());
+
         // 配置文件里装的是多套"按键组合",`active` 指向上次用的那一套;
         // 引擎始终只认 `Shared::profile`(= 生效中的那套),组合表放在它旁边。
-        let mut doc = load_profile().unwrap_or_default();
+        //
+        // 用户上次可能另选/新建过配置文件(位置记在 settings.json 的 `profile_path`):
+        // 优先把它读回来。旧版这个路径只活在内存里 —— "我选的配置重启后不见了",
+        // 程序每次都回到默认的 profile.yaml,用户只能一遍遍重选。
+        // 读不回来时退回默认配置,并把原因上屏(不静默);
+        // 记住的路径随即会被 settings 快照改成"实际在用"的默认路径(下次启动不再重复抱怨)。
+        let default_profile_path = profile_path();
+        let mut startup_notes: Vec<String> = Vec::new();
+        let (doc, profile_path) = match remembered_profile_path(&saved) {
+            Some(p) if p != default_profile_path => match read_profile_at(&p) {
+                Ok(d) => {
+                    startup_notes.push(format!("已恢复上次选用的配置: {}", p.display()));
+                    (Some(d), p)
+                }
+                Err(e) => {
+                    startup_notes.push(format!(
+                        "上次选用的配置无法读取({e}),已改回默认配置: {}",
+                        default_profile_path.display()
+                    ));
+                    let (d, notes) = load_profile();
+                    startup_notes.extend(notes);
+                    (d, default_profile_path)
+                }
+            },
+            // 首次运行,或上次用的就是默认位置
+            _ => {
+                let (d, notes) = load_profile();
+                startup_notes.extend(notes);
+                (d, default_profile_path)
+            }
+        };
+        let mut doc = doc.unwrap_or_default();
         doc.normalize();
-        let profile_path = profile_path();
         let mut profile = doc.active_profile().cloned().unwrap_or_default();
         // 外观(配色/密度/背景图)另有一份"程序自用"的缓存,与键位配置同目录。
         // 有了它,即使没点过[保存配置],重启后外观也保持上次调好的样子。
-        if let Some(cached) = load_look_cache() {
+        let (cached_look, look_notes) = load_look_cache();
+        startup_notes.extend(look_notes);
+        if let Some(cached) = cached_look {
             profile.look = cached;
         }
         // 生效中的那套要与刚装载的 profile 对齐(外观缓存可能刚覆盖过它)
@@ -1205,6 +1304,10 @@ impl PadApp {
             .as_ref()
             .map(|c| c.grab.clone())
             .unwrap_or_else(|| Arc::new(false.into()));
+        let swallow_flag = capture
+            .as_ref()
+            .map(|c| c.swallow.clone())
+            .unwrap_or_else(|| Arc::new(0.into()));
         let mouse_grab_flag = capture
             .as_ref()
             .map(|c| c.mouse_grab.clone())
@@ -1217,6 +1320,18 @@ impl PadApp {
             .as_ref()
             .map(|c| c.mouse_found.clone())
             .unwrap_or_else(|| Arc::new(false.into()));
+        let hook_lag_flag = capture
+            .as_ref()
+            .map(|c| c.hook_lag.clone())
+            .unwrap_or_else(|| Arc::new(false.into()));
+        let hb_flag = capture
+            .as_ref()
+            .map(|c| c.hb_state.clone())
+            .unwrap_or_else(|| Arc::new(0.into()));
+        let hook_ok_flag = capture
+            .as_ref()
+            .map(|c| c.hook_ok.clone())
+            .unwrap_or_else(|| Arc::new(0.into()));
 
         // 映射引擎线程(鼠标捕获状态由引擎统一维护,避免与 UI 帧率不同步)
         {
@@ -1229,34 +1344,6 @@ impl PadApp {
                 crate::engine::run(shared, cap_rx, gui_tx, mouse_grab, cursor_hide)
             });
         }
-
-        // 程序级设置(scrcpy 三件套路径等):与 profile.json / look.json 同目录的 settings.json。
-        // 有了它,scrcpy 目录即使不在程序同级,重启后也仍然记得,不必每次重新寻找。
-        let mut saved = settings::load().unwrap_or_default(); // 先留一份"文件里原本写了什么":关掉[记住路径]时写回的内容要以它为准,
-        // 而且落盘判定也必须以磁盘上的真实内容为基准(否则"关掉开关"这一动作
-        // 永远写不出去,下次启动又变回"记住")。
-        let loaded_raw = saved.clone();
-        // 日志级别:环境变量优先(临时排查不必改文件),否则用 settings.json 里的设置。
-        // 放在这里是因为 diag 已经在 main() 最开始初始化好了,那时还没读到设置文件。
-        if std::env::var(crate::diag::ENV_LEVEL).is_err() {
-            crate::diag::set_level_from_str(&saved.log_level, "settings.json");
-        }
-        if !saved.remember_paths {
-            // 用户关掉了"记住路径":不采用其中的路径,但仍保留启动参数一类的偏好
-            saved.clear_paths();
-        }
-        let remembered = saved.clone();
-        // 记住的路径可能早已被移动/删除:清掉死路径,但**保留它的位置线索**
-        // (所在目录会记进 scrcpy_dir),启动时能在那一带重新找回 scrcpy
-        if saved.sanitize() && saved.remember_paths {
-            eprintln!(
-                "[settings] 已修正 settings.json 里的路径(死路径转为目录线索): {}",
-                settings::path().display()
-            );
-        }
-        let (saved_args, legacy_mouse_args_removed) =
-            sanitize_saved_scrcpy_args(&saved.scrcpy_args);
-        let settings_cache = SettingsCache::new(loaded_raw.clone());
 
         // 自动寻找 scrcpy 与 server:先用上次记住的路径/目录,再自动寻找
         let (scrcpy_path, server_path, version, found_msg) = {
@@ -1335,15 +1422,26 @@ impl PadApp {
             .map(|p| p.display().to_string())
             .unwrap_or_default();
         let devices = adb::list_devices();
+        // 手动 adb 命令:命令栏恢复上次内容;用户预设从独立文件读
+        // (读不动按空处理并提示,不能因为一个坏文件起不来)
+        let (adb_user_presets, adb_presets_err) =
+            match adbcmd::load_user_presets(&adb_presets_path()) {
+                Ok(list) => (list, None),
+                Err(e) => (Vec::new(), Some(e)),
+            };
 
         let mut app = Self {
             shared,
             grab_flag,
+            swallow_flag,
             mouse_grab_flag,
             mouse_captured_prev: false,
             cursor_hide_flag,
             cursor_hidden_prev: false,
             mouse_found_flag,
+            hook_lag_flag,
+            hb_flag,
+            hook_ok_flag,
             enabled_prev: false,
             space_rx: None,
             bg_tex: None,
@@ -1377,6 +1475,10 @@ impl PadApp {
             test_msg: None,
             server: None,
             connect_rx: None,
+            reconnect_armed: false,
+            reconnect_attempts: 0,
+            reconnect_due: None,
+            stream_fps: None,
             waiting_key: None,
             picking: None,
             resizing: None,
@@ -1392,7 +1494,6 @@ impl PadApp {
             right_tab: RightTab::Keys,
             left_tab: LeftTab::default(),
             style: ui_style,
-            h_page: HPage::default(),
             vk_filters: VkFilters::KEYS_PAGE,
             vk_fps_filters: VkFilters::FPS_PAGE,
             vk_sel: None,
@@ -1406,6 +1507,7 @@ impl PadApp {
             macro_page_fps_only: false,
             macro_idle_ms: 800,
             macro_show_events: false,
+            macro_show_recording_steps: false,
             macro_expanded: None,
             macro_loaded_index: None,
             scroll_to_new: false,
@@ -1422,6 +1524,7 @@ impl PadApp {
             debug_info: RemoteDebugInfo::default(),
             debug_rx: None,
             debug_last_query: Instant::now(),
+            debug_size_at: None,
             wheel_info: None,
             draft: DraftBind::default(),
             logs: VecDeque::new(),
@@ -1432,6 +1535,17 @@ impl PadApp {
             help: crate::help::HelpWindow::new(),
             license_open: false,
             args_helper: None,
+            adb_bar: adbcmd::split_tokens(saved.adb_command.trim()),
+            adb_add_input: String::new(),
+            adb_msg: None,
+            adb_helper: None,
+            adb_user_presets,
+            adb_preset_sel: None,
+            adb_preset_save_open: false,
+            adb_preset_name: String::new(),
+            adb_run: None,
+            adb_run_started: None,
+            adb_last: None,
             dialog: None,
             dialog_purpose: DialogPurpose::ScrcpyExe,
             loginfo_rx: None,
@@ -1444,6 +1558,32 @@ impl PadApp {
             scheme_dirty: false,
         };
         app.log("就绪。顺序: 连接手机 -> [连接控制] -> [启动 scrcpy] -> 按总开关键开启映射");
+        if let Some(e) = adb_presets_err {
+            app.log(format!("adb 预设读取失败({e}),已按空列表处理"));
+        }
+        // 配置读取阶段的提示(W0-9):读不动/解析失败必须让用户看到,
+        // 且要说清"原文件留了备份" —— 否则用户只会觉得"我的配置自己没了"。
+        for note in startup_notes {
+            app.log(note);
+        }
+        // 钩子安装结果(W0-11):装失败以前只写诊断日志,用户只看到"按了没反应"。
+        // bits=0 既可能是"没装上",也可能是"等结果超时",文案两者都要覆盖。
+        #[cfg(windows)]
+        {
+            let bits = app.hook_ok_flag.load(Ordering::Relaxed);
+            if !crate::capture::hook_bits_keyboard_ok(bits) {
+                app.log(
+                    "⚠ 键盘捕获不可用:低级键盘钩子没有装上(或状态未知),按键映射将完全没有反应。\
+                     常见原因:安全软件拦截、系统资源不足。详见运行日志",
+                );
+            }
+            if !crate::capture::hook_bits_mouse_ok(bits) {
+                app.log(
+                    "⚠ 鼠标捕获不可用:低级鼠标钩子没有装上(或状态未知),鼠标按键与 FPS 瞄准将没有反应。\
+                     详见运行日志",
+                );
+            }
+        }
         app.log(found_msg);
         if legacy_mouse_args_removed {
             app.log("已清除旧配置中的 --mouse=uhid/aoa：该模式会让 scrcpy 捕获鼠标并干扰键盘，已改为默认 SDK 鼠标模式");
@@ -1516,7 +1656,67 @@ impl PadApp {
         }
     }
 
+    /// 自动重连的最大尝试次数。
+    ///
+    /// 退避节拍前快后慢(1/1/2/3/5/8/10/10s):绝大多数断开是瞬时的(设备端
+    /// server 被杀、adb 抖动),一秒左右就能回来,不该让玩家干等两位数秒;
+    /// 后段放慢到 10s 封顶 —— 设备真的掉线时,也不至于无限每 10 秒刷一串
+    /// adb 进程。到顶后停下来给一句提示,把决定权交回用户。
+    const RECONNECT_MAX_ATTEMPTS: u32 = 8;
+
+    fn reconnect_delay(attempt: u32) -> Duration {
+        let secs = match attempt {
+            0 | 1 => 1,
+            2 => 2,
+            3 => 3,
+            4 => 5,
+            5 => 8,
+            _ => 10,
+        };
+        Duration::from_secs(secs)
+    }
+
+    /// 断开/连接失败后排下一班自动重连;超过上限则停用并提示。
+    fn schedule_reconnect(&mut self) {
+        if !self.reconnect_armed {
+            return;
+        }
+        if self.reconnect_attempts >= Self::RECONNECT_MAX_ATTEMPTS {
+            self.reconnect_armed = false;
+            self.reconnect_due = None;
+            self.log(format!(
+                "自动重连已尝试 {} 次仍未成功,停止重试;设备/数据线恢复后点[连接控制]再试",
+                self.reconnect_attempts
+            ));
+            return;
+        }
+        self.reconnect_due = Some(Instant::now() + Self::reconnect_delay(self.reconnect_attempts));
+    }
+
+    /// 每帧调用:到点了就发起下一次自动重连。
+    fn tick_auto_reconnect(&mut self) {
+        if !self.reconnect_armed || self.connect_rx.is_some() || self.server.is_some() {
+            return;
+        }
+        let Some(due) = self.reconnect_due else {
+            return;
+        };
+        if Instant::now() < due {
+            return;
+        }
+        self.reconnect_due = None;
+        self.reconnect_attempts += 1;
+        self.log(format!(
+            "自动重连第 {} 次尝试(断开期间按键/摇杆全部失效,连上后按当前按键状态重建触点)",
+            self.reconnect_attempts
+        ));
+        self.connect_control();
+    }
+
     fn connect_control(&mut self) {
+        // 发起连接 = 用户想要连接(自动重连的启用条件)。尝试计数由成功/失败
+        // 路径管理:成功清零;[连接控制]按钮先清零,自动路径靠它累计退避。
+        self.reconnect_armed = true;
         // 连接前先做一次联动,确保 adb 已定位(push/forward 都依赖它)
         self.resync();
         // **先彻底收掉旧的 server**,再启新的。
@@ -1527,7 +1727,7 @@ impl PadApp {
         // 表现是"重连之后按键时灵时不灵、且没有任何报错"。
         // ControlServer::drop 会 kill adb 子进程并 `adb forward --remove`。
         if let Some(old) = self.server.take() {
-            self.shared.lock().unwrap().control = None;
+            lock_shared(&self.shared).control = None;
             drop(old);
             self.log("已关闭上一个 control server(重连前先腾干净端口与 socket)");
         }
@@ -1569,8 +1769,15 @@ impl PadApp {
     }
 
     fn disconnect(&mut self) {
-        self.shared.lock().unwrap().control = None;
+        lock_shared(&self.shared).control = None;
         self.server = None;
+        // 手动断开 = 明确表达"不要再连":取消自动重连排程,并丢弃可能在途的
+        // 连接尝试(rx 一丢,后台线程产出的 server 对象会随之析构,它拉起的
+        // adb 子进程会被带走 —— 不会留下抢端口的孤儿)。
+        self.reconnect_armed = false;
+        self.reconnect_attempts = 0;
+        self.reconnect_due = None;
+        self.connect_rx = None;
         self.log("已断开控制通道");
     }
 
@@ -1580,9 +1787,10 @@ impl PadApp {
             Some("连接")
         } else if self.shot_rx.is_some() {
             Some("截图")
-        } else if self.debug_rx.is_some() {
-            Some("调试刷新")
         } else if self.space_rx.is_some() {
+            // 注意:调试刷新(debug_rx)故意**不在**这里 —— 它每秒都会在途一次,
+            // 把它算作"可取消任务"会让右上角红色按钮每秒弹出一次(用户反馈:
+            // 显示调试信息时按钮疯狂闪烁)。调试刷新本来就短,不需要取消。
             Some("坐标刷新")
         } else if self.audio_rx.is_some() {
             Some("音频唤醒")
@@ -1629,7 +1837,9 @@ impl PadApp {
             return;
         }
         self.shutdown_done = true;
-        if let Ok(mut g) = self.shared.lock() {
+        {
+            // 中毒也要把锁拿回来(lock_shared):退出时必须尽力停掉映射、断开控制
+            let mut g = lock_shared(&self.shared);
             g.enabled = false;
             g.control = None;
         }
@@ -1650,7 +1860,7 @@ impl PadApp {
     /// scrcpy 启动前把自动追加的参数写回可见参数框。
     /// 只有虚拟手柄模式需要禁用 scrcpy 自带输入；触摸拖动模式不再自动添加 --mouse=uhid。
     fn prepare_scrcpy_args(&mut self) -> String {
-        let mode = self.shared.lock().unwrap().profile.aim.input_mode;
+        let mode = lock_shared(&self.shared).profile.aim.input_mode;
         let before = self.scrcpy_args.trim().to_string();
         self.scrcpy_args = prepare_scrcpy_args_with_mode(&self.scrcpy_args, mode);
         if self.scrcpy_args != before {
@@ -1734,7 +1944,7 @@ impl PadApp {
         // 普通键位不在此列 —— 拖动圆圈/连续改键太频繁,由 [保存配置] 决定何时写。
         let mut switch_key_touched = false;
         {
-            let mut g = self.shared.lock().unwrap();
+            let mut g = lock_shared(&self.shared);
             match slot {
                 KeySlot::NewBind => self.draft.key = Some(code),
                 KeySlot::Bind(i) => {
@@ -1767,6 +1977,7 @@ impl PadApp {
                 KeySlot::AimHold => g.profile.aim.hold_key = code,
                 KeySlot::AimToggle => g.profile.aim.toggle_key = code,
                 KeySlot::AimSuspend => g.profile.aim.suspend_key = code,
+                KeySlot::RecoilTrigger => g.profile.aim.recoil.trigger_key = code,
                 KeySlot::SwitchKey(i) => {
                     if let Some(s) = g.switch_keys.get_mut(i) {
                         s.key = code;
@@ -1839,8 +2050,49 @@ impl PadApp {
     fn assign_coord(&mut self, slot: CoordSlot, x: i32, y: i32) {
         self.push_undo();
         let m = self.mapper();
+        // 宏页的落点写在页面草稿状态里(不碰 Shared):单独先处理,
+        // 免得与下面 `lock_shared(&self.shared)` 的借用范围纠缠。
+        match slot {
+            CoordSlot::MacroClickPoint(i) => {
+                if let Some(MacroInstruction::Click { x: ax, y: ay, .. }) =
+                    self.macro_page_instructions.get_mut(i)
+                {
+                    *ax = m.rel_x(x);
+                    *ay = m.rel_y(y);
+                }
+                self.log(format!("坐标已设置: ({x}, {y})"));
+                return;
+            }
+            CoordSlot::MacroSwipeStart(i) => {
+                if let Some(MacroInstruction::Swipe {
+                    start_x: ax,
+                    start_y: ay,
+                    ..
+                }) = self.macro_page_instructions.get_mut(i)
+                {
+                    *ax = m.rel_x(x);
+                    *ay = m.rel_y(y);
+                }
+                self.log(format!("坐标已设置: ({x}, {y})"));
+                return;
+            }
+            CoordSlot::MacroSwipeEnd(i) => {
+                if let Some(MacroInstruction::Swipe {
+                    end_x: ax,
+                    end_y: ay,
+                    ..
+                }) = self.macro_page_instructions.get_mut(i)
+                {
+                    *ax = m.rel_x(x);
+                    *ay = m.rel_y(y);
+                }
+                self.log(format!("坐标已设置: ({x}, {y})"));
+                return;
+            }
+            _ => {}
+        }
         {
-            let mut g = self.shared.lock().unwrap();
+            let mut g = lock_shared(&self.shared);
             match slot {
                 // 新增草稿是临时状态,直接存像素(绘制与提交时再换算)
                 CoordSlot::NewBind => {
@@ -1935,6 +2187,11 @@ impl PadApp {
                     g.profile.aim.anchor_x = m.rel_x(x);
                     g.profile.aim.anchor_y = m.rel_y(y);
                 }
+                // 宏页落点已在函数开头单独处理(写在页面草稿里,不碰 Shared),
+                // 这里只为穷尽枚举。
+                CoordSlot::MacroClickPoint(_)
+                | CoordSlot::MacroSwipeStart(_)
+                | CoordSlot::MacroSwipeEnd(_) => {}
             }
         }
         self.log(format!("坐标已设置: ({x}, {y})"));
@@ -2007,7 +2264,7 @@ impl PadApp {
 
     /// 把当前配置压入撤销栈(所有键位修改入口调用),并清空重做栈
     fn push_undo(&mut self) {
-        let profile = self.shared.lock().unwrap().profile.clone();
+        let profile = lock_shared(&self.shared).profile.clone();
         self.push_undo_snapshot(profile);
     }
 
@@ -2026,18 +2283,18 @@ impl PadApp {
 
     fn undo(&mut self) {
         if let Some(prev) = self.undo_stack.pop() {
-            let current = self.shared.lock().unwrap().profile.clone();
+            let current = lock_shared(&self.shared).profile.clone();
             self.redo_stack.push(current);
-            self.shared.lock().unwrap().profile = prev;
+            lock_shared(&self.shared).profile = prev;
             self.log("已撤销");
         }
     }
 
     fn redo(&mut self) {
         if let Some(next) = self.redo_stack.pop() {
-            let current = self.shared.lock().unwrap().profile.clone();
+            let current = lock_shared(&self.shared).profile.clone();
             self.undo_stack.push(current);
-            self.shared.lock().unwrap().profile = next;
+            lock_shared(&self.shared).profile = next;
             self.log("已重做");
         }
     }
@@ -2047,7 +2304,7 @@ impl PadApp {
     /// 关键一步:`profile`(引擎眼里"此刻生效的那套")要先写回 `schemes[active_scheme]`
     /// —— 界面上的改动都直接改 `profile`,组合表本身是"存档"。
     fn config_doc(&self) -> ConfigFile {
-        let mut g = self.shared.lock().unwrap();
+        let mut g = lock_shared(&self.shared);
         g.stash_active();
         ConfigFile {
             format_version: g.profile.format_version,
@@ -2063,32 +2320,27 @@ impl PadApp {
         self.stamp_profile_meta();
         let text = render_config(&self.config_doc());
         match text {
-            Ok(text) => {
-                if let Some(parent) = self.profile_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+            Ok(text) => match write_atomic(&self.profile_path, &text) {
+                Ok(_) => {
+                    self.scheme_saved = self.active_scheme();
+                    self.scheme_dirty = false;
+                    self.log(format!("已保存到 {}", self.profile_path.display()))
                 }
-                match std::fs::write(&self.profile_path, text) {
-                    Ok(_) => {
-                        self.scheme_saved = self.active_scheme();
-                        self.scheme_dirty = false;
-                        self.log(format!("已保存到 {}", self.profile_path.display()))
-                    }
-                    Err(e) => self.log(format!("保存失败: {e}")),
-                }
-            }
+                Err(e) => self.log(format!("保存失败: {e}")),
+            },
             Err(e) => self.log(format!("序列化失败: {e}")),
         }
     }
 
     /// 引擎此刻生效的组合下标(界面用它标记当前项)
     fn active_scheme(&self) -> usize {
-        self.shared.lock().unwrap().active_scheme
+        lock_shared(&self.shared).active_scheme
     }
 
     /// 把一份文档整体装进 `Shared`:组合表、切换键表、生效下标,
     /// 以及引擎真正读的那份 `profile`。
     fn install_config(&self, doc: &ConfigFile) {
-        let mut g = self.shared.lock().unwrap();
+        let mut g = lock_shared(&self.shared);
         g.schemes = doc.schemes.clone();
         g.switch_keys = doc.switch_keys.clone();
         g.fast_switch_enabled = doc.fast_switch_enabled;
@@ -2103,10 +2355,12 @@ impl PadApp {
     /// 增删切换键位、改切换目标)由 `scheme_dirty` 标记;键位主体的细节(拖动圆圈、
     /// 增删键位)仍由 [保存配置] / Ctrl+S 决定何时写 —— 否则一次拖动就是几百次写盘。
     ///
-    /// 只写文件、不记日志:开打中按一下切换键不该在日志区刷屏。
+    /// 成功时不记日志:开打中按一下切换键不该在日志区刷屏。
+    /// **失败必须记**(W0-9):以前这里是 `let _ =`,磁盘满/文件只读时
+    /// "组合换了、文件没换"悄无声息,用户下次启动才发现配置对不上。
     fn sync_scheme_state(&mut self) {
         let active = {
-            let mut g = self.shared.lock().unwrap();
+            let mut g = lock_shared(&self.shared);
             g.stash_active();
             g.active_scheme
         };
@@ -2115,11 +2369,16 @@ impl PadApp {
         }
         self.scheme_saved = active;
         self.scheme_dirty = false;
-        if let Ok(text) = render_config(&self.config_doc()) {
-            if let Some(parent) = self.profile_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+        match render_config(&self.config_doc()) {
+            Ok(text) => {
+                if let Err(e) = write_atomic(&self.profile_path, &text) {
+                    self.log(format!(
+                        "自动保存失败({e}),本次切换只在本次运行内有效: {}",
+                        self.profile_path.display()
+                    ));
+                }
             }
-            let _ = std::fs::write(&self.profile_path, text);
+            Err(e) => self.log(format!("序列化失败: {e}")),
         }
     }
 
@@ -2127,19 +2386,19 @@ impl PadApp {
     /// 这由引擎的 `sync_structures` 兜底(结构指纹变了就抬干净再重建),
     /// 所以这里只换数据、不动引擎。
     fn select_scheme(&mut self, idx: usize) {
-        if !self.shared.lock().unwrap().select_scheme(idx) {
+        if !lock_shared(&self.shared).select_scheme(idx) {
             return;
         }
         self.undo_stack.clear();
         self.redo_stack.clear();
-        let name = self.shared.lock().unwrap().profile.name.clone();
+        let name = lock_shared(&self.shared).profile.name.clone();
         self.log(format!("已切换到按键组合「{name}」"));
     }
 
     /// 新建一套组合(复制当前这套)并切过去
     fn add_scheme(&mut self) {
         let name = {
-            let mut g = self.shared.lock().unwrap();
+            let mut g = lock_shared(&self.shared);
             g.stash_active();
             let n = g.schemes.len() + 1;
             let mut copy = g.profile.clone();
@@ -2162,7 +2421,7 @@ impl PadApp {
         // 先在锁内算好结论、拿到要显示的文案,出了作用域再 self.log:
         // 持锁期间 self 被借住,`&mut self` 的方法调不了。
         let (msg, removed) = {
-            let mut g = self.shared.lock().unwrap();
+            let mut g = lock_shared(&self.shared);
             if g.schemes.len() <= 1 || idx >= g.schemes.len() {
                 // 至少留一套:删空会让引擎没有配置可跑
                 ("至少要保留一套按键组合".to_string(), false)
@@ -2207,7 +2466,7 @@ impl PadApp {
                     "配置已重新加载(可撤销): {}",
                     self.profile_path.display()
                 ));
-                // 已知屏幕尺寸时,顺手把旧格式配置升级为相对坐标(与[选用配置]行为一致)
+                // 已知屏幕尺寸时,顺手校正控制通道坐标空间(与[选用配置]行为一致)
                 if let Some((w, h)) = self.screen_size() {
                     self.sync_display_space(w, h);
                 }
@@ -2240,10 +2499,12 @@ impl PadApp {
             }
         };
         self.profile_path = path.clone();
+        // 换回默认位置也是一次"配置选择",要活过重启(W0-9)
+        self.remember_now();
         self.apply_profile_switch(doc);
         // 先取数、释放锁,再 log:避免 format! 参数里两次 lock 死锁
         let (nb, nw) = {
-            let g = self.shared.lock().unwrap();
+            let g = lock_shared(&self.shared);
             (g.profile.binds.len(), g.profile.wheels.len())
         };
         self.log(format!(
@@ -2262,7 +2523,7 @@ impl PadApp {
         self.install_config(&doc);
         self.undo_stack.clear();
         self.redo_stack.clear();
-        // 已知屏幕尺寸时,顺手把旧格式配置升级为相对坐标
+        // 已知屏幕尺寸时,顺手校正控制通道坐标空间
         if let Some((w, h)) = self.screen_size() {
             self.sync_display_space(w, h);
         }
@@ -2270,9 +2531,21 @@ impl PadApp {
 
     /// 进入取点。取点/改范围这类交互同一时刻只保留一个,以最后一次操作为准:
     /// 正在改响应范围时点[取点],就直接转去取点,不再两头挂着。
-    fn begin_pick(&mut self, slot: CoordSlot) {
+    ///
+    /// W2-2:截图与注入空间纵横比不一致时**拒绝进入取点**(所有[取点]按钮的
+    /// 统一入口就在这),提示去截图取点面板按一键对齐处理。返回是否武装成功 ——
+    /// 调用方若已为取点先建了半成品(如虚拟键盘的"新建草稿"),失败时要自行撤销。
+    fn begin_pick(&mut self, slot: CoordSlot) -> bool {
         self.resizing = None;
+        if let Some(m) = self.space_guard() {
+            self.log(format!(
+                "已阻止取点:{}(取点会落偏)。请到「截图取点」面板按提示对齐坐标空间或重新截图",
+                m.describe()
+            ));
+            return false;
+        }
         self.picking = Some(slot);
+        true
     }
 
     /// 进入"修改响应范围"(同样按最新操作优先,终止正在进行的取点)
@@ -2547,10 +2820,17 @@ impl PadApp {
             server_path: self.server_path.trim().to_string(),
             adb_path: self.adb_path.trim().to_string(),
             scrcpy_args: self.scrcpy_args.trim().to_string(),
+            // 命令栏按 token 空格连接落盘(引号片段保持原样,读回时同样规则拆开)
+            adb_command: self.adb_bar.join(" "),
             selected_serial: self.serial(),
             // 日志级别由界面上的下拉框负责写入,这里原样带回上次读到的值,
             // 免得"改一次别的设置"就把用户选的级别冲掉
             log_level: self.settings_loaded.log_level.clone(),
+            // 当前在用的配置文件位置(W0-9):它让"另选/新建的配置"活过重启。
+            // **不受 [记住路径] 开关管辖** —— 那条开关的语义是"scrcpy 装在哪"
+            // (本机环境信息);而"我在编辑哪一份配置"换了却不记得,重启后
+            // 打开的是另一份文件、用户会以为改动丢了,属于正确性问题。
+            profile_path: Some(self.profile_path.display().to_string()),
             saved_at: 0,
         };
         if !self.remember_paths {
@@ -2676,8 +2956,8 @@ impl PadApp {
         let th = self.theme();
         ui.label("底层运行状况。出问题时这里直接说原因,并可把日志交给作者。");
 
-        let (connected, live, capture_err) = {
-            let g = self.shared.lock().unwrap();
+        let (connected, live, capture_err, qstats) = {
+            let g = lock_shared(&self.shared);
             (
                 g.control
                     .as_ref()
@@ -2685,9 +2965,13 @@ impl PadApp {
                     .unwrap_or(false),
                 g.live,
                 self.capture_err.clone(),
+                // W1-3:控制队列深度快照(只读三个原子量,不碰写线程的锁)
+                g.control.as_ref().map(|c| c.queue_stats()),
             )
         };
         let mouse_found = self.mouse_found_flag.load(Ordering::Relaxed);
+        // 钩子安装结果(W0-11):bit0=键盘钩子,bit1=鼠标钩子,0=未知
+        let hook_ok = self.hook_ok_flag.load(Ordering::Relaxed);
         let level = crate::diag::level();
         let log_path = crate::diag::path();
 
@@ -2695,15 +2979,29 @@ impl PadApp {
         ui.separator();
         ui.label("状态自检:");
         let mut blocker: Option<&str> = None;
-        for (ok, text) in [
+        let mut checks: Vec<(bool, &str)> = vec![
             (
                 capture_err.is_none(),
-                "输入捕获已启动(读得到 /dev/input,或 Windows 钩子已装上)",
+                "输入捕获线程已启动(读得到 /dev/input,或钩子线程已起来)",
             ),
             (mouse_found, "检测到鼠标类设备(有相对位移轴)"),
             (connected, "控制通道已连接"),
             (live.refused == 0, "没有因为触点池满而被拒的按下"),
-        ] {
+        ];
+        // 这两项只在 Windows 有意义(装的是低级钩子;Linux 走 evdev,失败会走上面的
+        // capture_err 分支)。放在这里是为了让"按了没反应"的用户第一眼就看到原因。
+        #[cfg(windows)]
+        {
+            checks.push((
+                crate::capture::hook_bits_keyboard_ok(hook_ok),
+                "键盘低级钩子已装上(键盘映射可用)",
+            ));
+            checks.push((
+                crate::capture::hook_bits_mouse_ok(hook_ok),
+                "鼠标低级钩子已装上(鼠标按键 / FPS 瞄准可用;安装时结果)",
+            ));
+        }
+        for (ok, text) in checks {
             if !ok && blocker.is_none() {
                 blocker = Some(text);
             }
@@ -2733,8 +3031,38 @@ impl PadApp {
                 )
             }
         ));
+        if let Some(q) = qstats {
+            // 积压/丢弃都说明设备端或转发通道跟不上:平时它一直是 0,
+            // 出现数字就该怀疑 adb/设备端卡顿(W1-3)
+            let extra = if q.dropped > 0 {
+                format!(" · 丢旧保新 {} 条", q.dropped)
+            } else {
+                String::new()
+            };
+            ui.label(format!(
+                "控制队列 深度 {} / 峰值 {}{}",
+                q.depth, q.peak, extra
+            ));
+        }
         if let Some(b) = blocker {
             ui.colored_label(th.warn, format!("→ 现在不完整,因为: {b}"));
+        }
+        // 钩子装不上 = 映射整体不可用:用"红字"而不是普通 ✗(橙字)说清楚。
+        // 用户的第一反馈就是"按了没反应",这里必须给出原因与下一步。
+        #[cfg(windows)]
+        if capture_err.is_none()
+            && !(crate::capture::hook_bits_keyboard_ok(hook_ok)
+                && crate::capture::hook_bits_mouse_ok(hook_ok))
+        {
+            ui.colored_label(
+                th.danger,
+                "⚠ 输入捕获不完整:有低级钩子没有装上,相关按键不会有任何反应。",
+            )
+            .on_hover_text(
+                "键盘/鼠标低级钩子可能被安全软件拦截,或系统资源不足。\n\
+                 运行日志里记着每个钩子安装失败的具体错误码。\n\
+                 常见处理:把本程序加入安全软件白名单后重启。",
+            );
         }
 
         // ---- 日志级别 ----
@@ -2845,7 +3173,7 @@ impl PadApp {
         }
         out.push_str("===== 当前配置摘要 =====\n");
         {
-            let g = self.shared.lock().unwrap();
+            let g = lock_shared(&self.shared);
             out.push_str(&format!(
                 "生效组合: {}(第 {} 套 / 共 {} 套)\n",
                 g.profile.name,
@@ -2871,12 +3199,12 @@ impl PadApp {
         out.push_str(&format!(
             "触点占用 {}/{} · 累计被放弃 {} 次\n",
             {
-                let g = self.shared.lock().unwrap();
+                let g = lock_shared(&self.shared);
                 g.live.pointers
             },
             crate::engine::DEVICE_MAX_POINTERS,
             {
-                let g = self.shared.lock().unwrap();
+                let g = lock_shared(&self.shared);
                 g.live.refused
             }
         ));
@@ -2885,7 +3213,7 @@ impl PadApp {
 
         let path = crate::diag::path()
             .with_file_name(format!("diagnostics-report-{}.txt", timestamp_compact()));
-        match std::fs::write(&path, out) {
+        match write_atomic(&path, &out) {
             Ok(_) => {
                 crate::diag::flush();
                 self.log(format!("诊断报告已写出: {}", path.display()));
@@ -2904,6 +3232,7 @@ impl eframe::App for PadApp {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
         self.poll_debug_rx();
+        self.poll_adb_run();
         self.maybe_refresh_debug_info();
 
         let mut scrcpy_messages = Vec::new();
@@ -2921,6 +3250,12 @@ impl eframe::App for PadApp {
             }
         }
         for message in scrcpy_messages {
+            // scrcpy --print-fps 每秒一行:解析成实况帧率,不写进界面日志
+            // (一秒一行纯属刷屏);其余行照旧。诊断文件里这行也只记 debug 级。
+            if let Some(fps) = adb::parse_scrcpy_fps(&message) {
+                self.stream_fps = Some((fps, Instant::now()));
+                continue;
+            }
             self.log(message);
         }
         if scrcpy_rx_done {
@@ -3018,7 +3353,7 @@ impl eframe::App for PadApp {
                 } else {
                     1.0 / crate::keymap::RADIUS_ZOOM_FACTOR
                 };
-                let mut g = self.shared.lock().unwrap();
+                let mut g = lock_shared(&self.shared);
                 match target {
                     ResizeTarget::Bind(i) => {
                         if let Some(b) = g.profile.binds.get_mut(i) {
@@ -3046,7 +3381,14 @@ impl eframe::App for PadApp {
 
         // ---- 异步任务回收 ----
         if let Some(rx) = &self.connect_rx {
-            if let Ok(r) = rx.try_recv() {
+            let mut outcome: Option<Result<(ControlServer, ControlClient), String>> = None;
+            let mut thread_gone = false;
+            match rx.try_recv() {
+                Ok(r) => outcome = Some(r),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => thread_gone = true,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            if let Some(r) = outcome {
                 self.connect_rx = None;
                 match r {
                     Ok((server, client)) => {
@@ -3056,12 +3398,23 @@ impl eframe::App for PadApp {
                         ));
                         let (w, h) = (client.screen_w, client.screen_h);
                         self.server = Some(server);
-                        self.shared.lock().unwrap().control = Some(client);
+                        lock_shared(&self.shared).control = Some(client);
                         // 连接后立刻校正坐标空间并升级旧配置(保证注入前已完成)
                         self.sync_display_space(w, h);
+                        self.reconnect_attempts = 0;
+                        self.reconnect_due = None;
                     }
-                    Err(e) => self.log(format!("连接失败: {e}")),
+                    Err(e) => {
+                        self.log(format!("连接失败: {e}"));
+                        self.schedule_reconnect();
+                    }
                 }
+            } else if thread_gone {
+                // 旧实现只处理 Ok/Err:连接线程 panic 时 rx 断开,界面会永远
+                // 停在"连接中..."且没有任何出口 —— 归到失败路径重试。
+                self.connect_rx = None;
+                self.log("连接线程意外退出(未返回结果)");
+                self.schedule_reconnect();
             }
         }
         if let Some(rx) = &self.audio_rx {
@@ -3133,7 +3486,7 @@ impl eframe::App for PadApp {
                     }
                     (DialogPurpose::SaveLog, Some(p)) => {
                         let content = self.pending_log.take().unwrap_or_default();
-                        match std::fs::write(&p, content) {
+                        match write_atomic(&p, &content) {
                             Ok(_) => self.log(format!("日志已保存到 {}", p.display())),
                             Err(e) => self.log(format!("日志保存失败: {e}")),
                         }
@@ -3142,7 +3495,7 @@ impl eframe::App for PadApp {
                         self.stamp_profile_meta();
                         let text = render_config(&self.config_doc());
                         match text {
-                            Ok(text) => match std::fs::write(&p, text) {
+                            Ok(text) => match write_atomic(&p, &text) {
                                 Ok(_) => self
                                     .log(format!("配置已另存到 {}(可直接分享该文件)", p.display())),
                                 Err(e) => self.log(format!("另存失败: {e}")),
@@ -3154,10 +3507,12 @@ impl eframe::App for PadApp {
                         match read_profile_at(&p) {
                             Ok(doc) => {
                                 self.profile_path = p.clone();
+                                // 记住这次选择:否则重启后回到默认配置(W0-9)
+                                self.remember_now();
                                 self.apply_profile_switch(doc);
                                 // 先取数、释放锁,再 log:避免 format! 参数里两次 lock 死锁
                                 let (nb, nw) = {
-                                    let g = self.shared.lock().unwrap();
+                                    let g = lock_shared(&self.shared);
                                     (g.profile.binds.len(), g.profile.wheels.len())
                                 };
                                 self.log(format!(
@@ -3173,6 +3528,8 @@ impl eframe::App for PadApp {
                     (DialogPurpose::NewProfile, Some(p)) => match write_default_profile(&p) {
                         Ok(_) => {
                             self.profile_path = p.clone();
+                            // 新建的配置同样要活过重启(W0-9)
+                            self.remember_now();
                             self.apply_profile_switch(ConfigFile::default());
                             self.log(format!("已新建空配置并切换: {}", p.display()));
                         }
@@ -3180,13 +3537,13 @@ impl eframe::App for PadApp {
                     },
                     (DialogPurpose::PickBackground, Some(p)) => {
                         let path = p.display().to_string();
-                        let before = self.shared.lock().unwrap().profile.clone();
+                        let before = lock_shared(&self.shared).profile.clone();
                         // 顶栏+左栏+中央区几乎铺满窗口,背景图只能透过面板显出来。
                         // 若"面板不透明度 × 压暗"已经把图压到基本看不见(用户会以为
                         // 选图没生效),就自动调到能看见的档位并写进日志说明。
                         let mut adjusted: Vec<String> = Vec::new();
                         {
-                            let mut g = self.shared.lock().unwrap();
+                            let mut g = lock_shared(&self.shared);
                             let look = &mut g.profile.look;
                             look.bg_path = path.clone();
                             let visible = f32::from(255 - look.panel_alpha) / 255.0
@@ -3240,8 +3597,10 @@ impl eframe::App for PadApp {
         }
         for ev in gui_events {
             if let Some(rec) = self.macro_recording.as_mut() {
-                if let CaptureEvent::Button { code, pressed } = ev {
-                    Self::record_macro_button(rec, code, pressed, Instant::now());
+                if let CaptureEvent::Button { code, pressed, .. } = ev {
+                    // W1-1:按事件的**捕获时刻**记步骤 —— 以前用收到事件的时刻,
+                    // 队列排队与界面卡顿都会被算进两步之间的间隔里。
+                    Self::record_macro_button(rec, code, pressed, ev.at());
                 }
                 continue;
             }
@@ -3253,7 +3612,7 @@ impl eframe::App for PadApp {
         if self
             .macro_recording
             .as_ref()
-            .is_some_and(|rec| rec.last_event.elapsed().as_millis() >= rec.idle_ms as u128)
+            .is_some_and(|rec| rec.should_auto_stop())
         {
             self.finish_macro_recording();
         }
@@ -3263,7 +3622,7 @@ impl eframe::App for PadApp {
         // 刚才是谁把它关了"完全看不出来,用户只能反复按 F8 试。
         {
             let (msgs, recheck) = {
-                let mut g = self.shared.lock().unwrap();
+                let mut g = lock_shared(&self.shared);
                 (
                     std::mem::take(&mut g.notices),
                     std::mem::take(&mut g.space_recheck),
@@ -3283,7 +3642,7 @@ impl eframe::App for PadApp {
 
         // ---- 同步映射开关到键盘 grab(鼠标捕获由引擎维护) ----
         let (enabled, connected) = {
-            let g = self.shared.lock().unwrap();
+            let g = lock_shared(&self.shared);
             (
                 g.enabled,
                 g.control
@@ -3292,8 +3651,49 @@ impl eframe::App for PadApp {
                     .unwrap_or(false),
             )
         };
-        self.grab_flag
-            .store(enabled && self.grab_enabled, Ordering::Relaxed);
+        let grab_now = enabled && self.grab_enabled;
+        self.grab_flag.store(grab_now, Ordering::Relaxed);
+        // ---- 同步「拦截系统默认行为」掩码(2026-10-07) ----
+        // 位定义见 capture::swallow_bit。规则:映射开启时,把"有系统默认功能
+        // 且在配置里被绑定"的候选键交给捕获层吞掉(Esc 不再退出全屏、右键不再
+        // 弹菜单)——"被绑定"就是用户的逐键选择,不额外要求 grab 勾选
+        // (grab 在 Windows 上只有 Linux 的 EVIOCGRAB 语义、且不落盘,拿它当
+        // 前置会让这个功能默认静默失效);FPS 模式的滚轮缩放在生效时也吞滚轮。
+        // 钩子回调只读这一份预计算掩码,不做锁/不做遍历。
+        {
+            let bits = if enabled {
+                let g = lock_shared(&self.shared);
+                let live = g.aim_live;
+                let aim = &g.profile.aim;
+                // FPS 模式是否正在生效(与 engine 的 fps_is_active 同口径,
+                // 含 anchor_set:未取锚点时引擎不会缩滚轮,捕获层也不能吞)
+                let fps_active =
+                    aim.enabled && live.mode_active && !live.suspended && aim.anchor_set();
+                let mut bits = 0u8;
+                for b in &g.profile.binds {
+                    // 仅 FPS 的绑定在非 FPS 模式里并不生效,不能占着吞掉位 ——
+                    // 否则用户平时按 Esc 也会被吞(映射里那条 fps_only 还没生效)。
+                    if b.fps_only && !fps_active {
+                        continue;
+                    }
+                    if let Some(bit) = crate::capture::swallow_bit(b.key) {
+                        bits |= bit;
+                    }
+                }
+                if aim.wheel_zoom && fps_active {
+                    if let (Some(up), Some(down)) = (
+                        crate::capture::swallow_bit(crate::keymap::BTN_WHEEL_UP),
+                        crate::capture::swallow_bit(crate::keymap::BTN_WHEEL_DOWN),
+                    ) {
+                        bits |= up | down;
+                    }
+                }
+                bits
+            } else {
+                0
+            };
+            self.swallow_flag.store(bits, Ordering::Relaxed);
+        }
         // 由关到开(准备开打)时重新确认一次当前屏幕方向:
         // 手机随时可能横竖屏切换,坐标空间必须跟着当前方向走
         if enabled && !self.enabled_prev && connected {
@@ -3337,11 +3737,11 @@ impl eframe::App for PadApp {
             // 未抬起的触点(只能靠重连时重建)。引擎那边会在下一轮发现通道不可用
             // 并清空本地状态,这里只负责让用户知道发生了什么。
             let pending = {
-                let g = self.shared.lock().unwrap();
+                let g = lock_shared(&self.shared);
                 g.live.pointers
             };
             self.server = None;
-            self.shared.lock().unwrap().control = None;
+            lock_shared(&self.shared).control = None;
             if pending > 0 {
                 self.log(format!(
                     "控制通道已断开(当时有 {pending} 个触点未抬起;重连后会自动重建,不必手动收拾)"
@@ -3350,15 +3750,23 @@ impl eframe::App for PadApp {
             } else {
                 self.log("控制通道已断开");
             }
+            // 自动重连(2026-10-06):旧实现断线后只清状态、等用户手动点按钮。
+            // 真机日志里断出过一次 4 分钟空窗(注入全死:摇杆停在上一个方向、
+            // 技能按不出来)。这里排下第一班重连;用户点[断开]即取消。
+            self.schedule_reconnect();
+            if self.reconnect_armed {
+                self.log("将在 1 秒后自动重连(不想重连可点[断开])");
+                crate::diag_warn!("app", "控制通道断开:已排入自动重连");
+            }
         }
+        self.tick_auto_reconnect();
 
         // ================= 布局分派 =================
-        // 鸿蒙风格是一套**重新设计**的界面(照 harmonyos-pc 的 HDC UI):
-        // 顶栏 + 左侧导航 + 中央卡片 + 右侧屏幕预览 + 底部状态栏。
-        // 默认/可视化风格保持原来的"顶栏 + 左栏 + 中央标签页"布局。
-        if self.ui_style() == theme::UiStyle::Harmony {
-            self.layout_harmony(ui, connected, enabled, mouse_captured);
-        } else {
+        // 布局只有一套:顶栏 + 左栏 + 中央标签页(默认可视化共用),
+        // 可视化风格改变的是页面内容(虚拟键盘),不是整体骨架。
+        // (历史上还有第三种"鸿蒙"风格:顶栏 + 左侧导航 + 中央卡片 + 右侧预览
+        //  + 底部状态栏的整套独立布局,2026-10-06 按用户决策 W2-7 删除。)
+        {
             // ================= 顶栏 =================
             egui::Panel::top("top").show(ui, |ui| {
                 // 仅顶栏生效的细滚动条:非浮动、不随悬停加粗,避免盖住内容
@@ -3405,13 +3813,20 @@ impl eframe::App for PadApp {
                                 self.disconnect();
                             }
                         } else if self.connect_rx.is_some() {
-                            ui.label("连接中...");
+                            if self.reconnect_attempts > 0 {
+                                ui.label(format!("重连中…(第 {} 次)", self.reconnect_attempts));
+                            } else {
+                                ui.label("连接中...");
+                            }
                         } else if ui.button("连接控制").clicked() {
+                            // 手动连接 = 重新开始:清零退避计数
+                            self.reconnect_attempts = 0;
+                            self.reconnect_due = None;
                             self.connect_control();
                         }
 
                         ui.separator();
-                        let tk = self.shared.lock().unwrap().profile.toggle_key;
+                        let tk = lock_shared(&self.shared).profile.toggle_key;
                         let tkn = key_name(tk).replace("KEY_", "");
                         let txt = if enabled {
                             format!("映射: 开 ({tkn})")
@@ -3501,7 +3916,7 @@ impl eframe::App for PadApp {
                             // ---- 中段:外观 / 总开关 / 键位组合 / 引擎状态 / 诊断 ----
                             // 可视化风格:外观、键位组合、诊断变成三张"浏览器标签页"夹在
                             // 配置与 scrcpy 管理之间(默认选中键位组合);总开关等即时控件仍在标签页之外。
-                            // 默认/鸿蒙风格:维持折叠头(现状不变)。
+                            // 默认风格:维持折叠头(现状不变)。
                             let visual = self.ui_style() == theme::UiStyle::Visual;
                             if visual {
                                 let th = self.theme();
@@ -3523,7 +3938,7 @@ impl eframe::App for PadApp {
                                     LeftTab::Diag => self.ui_diagnostics(ui),
                                 }
                             } else {
-                                egui::CollapsingHeader::new("外观（开发中）")
+                                egui::CollapsingHeader::new("外观")
                                     .default_open(false)
                                     .show(ui, |ui| {
                                         self.ui_look(ui);
@@ -3630,7 +4045,7 @@ impl eframe::App for PadApp {
                         });
                 });
             });
-        } // ← 布局分派:非鸿蒙分支到这里结束
+        } // ← 布局(顶栏 + 左栏 + 中央标签页)到这里结束
 
         // ================= 关于窗口 =================
         let mut open_license = false;
@@ -3687,6 +4102,9 @@ impl eframe::App for PadApp {
         // ================= 参数助手窗口 =================
         self.ui_args_helper(ctx);
 
+        // ================= adb 命令助手窗口 =================
+        self.ui_adb_helper(ctx);
+
         // ================= 滑动曲线参数编辑窗口 =================
         self.ui_easing_editor(ctx);
 
@@ -3739,7 +4157,7 @@ impl PadApp {
         );
 
         let (names, active, n) = {
-            let g = self.shared.lock().unwrap();
+            let g = lock_shared(&self.shared);
             (
                 g.schemes.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
                 g.active_scheme,
@@ -3782,13 +4200,13 @@ impl PadApp {
         });
 
         ui.separator();
-        let mut fast = self.shared.lock().unwrap().fast_switch_enabled;
+        let mut fast = lock_shared(&self.shared).fast_switch_enabled;
         if ui
             .checkbox(&mut fast, "启用快速切换")
             .on_hover_text("只有勾选后，切换键才会真正切换组合；不勾选也可在[其他功能]里预先设置")
             .changed()
         {
-            self.shared.lock().unwrap().fast_switch_enabled = fast;
+            lock_shared(&self.shared).fast_switch_enabled = fast;
             self.scheme_dirty = true;
             self.log(if fast {
                 "已启用快速切换"
@@ -3809,7 +4227,7 @@ impl PadApp {
     /// 组合改名(生效中的那套连同 `profile.name` 一起改,两者必须一致)
     fn rename_scheme(&mut self, i: usize, name: String) {
         {
-            let mut g = self.shared.lock().unwrap();
+            let mut g = lock_shared(&self.shared);
             let Some(slot) = g.schemes.get_mut(i) else {
                 return;
             };
@@ -3830,7 +4248,9 @@ impl PadApp {
     }
 
     fn apply_pending_scroll(&mut self, ui: &mut egui::Ui) {
-        if self.scroll_to_new && self.ui_style() != theme::UiStyle::Harmony {
+        // 新增/选中后滚动到光标。以前这是"非鸿蒙才做"(鸿蒙是独立布局,滚的是别的容器);
+        // 现在只剩一套布局,一律滚动。
+        if self.scroll_to_new {
             ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
             self.scroll_to_new = false;
         }
@@ -3842,11 +4262,11 @@ impl PadApp {
         ui.label("勾选每行的 [仅 FPS]：该物理键只在 FPS 模式生效并覆盖同键普通映射。")
             .on_hover_text("FPS 模式运行时优先使用“仅 FPS”键位；退出或按住才退出后恢复普通映射。");
         let mut to_delete: Option<usize> = None;
-        let bind_count = self.shared.lock().unwrap().profile.binds.len();
+        let bind_count = lock_shared(&self.shared).profile.binds.len();
 
         for i in 0..bind_count {
             let is_macro = {
-                let g = self.shared.lock().unwrap();
+                let g = lock_shared(&self.shared);
                 matches!(
                     g.profile.binds.get(i).map(|b| &b.action),
                     Some(Action::Macro(_))
@@ -3870,8 +4290,13 @@ impl PadApp {
         let mut to_delete: Option<usize> = None;
         ui.horizontal(|ui| {
             let (key, kind, is_swipe, is_point, fps_only) = {
-                let g = self.shared.lock().unwrap();
-                let b = &g.profile.binds[i];
+                let g = lock_shared(&self.shared);
+                // 列表长度是**上一次**加锁时读的:期间引擎可能用切换键整份换掉
+                // profile(换成键位更少的组合)→ 直接下标会 panic。
+                // 取不到就整行不渲染(下一帧会按新长度重建列表)。
+                let Some(b) = g.profile.binds.get(i) else {
+                    return;
+                };
                 (
                     b.key,
                     b.action.kind_name(),
@@ -3896,7 +4321,7 @@ impl PadApp {
                 .changed()
             {
                 let before = {
-                    let mut g = self.shared.lock().unwrap();
+                    let mut g = lock_shared(&self.shared);
                     let before = g.profile.clone();
                     if let Some(b) = g.profile.binds.get_mut(i) {
                         b.fps_only = fps_only_edit;
@@ -3912,7 +4337,7 @@ impl PadApp {
                 let mut easing_edit = self.easing_edit;
                 let mut swipe_edit = false;
                 {
-                    let mut g = self.shared.lock().unwrap();
+                    let mut g = lock_shared(&self.shared);
                     // 撤销快照只取这一个键位:每次拖动/聚焦都会压一份,
                     // 而整份 Profile 的深拷贝与"键位总数"成正比,这里没必要。
                     let before = g.profile.binds.get(i).cloned();
@@ -3952,7 +4377,7 @@ impl PadApp {
                 // 界面按像素显示与编辑(便于对着截图核对),配置里始终存相对值
                 let m = self.mapper();
                 {
-                    let mut g = self.shared.lock().unwrap();
+                    let mut g = lock_shared(&self.shared);
                     // 同上:撤销快照只需这一个键位
                     let before = g.profile.binds.get(i).cloned();
                     if let Some(b) = g.profile.binds.get_mut(i) {
@@ -4041,7 +4466,7 @@ impl PadApp {
                 }
                 // 长短按一键切换(坐标/范围保留)
                 let is_tap = {
-                    let g = self.shared.lock().unwrap();
+                    let g = lock_shared(&self.shared);
                     matches!(
                         g.profile.binds.get(i).map(|b| &b.action),
                         Some(Action::Tap { .. })
@@ -4061,7 +4486,7 @@ impl PadApp {
                 }
                 if do_convert {
                     self.push_undo();
-                    let mut g = self.shared.lock().unwrap();
+                    let mut g = lock_shared(&self.shared);
                     if let Some(b) = g.profile.binds.get_mut(i) {
                         b.action = match &b.action {
                             Action::Tap { x, y, radius, .. } => Action::Hold {
@@ -4085,11 +4510,12 @@ impl PadApp {
             } else {
                 // 系统键
                 let desc = {
-                    let g = self.shared.lock().unwrap();
-                    g.profile.binds[i].action.describe()
+                    let g = lock_shared(&self.shared);
+                    // 渲染中途索引失效(引擎换组合):给占位文本而不是 panic
+                    g.profile.binds.get(i).map(|b| b.action.describe())
                 };
-                ui.label(desc);
-                let mut g = self.shared.lock().unwrap();
+                ui.label(desc.unwrap_or_else(|| "(该键位已不存在)".to_string()));
+                let mut g = lock_shared(&self.shared);
                 if let Some(b) = g.profile.binds.get_mut(i) {
                     if let Action::AndroidKey { keycode } = &mut b.action {
                         ui.label("keycode:");
@@ -4108,7 +4534,15 @@ impl PadApp {
     /// 删除第 i 条键位绑定(撤销 + 移除 + 交互态复位)。
     fn delete_bind(&mut self, i: usize) {
         self.push_undo();
-        self.shared.lock().unwrap().profile.binds.remove(i);
+        // 下标核查见 remove_indexed:引擎可能刚用切换键换掉整份 profile
+        let removed = {
+            let mut g = lock_shared(&self.shared);
+            remove_indexed(&mut g.profile.binds, i)
+        };
+        if !removed {
+            self.log("该键位已不在当前组合里(组合刚被切换),未删除");
+            return;
+        }
         // 交互态若指向刚删掉的条目就一并收尾,免得残留在失效索引上
         if self.resizing == Some(ResizeTarget::Bind(i)) {
             self.resizing = None;
@@ -4281,7 +4715,7 @@ impl PadApp {
                 keycode: self.draft.keycode,
             },
         };
-        self.shared.lock().unwrap().profile.binds.push(KeyBind {
+        lock_shared(&self.shared).profile.binds.push(KeyBind {
             key,
             action,
             // FPS 页建的草稿只入"仅 FPS"键位;键位页建的为普通键位
@@ -4341,17 +4775,22 @@ impl PadApp {
 
     /// FPS 页:虚拟键盘(与键位页同一套显示能力,默认只亮 FPS 键位)
     /// + 既有 FPS 面板(全保留)。功能上只能设置 FPS 相关键。
+    ///
+    /// 布局(用户 2026-10-07 拍板):「鼠标瞄准」整串**常驻页面最上** ——
+    /// 它本来就是 FPS 页的核心,不再等切到"瞄准锚点"才展开;顺序 =
+    /// 瞄准 → 虚拟键盘 → 过滤/新增下拉行 → 下拉栏下方显示所选项目的设置。
     fn ui_visual_fps(&mut self, ui: &mut egui::Ui, captured: bool) {
+        self.ui_aim(ui, captured);
+        ui.separator();
+        self.ui_vk_area(ui, true);
         ui.horizontal(|ui| self.vk_fps_filters.ui(ui, "vk_filters_fps"))
             .response
             .on_hover_text(
                 "与[键位]页一样:想在这里看到普通映射/组合键/摇杆,勾上即可。\n\
                  默认只显示 FPS 独有的键位。",
             );
-        self.ui_vk_area(ui, true);
         self.ui_vk_panel(ui, true);
         self.apply_pending_scroll(ui);
-        let _ = captured; // FPS 面板现在由“新增项目 → 瞄准锚点”在操作栏中展开
     }
 
     /// 虚拟键盘 + 虚拟鼠标 + 下方操作栏。fps_tab=true 时空闲键建"仅 FPS"草稿,
@@ -4448,7 +4887,7 @@ impl PadApp {
         }
         let mut m = std::collections::HashMap::new();
         let th = self.theme();
-        let g = self.shared.lock().unwrap();
+        let g = lock_shared(&self.shared);
         let p = &g.profile;
         // 键位(普通 / 宏 / 仅 FPS 各自受一个勾选控制)
         for b in p.binds.iter() {
@@ -4542,7 +4981,7 @@ impl PadApp {
 
     /// 取点中应当呼吸闪烁的键码(取点目标本身在哪条键上就闪哪条)
     fn vk_pulse_code(&self) -> Option<u16> {
-        let g = self.shared.lock().unwrap();
+        let g = lock_shared(&self.shared);
         match self.picking? {
             CoordSlot::NewBind => self.draft.key,
             CoordSlot::Bind(i)
@@ -4560,7 +4999,7 @@ impl PadApp {
 
     /// 操作栏正在编辑的目标对应的键码(用于加亮显示)
     fn vk_sel_code(&self) -> Option<u16> {
-        let g = self.shared.lock().unwrap();
+        let g = lock_shared(&self.shared);
         match self.vk_sel? {
             VkSel::New => self.draft.key,
             VkSel::Bind(i) => g.profile.binds.get(i).map(|b| b.key),
@@ -4596,7 +5035,7 @@ impl PadApp {
         if code == 0 {
             return None;
         }
-        let g = self.shared.lock().unwrap();
+        let g = lock_shared(&self.shared);
         let p = &g.profile;
         if let Some(i) = p.binds.iter().position(|b| b.key == code) {
             return Some(if matches!(p.binds[i].action, Action::Macro(_)) {
@@ -4653,7 +5092,7 @@ impl PadApp {
 
     /// 该目标是否属于 FPS 范畴(FPS 页只允许编辑这些)
     fn vk_sel_is_fps(&self, sel: &VkSel) -> bool {
-        let g = self.shared.lock().unwrap();
+        let g = lock_shared(&self.shared);
         match sel {
             VkSel::Bind(i) => g.profile.binds.get(*i).map(|b| b.fps_only).unwrap_or(false),
             VkSel::Macro(i) => g.profile.binds.get(*i).map(|b| b.fps_only).unwrap_or(false),
@@ -4692,7 +5131,7 @@ impl PadApp {
                 }
                 VkSel::WheelDir { wheel, .. } => {
                     let is_temp = {
-                        let g = self.shared.lock().unwrap();
+                        let g = lock_shared(&self.shared);
                         g.profile
                             .wheels
                             .get(wheel)
@@ -4727,8 +5166,12 @@ impl PadApp {
         self.draft.key = Some(code);
         self.draft.fps_only = fps_tab;
         self.draft_active = true;
+        // W2-2:守卫拒绝时不留下"没人要的草稿"(撤销掉刚建的一切,日志已给出原因)
+        if !self.begin_pick(CoordSlot::NewBind) {
+            self.cancel_draft();
+            return;
+        }
         self.vk_sel = Some(VkSel::New);
-        self.begin_pick(CoordSlot::NewBind);
         self.log(format!(
             "已选中 {name}: 请在截图上点击取点(或点[取消取点]放弃)"
         ));
@@ -4752,7 +5195,7 @@ impl PadApp {
         let m = self.mapper();
         let (x, y) = (m.rel_x(540), m.rel_y(960));
         let index = {
-            let mut g = self.shared.lock().unwrap();
+            let mut g = lock_shared(&self.shared);
             g.profile.combos_enabled = true;
             g.profile.combos.push(KeyCombo {
                 keys: vec![first, code],
@@ -4815,7 +5258,7 @@ impl PadApp {
                         self.push_undo();
                         let m = self.mapper();
                         let (x, y) = (m.rel_x(540), m.rel_y(960));
-                        let mut g = self.shared.lock().unwrap();
+                        let mut g = lock_shared(&self.shared);
                         g.profile.combos_enabled = true;
                         g.profile.combos.push(KeyCombo {
                             keys: vec![0, 0],
@@ -4862,58 +5305,27 @@ impl PadApp {
         });
     }
 
-    /// FPS 页专用添加栏：只允许 FPS 独有键位和瞄准锚点，不暴露普通键位/组合键/轮盘。
+    /// FPS 页专用添加栏：只允许新增 FPS 独有键位，不暴露普通键位/组合键/轮盘。
+    /// 「鼠标瞄准」设置自 2026-10-07 起常驻页面上方，这里不再提供"瞄准锚点"条目
+    /// (锚点取点按钮就在上方瞄准分组里)。
     fn ui_fps_add_bar(&mut self, ui: &mut egui::Ui) {
-        if !matches!(self.vk_add_kind, VkAddKind::Key | VkAddKind::Aim) {
+        if self.vk_add_kind != VkAddKind::Key {
             self.vk_add_kind = VkAddKind::Key;
             self.vk_sel = None;
             self.waiting_key = None;
         }
         let th = self.theme();
         ui.horizontal(|ui| {
-            ui.label("新增 FPS 项目：");
-            let old = self.vk_add_kind;
-            egui::ComboBox::from_id_salt("vk_add_kind_fps")
-                .selected_text(match self.vk_add_kind {
-                    VkAddKind::Aim => "瞄准锚点",
-                    _ => "FPS 专用键位",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.vk_add_kind, VkAddKind::Key, "FPS 专用键位");
-                    ui.selectable_value(&mut self.vk_add_kind, VkAddKind::Aim, "瞄准锚点");
-                });
-            if self.vk_add_kind != old {
-                self.vk_combo_pending.clear();
+            if Self::tab_button(ui, "＋ 新增 FPS 键位", false, th.ok) {
+                self.cancel_draft();
+                self.reset_draft_to_screen();
+                self.draft.key = None;
+                self.draft.fps_only = true;
+                self.draft_active = true;
                 self.vk_sel = None;
-                self.waiting_key = None;
-                self.picking = None;
+                self.waiting_key = Some(KeySlot::NewBind);
             }
-            match self.vk_add_kind {
-                VkAddKind::Key => {
-                    if Self::tab_button(ui, "＋ 新增 FPS 键位", false, th.ok) {
-                        self.cancel_draft();
-                        self.reset_draft_to_screen();
-                        self.draft.key = None;
-                        self.draft.fps_only = true;
-                        self.draft_active = true;
-                        self.vk_sel = None;
-                        self.waiting_key = Some(KeySlot::NewBind);
-                    }
-                    ui.label("也可直接点击键盘/鼠标上的空闲键创建仅 FPS 键位");
-                }
-                VkAddKind::Aim => {
-                    if Self::tab_button(
-                        ui,
-                        "取锚点",
-                        self.picking == Some(CoordSlot::AimAnchor),
-                        th.ok,
-                    ) {
-                        self.begin_pick(CoordSlot::AimAnchor);
-                    }
-                    ui.label("锚点是在手机屏幕上放置虚拟手指的起点，不是游戏准星。");
-                }
-                VkAddKind::Combo | VkAddKind::Wheel => {}
-            }
+            ui.label("也可直接点击键盘/鼠标上的空闲键创建仅 FPS 键位；鼠标瞄准设置常驻在页面上方");
         });
     }
 
@@ -4996,7 +5408,7 @@ impl PadApp {
                 });
                 if self.vk_sel.is_some() {
                     let mut action = {
-                        let g = self.shared.lock().unwrap();
+                        let g = lock_shared(&self.shared);
                         g.profile.binds.get(i).and_then(|b| match &b.action {
                             Action::Macro(m) => Some(m.clone()),
                             _ => None,
@@ -5015,12 +5427,14 @@ impl PadApp {
                                 ui,
                                 &mut action.instructions,
                                 &format!("vk_macro_{i}"),
+                                false,
+                                true,
                             );
                         } else {
                             ui.small("该宏只有录制步骤；展开后可查看，编辑请点[载入编辑]。");
                         }
                         if ui.button("保存宏修改").clicked() {
-                            let mut g = self.shared.lock().unwrap();
+                            let mut g = lock_shared(&self.shared);
                             if let Some(b) = g.profile.binds.get_mut(i) {
                                 b.action = Action::Macro(action.clone());
                             }
@@ -5058,7 +5472,7 @@ impl PadApp {
     fn ui_macro_page(&mut self, ui: &mut egui::Ui) {
         let th = self.theme();
         let visual = self.ui_style() == theme::UiStyle::Visual;
-        ui.heading("宏（开发中）");
+        ui.heading("宏");
         ui.label("录制真实按键时序，或用设置宏编排按键、组合键、轮盘、FPS、点击、滑动与间隔，再绑定到一个触发键。");
         ui.separator();
 
@@ -5076,6 +5490,20 @@ impl PadApp {
                 if Self::tab_button(ui, "停止录制", false, th.danger) {
                     self.finish_macro_recording();
                 }
+                // 录制中也能看步骤:先看步骤、再决定要不要保存(用户 2026-10-07)
+                let showing = self.macro_show_recording_steps;
+                if Self::tab_button(
+                    ui,
+                    if showing {
+                        "隐藏步骤"
+                    } else {
+                        "显示步骤"
+                    },
+                    showing,
+                    th.accent,
+                ) {
+                    self.macro_show_recording_steps = !showing;
+                }
             } else if Self::tab_button(ui, "开始录制", false, th.ok) {
                 self.waiting_key = None;
                 self.picking = None;
@@ -5087,7 +5515,10 @@ impl PadApp {
                     last_step_at: Instant::now(),
                     idle_ms: self.macro_idle_ms,
                 });
-                self.log("宏录制开始：操作按键或点击下方虚拟键盘；空闲会自动停止");
+                self.log(
+                    "宏录制开始：等待第一个按键……（从第一个按键才开始计时与空闲停止；\
+                     之后空闲会自动停止）",
+                );
             }
             if Self::tab_button(ui, "清空", false, th.accent) {
                 self.reset_macro_draft();
@@ -5143,16 +5574,22 @@ impl PadApp {
             self.open_macro_virtual_editor();
         }
 
-        if self.macro_recording.is_some() {
-            let n = self
-                .macro_recording
-                .as_ref()
-                .map(|r| r.steps.len())
-                .unwrap_or(0);
-            ui.colored_label(
-                th.warn,
-                format!("录制中… 已记录 {n} 条结果（长按重复已合并）"),
-            );
+        if let Some(rec) = self.macro_recording.as_ref() {
+            if rec.steps.is_empty() {
+                // 第一个键之前只是"等待":不发计时、不空闲停止、不计入宏
+                ui.colored_label(th.warn, "录制中… 等待第一个按键（第一键按下后才开始计时）");
+            } else {
+                ui.colored_label(
+                    th.warn,
+                    format!(
+                        "录制中… 已记录 {} 条结果（长按重复已合并）",
+                        rec.steps.len()
+                    ),
+                );
+            }
+            if self.macro_show_recording_steps && !rec.steps.is_empty() {
+                Self::ui_macro_recorded_steps(ui, &rec.steps);
+            }
         } else if self.macro_page_steps.is_empty() {
             ui.small("尚未录制。先点[开始录制]，再操作按键或点击下方虚拟键盘；也可以直接设置宏。");
         } else {
@@ -5180,7 +5617,8 @@ impl PadApp {
             }
         });
         let mut instructions = std::mem::take(&mut self.macro_page_instructions);
-        self.ui_macro_instruction_list(ui, &mut instructions, "macro_page");
+        // 宏页这份草稿不用返回值:传 false,省掉每帧一次整表克隆(W2-3)
+        self.ui_macro_instruction_list(ui, &mut instructions, "macro_page", true, false);
         self.macro_page_instructions = instructions;
 
         if visual {
@@ -5236,7 +5674,7 @@ impl PadApp {
         ui.separator();
         ui.heading("已录宏");
         let rows: Vec<(usize, u16, usize, usize, bool)> = {
-            let g = self.shared.lock().unwrap();
+            let g = lock_shared(&self.shared);
             g.profile
                 .binds
                 .iter()
@@ -5293,14 +5731,18 @@ impl PadApp {
             });
             if expanded {
                 let mut action = {
-                    let g = self.shared.lock().unwrap();
+                    let g = lock_shared(&self.shared);
                     g.profile.binds.get(i).and_then(|b| match &b.action {
                         Action::Macro(m) => Some(m.clone()),
                         _ => None,
                     })
                 };
                 if let Some(action) = action.as_mut() {
-                    let before = action.clone();
+                    // 这一步原先克隆整份 action(带录制步骤/virtual_profile)只为比较。
+                    // 本块里唯一可改的就是 `instructions`(步骤与扩展键位表都是只读),
+                    // 所以直接用列表自己的"改了没有"返回值代替(W2-3)。
+                    // 注意:列表没被渲染时(只有录制步骤)返回 false,与旧比较行为一致。
+                    let mut changed = false;
                     if !action.steps.is_empty() {
                         Self::ui_macro_recorded_steps(ui, &action.steps);
                     }
@@ -5309,17 +5751,19 @@ impl PadApp {
                     }
                     if !action.instructions.is_empty() || action.virtual_profile.is_some() {
                         ui.small("设置动作:");
-                        self.ui_macro_instruction_list(
+                        changed = self.ui_macro_instruction_list(
                             ui,
                             &mut action.instructions,
                             &format!("macro_expand_{i}"),
+                            false,
+                            true,
                         );
                     } else {
                         ui.small("该宏只有录制步骤，录制步骤只读。");
                     }
-                    if action != &before {
+                    if changed {
                         {
-                            let mut g = self.shared.lock().unwrap();
+                            let mut g = lock_shared(&self.shared);
                             if let Some(b) = g.profile.binds.get_mut(i) {
                                 b.action = Action::Macro(action.clone());
                             }
@@ -5331,7 +5775,7 @@ impl PadApp {
         }
         if let Some(i) = load {
             let loaded = {
-                let g = self.shared.lock().unwrap();
+                let g = lock_shared(&self.shared);
                 g.profile.binds.get(i).and_then(|b| match &b.action {
                     Action::Macro(m) => Some((b.key, m.clone(), b.fps_only)),
                     _ => None,
@@ -5340,6 +5784,9 @@ impl PadApp {
             if let Some((key, action, fps)) = loaded {
                 self.macro_page_key = Some(key);
                 self.macro_page_steps = action.steps;
+                // 旧文件/手工编辑来的宏可能第一步带延迟(甚至是在"录制起点"
+                // 修复之前录的):进了编辑区就按不变量归一化,让它可见可控。
+                Self::normalize_macro_start(&mut self.macro_page_steps);
                 self.macro_page_instructions = action.instructions;
                 self.macro_page_virtual_profile = action.virtual_profile.as_deref().cloned();
                 self.macro_page_fps_only = fps;
@@ -5350,7 +5797,15 @@ impl PadApp {
         }
         if let Some(i) = delete {
             self.push_undo();
-            self.shared.lock().unwrap().profile.binds.remove(i);
+            // 下标核查见 remove_indexed(引擎可能刚换过组合)
+            let removed = {
+                let mut g = lock_shared(&self.shared);
+                remove_indexed(&mut g.profile.binds, i)
+            };
+            if !removed {
+                self.log("该宏已不在当前组合里(组合刚被切换),未删除");
+                return;
+            }
             if self.macro_loaded_index == Some(i) {
                 self.reset_macro_draft();
             }
@@ -5372,7 +5827,7 @@ impl PadApp {
 
     fn open_macro_virtual_editor(&mut self) {
         let (source_scheme, profile) = {
-            let g = self.shared.lock().unwrap();
+            let g = lock_shared(&self.shared);
             let source = g.active_scheme.min(g.schemes.len().saturating_sub(1));
             let profile = self
                 .macro_page_virtual_profile
@@ -5395,7 +5850,7 @@ impl PadApp {
             return;
         };
         let schemes: Vec<String> = {
-            let g = self.shared.lock().unwrap();
+            let g = lock_shared(&self.shared);
             g.schemes.iter().map(|p| p.name.clone()).collect()
         };
         let mut open = true;
@@ -5419,10 +5874,7 @@ impl PadApp {
                             }
                         });
                     if source != editor.source_scheme {
-                        let mut inherited = self
-                            .shared
-                            .lock()
-                            .unwrap()
+                        let mut inherited = lock_shared(&self.shared)
                             .schemes
                             .get(source)
                             .cloned()
@@ -5698,8 +6150,14 @@ impl PadApp {
         ui: &mut egui::Ui,
         instructions: &mut Vec<MacroInstruction>,
         id: &str,
+        // 是否允许"取点":只有宏页的列表能直接写回(self.macro_page_instructions);
+        // 键位页里展开的宏编辑的是副本,取点会落错地方,故传 false。
+        pick_enabled: bool,
+        // 是否需要"这一帧改了没有"的返回值。整表克隆只是为了做这次比较
+        // (W2-3 度量:20 条约 451ns/帧),不需要返回值的调用方传 false 就整个省掉。
+        detect_change: bool,
     ) -> bool {
-        let before = instructions.clone();
+        let before = detect_change.then(|| instructions.clone());
         let mut remove = None;
         for (i, instruction) in instructions.iter_mut().enumerate() {
             ui.push_id(format!("{id}_{i}"), |ui| {
@@ -5710,7 +6168,7 @@ impl PadApp {
                             remove = Some(i);
                         }
                     });
-                    self.ui_macro_instruction(ui, instruction, i, id);
+                    self.ui_macro_instruction(ui, instruction, i, id, pick_enabled);
                 });
             });
         }
@@ -5730,7 +6188,10 @@ impl PadApp {
                 instructions.push(self.macro_instruction_kind.make());
             }
         });
-        before != *instructions
+        match before {
+            Some(b) => b != *instructions,
+            None => false,
+        }
     }
 
     /// 单个设置宏动作的参数编辑器。
@@ -5740,6 +6201,7 @@ impl PadApp {
         instruction: &mut MacroInstruction,
         index: usize,
         id: &str,
+        pick_enabled: bool,
     ) {
         let mut pending_key = None;
         match instruction {
@@ -5751,7 +6213,6 @@ impl PadApp {
             }
             MacroInstruction::Key {
                 code,
-                mode,
                 duration_ms,
                 delay_ms,
             } => {
@@ -5761,11 +6222,11 @@ impl PadApp {
                     if Self::key_button(ui, waiting, Some(*code)).clicked() {
                         pending_key = Some(KeySlot::MacroInstructionKey(index));
                     }
-                    ui.selectable_value(mode, MacroKeyMode::Tap, "点按");
-                    ui.selectable_value(mode, MacroKeyMode::Hold, "长按");
-                });
-                ui.horizontal(|ui| {
-                    ui.label("持续");
+                    ui.label("持续").on_hover_text(
+                        "按键步骤是自包含的\"按下 → 持续 → 抬起\"(W2-8):\n\
+                         宏不需要长按——点一下,需要的操作按部就班地执行,\n\
+                         宏结束时不会在手机上留下任何按着的触点。",
+                    );
                     ui.add(
                         egui::DragValue::new(duration_ms)
                             .range(5..=600_000)
@@ -5828,7 +6289,7 @@ impl PadApp {
                 delay_ms,
             } => {
                 let wheels = {
-                    let g = self.shared.lock().unwrap();
+                    let g = lock_shared(&self.shared);
                     g.profile
                         .wheels
                         .iter()
@@ -5908,6 +6369,15 @@ impl PadApp {
                     ui.label("位置 X/Y");
                     ui.add(egui::DragValue::new(x).range(0.0..=1.0).speed(0.005));
                     ui.add(egui::DragValue::new(y).range(0.0..=1.0).speed(0.005));
+                    if pick_enabled {
+                        let waiting = self.picking == Some(CoordSlot::MacroClickPoint(index));
+                        if ui
+                            .button(if waiting { "点击取点..." } else { "取点" })
+                            .clicked()
+                        {
+                            self.begin_pick(CoordSlot::MacroClickPoint(index));
+                        }
+                    }
                 });
                 ui.horizontal(|ui| {
                     ui.label("持续");
@@ -5936,9 +6406,37 @@ impl PadApp {
                     ui.label("起点 X/Y");
                     ui.add(egui::DragValue::new(start_x).range(0.0..=1.0).speed(0.005));
                     ui.add(egui::DragValue::new(start_y).range(0.0..=1.0).speed(0.005));
+                    if pick_enabled {
+                        let waiting = self.picking == Some(CoordSlot::MacroSwipeStart(index));
+                        if ui
+                            .button(if waiting {
+                                "点击取起点..."
+                            } else {
+                                "取起点"
+                            })
+                            .clicked()
+                        {
+                            self.begin_pick(CoordSlot::MacroSwipeStart(index));
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
                     ui.label("终点 X/Y");
                     ui.add(egui::DragValue::new(end_x).range(0.0..=1.0).speed(0.005));
                     ui.add(egui::DragValue::new(end_y).range(0.0..=1.0).speed(0.005));
+                    if pick_enabled {
+                        let waiting = self.picking == Some(CoordSlot::MacroSwipeEnd(index));
+                        if ui
+                            .button(if waiting {
+                                "点击取终点..."
+                            } else {
+                                "取终点"
+                            })
+                            .clicked()
+                        {
+                            self.begin_pick(CoordSlot::MacroSwipeEnd(index));
+                        }
+                    }
                 });
                 ui.horizontal(|ui| {
                     ui.label("滑动时长");
@@ -5957,7 +6455,7 @@ impl PadApp {
             }
             MacroInstruction::Macro { action, delay_ms } => {
                 let macros = {
-                    let g = self.shared.lock().unwrap();
+                    let g = lock_shared(&self.shared);
                     g.profile
                         .binds
                         .iter()
@@ -6054,8 +6552,8 @@ impl PadApp {
 
     /// 把捕获层上报的按键事件写入录制宏。重复 KEY_DOWN（键盘自动重复）
     /// 只更新空闲计时，不再追加一次按下；抬起时才用真实持续时间写一条记录。
-    fn record_macro_button(rec: &mut MacroRecording, code: u16, pressed: bool, now: Instant) {
-        rec.last_event = now;
+    fn record_macro_button(rec: &mut MacroRecording, code: u16, pressed: bool, at: Instant) {
+        rec.last_event = at;
         if pressed && rec.held.contains(&code) {
             return;
         }
@@ -6068,14 +6566,32 @@ impl PadApp {
         let delay = if rec.steps.is_empty() {
             0
         } else {
-            now.duration_since(rec.last_step_at).as_millis().min(2000) as u32
+            // Instant::duration_since 在"乱序"(后一条事件的时刻更早)时饱和为 0,
+            // 不会 panic,也不会记出负延迟。
+            at.duration_since(rec.last_step_at).as_millis().min(2000) as u32
         };
         rec.steps.push(MacroStep {
             code,
             pressed,
             delay_ms: delay,
         });
-        rec.last_step_at = now;
+        rec.last_step_at = at;
+    }
+
+    /// 宏的起始点归一化:**宏从第一个按键事件开始算**。
+    ///
+    /// 用户点[开始录制]之后可能要去翻键盘、想内容,空档期**不该**算进宏里 ——
+    /// 否则回放时会先愣上几秒才动,而且用户完全看不出那段时间是哪来的。
+    /// 录制侧本来就在 `record_macro_button` / 虚拟键盘录入里把第一步短路成 0,
+    /// 这里再兜一道,是因为宏还可能来自旧版配置文件、导入的 YAML 或手工编辑:
+    /// 统一在"进入草稿"和"保存成键位"两处归一化,保证不变量对所有来源都成立。
+    ///
+    /// 只动**第一个步骤**的延迟;用户手工编排的"间隔"指令(`MacroInstruction::Delay`)
+    /// 是明确写出来的动作,不能碰。
+    fn normalize_macro_start(steps: &mut [MacroStep]) {
+        if let Some(first) = steps.first_mut() {
+            first.delay_ms = 0;
+        }
     }
 
     fn macro_add_from_page(&mut self) {
@@ -6088,7 +6604,8 @@ impl PadApp {
             return;
         }
         self.push_undo();
-        self.shared.lock().unwrap().profile.binds.push(KeyBind {
+        Self::normalize_macro_start(&mut self.macro_page_steps);
+        lock_shared(&self.shared).profile.binds.push(KeyBind {
             key,
             action: Action::Macro(MacroAction {
                 steps: self.macro_page_steps.clone(),
@@ -6103,6 +6620,9 @@ impl PadApp {
     fn finish_macro_recording(&mut self) {
         if let Some(rec) = self.macro_recording.take() {
             self.macro_page_steps = rec.steps;
+            // 起始点不变量:第一个动作 = 用户按下第一个键的那一刻
+            // (点[开始录制]到那一刻之间的空档永远不算宏的一部分)。
+            Self::normalize_macro_start(&mut self.macro_page_steps);
             self.log(format!(
                 "宏录制结束：{} 个事件",
                 self.macro_page_steps.len()
@@ -6259,13 +6779,14 @@ impl PadApp {
 
     /// 读取一个 KeySlot 当前持有的键码(0 = 未绑定)
     fn vk_slot_code(&self, slot: &KeySlot) -> u16 {
-        let g = self.shared.lock().unwrap();
+        let g = lock_shared(&self.shared);
         match slot {
             KeySlot::Toggle => g.profile.toggle_key,
             KeySlot::CursorToggle => g.profile.cursor_toggle_key,
             KeySlot::AimHold => g.profile.aim.hold_key,
             KeySlot::AimToggle => g.profile.aim.toggle_key,
             KeySlot::AimSuspend => g.profile.aim.suspend_key,
+            KeySlot::RecoilTrigger => g.profile.aim.recoil.trigger_key,
             KeySlot::WheelDir { wheel, dir } => g
                 .profile
                 .wheels
@@ -6318,7 +6839,7 @@ impl PadApp {
     /// the leader's single-key action first.
     fn ui_combos(&mut self, ui: &mut egui::Ui) {
         let (mut enabled, combos, mapper) = {
-            let g = self.shared.lock().unwrap();
+            let g = lock_shared(&self.shared);
             let screen = g
                 .control
                 .as_ref()
@@ -6339,7 +6860,7 @@ impl PadApp {
             .changed()
         {
             self.push_undo();
-            self.shared.lock().unwrap().profile.combos_enabled = enabled;
+            lock_shared(&self.shared).profile.combos_enabled = enabled;
         }
         ui.label("按键顺序：第一个键是前缀，后续键要与前缀同时按住。Ctrl+R 应先按 Ctrl 再按 R。")
             .on_hover_text(
@@ -6402,7 +6923,7 @@ impl PadApp {
         self.easing_edit = combo_easing;
         if let Some(index) = delete_combo {
             self.push_undo();
-            let mut g = self.shared.lock().unwrap();
+            let mut g = lock_shared(&self.shared);
             if index < g.profile.combos.len() {
                 g.profile.combos.remove(index);
             }
@@ -6410,7 +6931,7 @@ impl PadApp {
         }
         if let Some((combo_index, slot)) = delete_slot {
             self.push_undo();
-            let mut g = self.shared.lock().unwrap();
+            let mut g = lock_shared(&self.shared);
             if let Some(combo) = g.profile.combos.get_mut(combo_index)
                 && slot < combo.keys.len()
             {
@@ -6420,14 +6941,14 @@ impl PadApp {
         }
         if let Some(index) = add_slot {
             self.push_undo();
-            let mut g = self.shared.lock().unwrap();
+            let mut g = lock_shared(&self.shared);
             if let Some(combo) = g.profile.combos.get_mut(index) {
                 combo.keys.push(0);
             }
         }
         for (index, combo) in snapshots {
             self.push_undo();
-            if let Some(target) = self.shared.lock().unwrap().profile.combos.get_mut(index) {
+            if let Some(target) = lock_shared(&self.shared).profile.combos.get_mut(index) {
                 *target = combo;
             }
         }
@@ -6435,7 +6956,7 @@ impl PadApp {
             self.push_undo();
             let m = self.mapper();
             let (x, y) = (m.rel_x(540), m.rel_y(960));
-            self.shared.lock().unwrap().profile.combos.push(KeyCombo {
+            lock_shared(&self.shared).profile.combos.push(KeyCombo {
                 keys: vec![0, 0],
                 action: Action::Tap {
                     x,
@@ -6454,13 +6975,17 @@ impl PadApp {
         ui.heading("轮盘(虚拟摇杆)");
         ui.label("设置[启用键]后变为临时轮盘:仅在启用期间生效,期间方向键的其它绑定让位");
         let mut to_delete: Option<usize> = None;
-        let wheel_count = self.shared.lock().unwrap().profile.wheels.len();
+        let wheel_count = lock_shared(&self.shared).profile.wheels.len();
 
         for i in 0..wheel_count {
             ui.horizontal(|ui| {
                 let temp_info = {
-                    let g = self.shared.lock().unwrap();
-                    let w = &g.profile.wheels[i];
+                    let g = lock_shared(&self.shared);
+                    // 列表长度是上一次加锁时读的:引擎换组合后可能越界(W0-10),
+                    // 取不到就整行不渲染
+                    let Some(w) = g.profile.wheels.get(i) else {
+                        return;
+                    };
                     (
                         w.temp.as_ref().map(|t| (t.key, t.mode)),
                         w.mode,
@@ -6486,7 +7011,7 @@ impl PadApp {
                 if kind != old_kind {
                     self.push_undo();
                     {
-                        let mut g = self.shared.lock().unwrap();
+                        let mut g = lock_shared(&self.shared);
                         if let Some(w) = g.profile.wheels.get_mut(i) {
                             w.kind = kind;
                             w.ensure_custom_directions();
@@ -6514,7 +7039,7 @@ impl PadApp {
                     if mode != old_mode {
                         self.push_undo();
                         {
-                            let mut g = self.shared.lock().unwrap();
+                            let mut g = lock_shared(&self.shared);
                             if let Some(w) = g.profile.wheels.get_mut(i) {
                                 w.mode = mode;
                             }
@@ -6541,8 +7066,8 @@ impl PadApp {
                         .clicked()
                     {
                         self.push_undo();
-                        let mut g = self.shared.lock().unwrap();
-                        if let Some(t) = g.profile.wheels[i].temp.as_mut() {
+                        let mut g = lock_shared(&self.shared);
+                        if let Some(t) = g.profile.wheels.get_mut(i).and_then(|w| w.temp.as_mut()) {
                             t.mode = match t.mode {
                                 TempMode::Hold => TempMode::Toggle,
                                 TempMode::Toggle => TempMode::Hold,
@@ -6551,19 +7076,30 @@ impl PadApp {
                     }
                     if ui.button("设为永久").clicked() {
                         self.push_undo();
-                        {
-                            let mut g = self.shared.lock().unwrap();
-                            g.profile.wheels[i].temp = None;
+                        let done = {
+                            let mut g = lock_shared(&self.shared);
+                            match g.profile.wheels.get_mut(i) {
+                                Some(w) => {
+                                    w.temp = None;
+                                    true
+                                }
+                                None => false,
+                            }
+                        };
+                        if done {
+                            self.log("已设为永久轮盘");
                         }
-                        self.log("已设为永久轮盘");
                     }
                 } else {
                     ui.label("(永久)");
                 }
             });
             let (dirs, kind) = {
-                let g = self.shared.lock().unwrap();
-                let w = &g.profile.wheels[i];
+                let g = lock_shared(&self.shared);
+                // 索引失效(引擎刚换组合)则跳过这一行,继续渲染后面的
+                let Some(w) = g.profile.wheels.get(i) else {
+                    continue;
+                };
                 (w.active_dirs(), w.kind)
             };
             if kind != WheelKind::Standard {
@@ -6575,8 +7111,10 @@ impl PadApp {
                         self.push_undo();
                     }
                     if r.changed() {
-                        let mut g = self.shared.lock().unwrap();
-                        g.profile.wheels[i].set_direction_count(count);
+                        let mut g = lock_shared(&self.shared);
+                        if let Some(w) = g.profile.wheels.get_mut(i) {
+                            w.set_direction_count(count);
+                        }
                     }
                     ui.label("最多 8 个；同时只接受最早按下的 2 个方向并取平均");
                 });
@@ -6603,8 +7141,13 @@ impl PadApp {
                             self.push_undo();
                         }
                         if r.changed() {
-                            let mut g = self.shared.lock().unwrap();
-                            if let Some(dir) = g.profile.wheels[i].directions.get_mut(d) {
+                            let mut g = lock_shared(&self.shared);
+                            if let Some(dir) = g
+                                .profile
+                                .wheels
+                                .get_mut(i)
+                                .and_then(|w| w.directions.get_mut(d))
+                            {
                                 dir.angle_deg = a;
                             }
                         }
@@ -6622,11 +7165,14 @@ impl PadApp {
                 let waiting_p = self.picking == Some(CoordSlot::WheelCenter(i));
                 let m = self.mapper();
                 {
-                    let mut g = self.shared.lock().unwrap();
+                    let mut g = lock_shared(&self.shared);
                     // 撤销快照只取这一个轮盘(理由同按键区:避免每帧深拷贝整份配置)
                     let before = g.profile.wheels.get(i).cloned();
                     let mut wheel_edit = false;
-                    let w = &mut g.profile.wheels[i];
+                    // 索引失效(引擎刚换组合)则不再渲染这一行的参数编辑
+                    let Some(w) = g.profile.wheels.get_mut(i) else {
+                        return;
+                    };
                     ui.label("圆心x:");
                     let mut px = m.x(w.cx);
                     let r = ui.add(egui::DragValue::new(&mut px).range(COORD_RANGE));
@@ -6702,8 +7248,10 @@ impl PadApp {
                     .clicked()
                 {
                     self.push_undo();
-                    self.shared.lock().unwrap().profile.wheels[i].scope =
-                        crate::keymap::DEFAULT_WHEEL_SCOPE;
+                    let mut g = lock_shared(&self.shared);
+                    if let Some(w) = g.profile.wheels.get_mut(i) {
+                        w.scope = crate::keymap::DEFAULT_WHEEL_SCOPE;
+                    }
                 }
                 if ui
                     .button(if waiting_p {
@@ -6739,11 +7287,19 @@ impl PadApp {
         }
         if let Some(i) = to_delete {
             self.push_undo();
-            self.shared.lock().unwrap().profile.wheels.remove(i);
-            if self.resizing == Some(ResizeTarget::Wheel(i)) {
-                self.resizing = None;
+            // 下标核查见 remove_indexed(引擎可能刚换过组合)
+            let removed = {
+                let mut g = lock_shared(&self.shared);
+                remove_indexed(&mut g.profile.wheels, i)
+            };
+            if !removed {
+                self.log("该轮盘已不在当前组合里(组合刚被切换),未删除");
+            } else {
+                if self.resizing == Some(ResizeTarget::Wheel(i)) {
+                    self.resizing = None;
+                }
+                self.log("已删除轮盘");
             }
-            self.log("已删除轮盘");
         }
         if ui.button("新增轮盘").clicked() {
             self.push_undo();
@@ -6752,13 +7308,13 @@ impl PadApp {
             // 也不该叠在别的摇杆上让人分不清
             let m = self.mapper();
             let (cx, cy) = {
-                let g = self.shared.lock().unwrap();
+                let g = lock_shared(&self.shared);
                 crate::keymap::next_wheel_spot(&g.profile.wheels)
             };
             let wheel = Wheel::new_default(&m, cx, cy);
             let r_px = m.len(wheel.radius);
             let n = {
-                let mut g = self.shared.lock().unwrap();
+                let mut g = lock_shared(&self.shared);
                 g.profile.wheels.push(wheel);
                 g.profile.wheels.len()
             };
@@ -6778,13 +7334,13 @@ impl PadApp {
         self.scroll_to_new = true;
         let m = self.mapper();
         let (cx, cy) = {
-            let g = self.shared.lock().unwrap();
+            let g = lock_shared(&self.shared);
             crate::keymap::next_wheel_spot(&g.profile.wheels)
         };
         let wheel = Wheel::new_default(&m, cx, cy);
         let r_px = m.len(wheel.radius);
         let n = {
-            let mut g = self.shared.lock().unwrap();
+            let mut g = lock_shared(&self.shared);
             g.profile.wheels.push(wheel);
             g.profile.wheels.len()
         };
@@ -6806,7 +7362,7 @@ impl PadApp {
         // 坐标换算器必须**先**构造好(它内部会加配置锁);
         // 若先拿到配置锁再调 self.mapper() 会自锁,界面会直接卡死。
         let m = self.mapper();
-        let g = self.shared.lock().unwrap();
+        let g = lock_shared(&self.shared);
         let th = g.profile.look.theme();
         // 键位浮层的显示亮度档位(0=默认;负=加深,正=变浅)。
         // 手动微调档位;每个标注的实际档位还要叠上"按截图采样的自动对比"
@@ -7292,7 +7848,7 @@ impl PadApp {
         // 读取当前曲线
         let mut easing = match target {
             EasingEditTarget::Bind(i) => {
-                let g = self.shared.lock().unwrap();
+                let g = lock_shared(&self.shared);
                 match g.profile.binds.get(i).map(|b| &b.action) {
                     Some(Action::Swipe(s)) => s.easing,
                     _ => {
@@ -7302,7 +7858,7 @@ impl PadApp {
                 }
             }
             EasingEditTarget::Combo(i) => {
-                let g = self.shared.lock().unwrap();
+                let g = lock_shared(&self.shared);
                 match g.profile.combos.get(i).map(|c| &c.action) {
                     Some(Action::Swipe(s)) => s.easing,
                     _ => {
@@ -7362,7 +7918,7 @@ impl PadApp {
             return;
         }
         if changed {
-            let mut g = self.shared.lock().unwrap();
+            let mut g = lock_shared(&self.shared);
             // 编辑刚开始那一帧:写回之前的配置就是撤销点
             let before = if undo_point {
                 Some(g.profile.clone())
@@ -7496,7 +8052,7 @@ impl PadApp {
                 return Some((*w, *h));
             }
         }
-        let g = self.shared.lock().unwrap();
+        let g = lock_shared(&self.shared);
         if let Some(c) = g.control.as_ref() {
             if c.screen_w > 0 && c.screen_h > 0 {
                 return Some((c.screen_w, c.screen_h));
@@ -7508,11 +8064,38 @@ impl PadApp {
     /// **注入**用的坐标空间(引擎实际使用的那个):控制通道的尺寸。
     /// 仅用于界面提示 —— 截图与它不一致时,取点会不准。
     fn inject_space(&self) -> Option<(u32, u32)> {
-        let g = self.shared.lock().unwrap();
+        let g = lock_shared(&self.shared);
         g.control
             .as_ref()
             .map(|c| (c.screen_w, c.screen_h))
             .filter(|(w, h)| *w > 0 && *h > 0)
+    }
+
+    /// W2-2 坐标空间守卫:截图与注入空间的纵横比不一致时返回证据。
+    /// 每帧现算,没有需要清理的状态 —— 两空间一对齐(重新截图/重查尺寸)自动恢复。
+    fn space_guard(&self) -> Option<SpaceMismatch> {
+        let (_, w, h) = self.shot.as_ref()?;
+        space_mismatch((*w, *h), self.inject_space()?)
+    }
+
+    /// W2-2 一键对齐:以当前截图空间为准 —— 注入坐标空间(含协议声明尺寸)
+    /// 与配置里记录的"设计尺寸"都重设为截图尺寸。
+    ///
+    /// 适用场景:截图是刚拍的、屏幕确实转了,而控制通道还停在旧方向。
+    /// 截图本身是旧的(视频流没跟上)时该用[重新查询屏幕尺寸]或重新截图,
+    /// 面板提示里已写明这两条路的区别。
+    fn adopt_shot_space(&mut self, m: SpaceMismatch) {
+        let (sw, sh) = m.shot;
+        self.sync_display_space(sw, sh);
+        {
+            let mut g = lock_shared(&self.shared);
+            if g.profile.format_version >= crate::keymap::PROFILE_VERSION {
+                g.profile.screen = Some((sw, sh));
+            }
+        }
+        self.log(format!(
+            "已按截图对齐坐标空间: 注入与设计尺寸 → {sw}x{sh}(可重新[截取手机屏幕]复核)"
+        ));
     }
 
     /// 坐标换算器:配置坐标(相对值) <-> 当前屏幕像素。
@@ -7520,16 +8103,16 @@ impl PadApp {
     ///
     /// 内部会加配置锁,调用方**不要**在已持有配置锁时调用它(会自锁)。
     fn mapper(&self) -> Mapper {
-        let unit = self.shared.lock().unwrap().profile.coord_unit();
+        let unit = lock_shared(&self.shared).profile.coord_unit();
         Mapper::new(unit, self.screen_size().unwrap_or((1080, 2400)))
     }
 
     /// 当前主题的语义色(界面里一律用它,不写死颜色)
     fn theme(&self) -> Theme {
-        self.shared.lock().unwrap().profile.look.theme()
+        lock_shared(&self.shared).profile.look.theme()
     }
 
-    /// 当前界面风格(默认/鸿蒙/可视化)。布局分支一律经它判断。
+    /// 当前界面风格(默认/可视化)。页面内容分支一律经它判断。
     /// 读的是 `self.style`(界面级),不是 `profile.look.style`:后者会被
     /// "切换按键组合"整体替换掉(见 `stamp_style`)。
     fn ui_style(&self) -> theme::UiStyle {
@@ -7544,7 +8127,7 @@ impl PadApp {
     /// 风格是界面级设置,只能由界面侧持有并在换组合后重新盖上。
     fn stamp_style(&mut self) {
         let style = self.style;
-        let mut g = self.shared.lock().unwrap();
+        let mut g = lock_shared(&self.shared);
         if g.profile.look.style != style {
             g.profile.look.style = style;
         }
@@ -7555,7 +8138,7 @@ impl PadApp {
     fn request_style_restart(&mut self, ctx: &egui::Context, new_style: theme::UiStyle) {
         self.style = new_style;
         {
-            let mut g = self.shared.lock().unwrap();
+            let mut g = lock_shared(&self.shared);
             g.profile.look.style = new_style;
             let look = g.profile.look.clone();
             drop(g);
@@ -7571,7 +8154,7 @@ impl PadApp {
 
     /// 当前外观设置
     fn look(&self) -> theme::Look {
-        self.shared.lock().unwrap().profile.look.clone()
+        lock_shared(&self.shared).profile.look.clone()
     }
 
     /// 新草稿:按当前屏幕尺寸初始化预览位置与半径(草稿坐标是像素)
@@ -7590,7 +8173,7 @@ impl PadApp {
         let Some(space) = self.screen_size() else {
             return;
         };
-        let mut g = self.shared.lock().unwrap();
+        let mut g = lock_shared(&self.shared);
         if g.profile.format_version >= crate::keymap::PROFILE_VERSION {
             g.profile.screen = Some(space);
         }
@@ -7601,16 +8184,13 @@ impl PadApp {
     /// 只校正坐标空间,**绝不改动已取好的锚点**:手机临时切到别的方向
     /// (例如横屏配好后弹了一下竖屏、再切回来)必须原样可用。
     /// 锚点暂时超出当前空间时,由注入前的钳制兜底,并在界面上给出提示即可。
-    ///
-    /// 顺带把旧格式(v1,像素坐标)升级为相对坐标:**只改单位,不改任何坐标的实际含义**。
     fn sync_display_space(&mut self, w: u32, h: u32) {
         if w == 0 || h == 0 {
             return;
         }
         let mut changed = false;
-        let upgraded;
         {
-            let mut g = self.shared.lock().unwrap();
+            let mut g = lock_shared(&self.shared);
             if let Some(c) = g.control.as_mut() {
                 if (c.screen_w, c.screen_h) != (w, h) {
                     // 走 set_screen:它会同时更新写线程用的原子量。
@@ -7619,20 +8199,14 @@ impl PadApp {
                     changed = true;
                 }
             }
-            upgraded = crate::keymap::upgrade_profile(&mut g.profile, (w, h));
         }
         if changed {
             self.log(format!("触摸坐标空间已更新为 {w}x{h}"));
         }
-        if upgraded {
-            self.log(format!(
-                "配置已升级为相对坐标(按 {w}x{h} 换算),换分辨率/换手机后键位不再错位"
-            ));
-        }
     }
 
     /// 配置区(保存/另存为/选用/新建/默认/检测/保存日志)。
-    /// 默认与可视化风格放在左栏;鸿蒙风格放在"按键映射"页的卡片里 —— 两条布局共用这一份。
+    /// 默认与可视化风格共用这一份(放在左栏)。
     fn ui_profile_config(&mut self, ui: &mut egui::Ui) {
         ui.heading("配置");
         ui.horizontal(|ui| {
@@ -7707,7 +8281,7 @@ impl PadApp {
     }
 
     /// scrcpy 三件套的定位与管理(目录/自动寻找/测试/记住路径/打开配置目录)。
-    /// 默认与可视化风格放在左栏;鸿蒙风格放在"连接与设备"页的卡片里。
+    /// 默认与可视化风格共用这一份(放在左栏)。
     fn ui_scrcpy_manage(&mut self, ui: &mut egui::Ui) {
         ui.heading("scrcpy 管理");
         ui.small(
@@ -7847,26 +8421,33 @@ impl PadApp {
         ui.small(format!("server 版本: {ver_txt}"));
     }
 
-    /// 总开关键 + [映射时屏蔽原键] 勾选(默认/可视化风格在左栏中段;鸿蒙在"连接与设备"页)
+    /// 总开关键 + [映射时屏蔽原键] 勾选(默认/可视化风格共用,放在左栏中段)。
+    /// 复选框只有 Linux 有实际语义(EVIOCGRAB 独占 /dev/input),Windows 上
+    /// 隐藏并留一行说明(2026-10-07 V1-2 ③ 决策:死 UI 不留)。
     fn ui_toggle_key_row(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("总开关键:");
-            let tk = { self.shared.lock().unwrap().profile.toggle_key };
+            let tk = { lock_shared(&self.shared).profile.toggle_key };
             let waiting = self.waiting_key == Some(KeySlot::Toggle);
             if Self::key_button(ui, waiting, Some(tk)).clicked() {
                 self.waiting_key = Some(KeySlot::Toggle);
             }
         });
+        #[cfg(not(windows))]
         ui.checkbox(
             &mut self.grab_enabled,
             "映射时屏蔽原键(grab)\n注意:开启后映射期间键盘只对本程序生效",
         );
+        // Windows 走全局钩子(拦截后不转发),没有"独占设备"这一档 ——
+        // 勾选不产生任何效果,所以这里只说明去处。
+        #[cfg(windows)]
+        ui.small("映射时屏蔽原键(grab)仅 Linux 可用(EVIOCGRAB 独占设备);Windows 无需该项。");
     }
 
     /// 引擎运行状态一行(触点占用 / 因池满被放弃)。
-    /// 默认/可视化风格在左栏中段;鸿蒙在"连接与设备"页与底部状态栏。
+    /// 默认/可视化风格共用(放在左栏中段)。
     fn ui_engine_status(&mut self, ui: &mut egui::Ui) {
-        let g = self.shared.lock().unwrap();
+        let g = lock_shared(&self.shared);
         let st = g.live;
         let th = g.profile.look.theme();
         let max = crate::engine::DEVICE_MAX_POINTERS;
@@ -7898,9 +8479,54 @@ impl PadApp {
              若『被放弃』不为 0,说明某一刻同时按住的键比设备能接的还多 ——\n\
              那一次按下会被设备直接丢掉(表现为『按了没反应』),日志里也会记。",
         );
+
+        // 捕获层健康:钩子回调耗时 p99 超过预警线时把原因摆出来。
+        // 系统对低级钩子有 300ms 超时线,越接近它越可能丢事件 ——
+        // 这条平时不出现,出现时一定是真出过毛刺(最近一轮 5 秒汇总)。
+        if self.hook_lag_flag.load(Ordering::Relaxed) {
+            ui.colored_label(
+                th.danger,
+                "⚠ 捕获层延迟异常:按键回调耗时超标,可能丢事件(详见运行日志)",
+            )
+            .on_hover_text(
+                "Windows 对底层按键回调有 300ms 的超时线:回调太慢时系统会静默\n\
+                 丢弃事件,严重时直接摘掉整个钩子(表现为按键突然全部失灵)。\n\
+                 最近一轮统计里回调 p99 超过 5ms 就会亮这条警示。\n\
+                 常见原因:CPU 被占满、安全软件也挂了同类钩子。",
+            );
+        }
+
+        // 捕获层心跳(W1-4):过去"钩子被系统静默摘除"的表现是按键突然全部
+        // 失灵,没有任何提示、只能重启程序;现在心跳会发现并就地重装。
+        // 状态 2 会在自愈后 dwell 展示几秒(事件型,不是持续状态)。
+        match self.hb_flag.load(Ordering::Relaxed) {
+            1 => {
+                ui.colored_label(
+                    th.danger,
+                    "⚠ 捕获层心跳中断:钩子线程无响应,事件可能正在丢失(详见运行日志)",
+                )
+                .on_hover_text(
+                    "低级钩子的回调跑在捕获线程自己的消息循环里:那里一旦卡住,\n\
+                     系统会先丢事件、再静默摘掉整个钩子。3 秒没有心跳就会亮这条。\n\
+                     常见原因:CPU 被占满、安全软件的钩子拖慢整个钩子链。",
+                );
+            }
+            2 => {
+                ui.colored_label(
+                    th.warn,
+                    "⚠ 捕获层钩子曾失效:已自动重装恢复(期间可能丢过事件)",
+                )
+                .on_hover_text(
+                    "Windows 会静默摘除超时的低级钩子,不通知程序 —— 以前的表现\n\
+                     是按键突然全部失灵,只能重启。心跳探针发现无回音后已就地重装。\n\
+                     若这条反复出现,检查安全软件,或把本程序设为管理员运行。",
+                );
+            }
+            _ => {}
+        }
     }
 
-    /// 运行日志列表(默认/可视化风格在左栏底部;鸿蒙在"诊断"页)
+    /// 运行日志列表(默认/可视化风格共用,放在左栏底部)
     fn ui_log_list(&self, ui: &mut egui::Ui, max_h: f32) {
         egui::ScrollArea::vertical()
             .id_salt("log_list")
@@ -7947,7 +8573,7 @@ impl PadApp {
 
     // ==================== 顶栏动作(两个布局共用) ====================
     //
-    // 默认/可视化风格的顶栏与鸿蒙风格的顶栏都调用这几个方法,
+    // 顶栏调用这几个方法,
     // 保证"按一下做同一件事"只有一份实现(与 ui_bind_row 的纪律一致)。
 
     /// [刷新设备]:重新定位三件套并刷新设备列表
@@ -7960,7 +8586,17 @@ impl PadApp {
     fn act_launch_scrcpy(&mut self) {
         // 启动前联动一次:确保 server/adb 路径已就绪(如已手动粘贴 scrcpy 路径)
         self.resync();
-        let launch_args = self.prepare_scrcpy_args();
+        let mut launch_args = self.prepare_scrcpy_args();
+        // 显示真实投屏帧率(2026-10-06 反馈):scrcpy 的 FPS 计数器每秒把
+        // 实况帧率打到 stdout(见 adb::parse_scrcpy_fps),"显示帧率"里的
+        // "投屏帧率"一行就是它。用户参数里已有 --print-fps 则尊重用户,不重复加。
+        if !launch_args.split_whitespace().any(|a| a == "--print-fps") {
+            if !launch_args.trim().is_empty() {
+                launch_args.push(' ');
+            }
+            launch_args.push_str("--print-fps");
+        }
+        self.stream_fps = None; // 旧进程的读数作废,等新进程的第一行
         self.log(format!("scrcpy 启动参数: {launch_args}"));
         match adb::launch_scrcpy(&self.scrcpy_path, &self.serial(), &launch_args) {
             Ok(rx) => {
@@ -7977,7 +8613,7 @@ impl PadApp {
     /// 否则手机上会"卡键" —— 这里只置请求位,由引擎在下一轮(≤4ms)执行。
     fn act_toggle_mapping(&mut self) {
         let now = {
-            let mut g = self.shared.lock().unwrap();
+            let mut g = lock_shared(&self.shared);
             g.enabled = !g.enabled;
             if !g.enabled {
                 g.toolbar_release = true;
@@ -7992,7 +8628,7 @@ impl PadApp {
     }
 
     /// scrcpy 启动参数行(参数框 + 助手 + 启动预设 + [启动 scrcpy])。
-    /// 默认/可视化风格在顶栏;鸿蒙风格在"连接与设备"页的卡片里 —— 共用这一份。
+    /// 放在顶栏(默认/可视化风格共用这一份)。
     fn ui_scrcpy_launch_row(&mut self, ui: &mut egui::Ui) {
         ui.label("scrcpy参数:");
         if ui
@@ -8031,396 +8667,19 @@ impl PadApp {
         }
     }
 
-    // ==================== 鸿蒙风格:照 harmonyos-pc(HDC UI)重新设计的界面 ====================
-    //
-    // 这不是"默认界面换个底色":整张界面的**骨架重新排过** ——
-    //   ┌ 顶栏(白底 + 细线): ● scrcpy-pad [设备▼] [状态 pill] … [使用说明][刷新设备][连接/断开][保存配置] ┐
-    //   ├ 左侧导航(图标+文字,选中淡蓝底) ┬ 中央:卡片页(浅灰底) ┬ 右侧:屏幕预览(截图取点) ┤
-    //   └ 底部状态栏:最新一条日志 ………… [引擎: 触点 n/10]                                  ┘
-    // 每个页面的内容都调用与默认风格**同一份**实现(ui_profile_config / ui_scrcpy_manage /
-    // ui_binds / ui_wheels / ui_aim / ui_look / ui_diagnostics …),所以不存在"鸿蒙少了某个功能"。
-
-    fn layout_harmony(
-        &mut self,
-        ui: &mut egui::Ui,
-        connected: bool,
-        enabled: bool,
-        mouse_captured: bool,
-    ) {
-        let line = egui::Stroke::new(1.0, theme::harmony::LINE);
-        let panel = |ui: &egui::Ui, inner: egui::Margin| {
-            egui::Frame::default()
-                .fill(ui.visuals().window_fill)
-                .inner_margin(inner)
-                .stroke(line)
-        };
-        // ---- 顶栏 ----
-        egui::Panel::top("h_top")
-            .frame(panel(ui, egui::Margin::symmetric(16, 10)))
-            .show(ui, |ui| self.h_top_bar(ui, connected, enabled));
-        // ---- 底部状态栏(最新一条日志 + 引擎状态) ----
-        egui::Panel::bottom("h_status")
-            .frame(panel(ui, egui::Margin::symmetric(14, 7)))
-            .show(ui, |ui| self.h_status_bar(ui));
-        // ---- 左侧导航 ----
-        egui::Panel::left("h_nav")
-            .resizable(false)
-            .default_size(196.0)
-            .frame(panel(ui, egui::Margin::symmetric(12, 16)))
-            .show(ui, |ui| self.h_nav(ui));
-        // ---- 右侧:屏幕预览(= 截图取点,原样复用) ----
-        egui::Panel::right("h_preview")
-            .resizable(true)
-            .default_size(430.0)
-            .min_size(300.0)
-            .frame(panel(ui, egui::Margin::same(16)))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("屏幕预览");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if let Some((_, w, h)) = &self.shot {
-                            ui.small(format!("{w} × {h}"));
-                        }
-                    });
-                });
-                egui::ScrollArea::both()
-                    .id_salt("h_preview_scroll")
-                    .show(ui, |ui| self.ui_picker_body(ui));
-            });
-        // ---- 中央:当前导航页(卡片) ----
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::default()
-                    .fill(ui.visuals().panel_fill)
-                    .inner_margin(egui::Margin::same(16)),
-            )
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("h_page_scroll")
-                    .show(ui, |ui| self.h_page_body(ui, mouse_captured));
-            });
-    }
-
-    /// 鸿蒙风格顶栏:标题 + 设备 + 状态 pill + 主操作按钮
-    fn h_top_bar(&mut self, ui: &mut egui::Ui, connected: bool, enabled: bool) {
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("●")
-                    .size(18.0)
-                    .color(theme::harmony::PRIMARY),
-            );
-            ui.heading(
-                egui::RichText::new("scrcpy-pad")
-                    .strong()
-                    .color(theme::harmony::TEXT),
-            );
-            ui.label(egui::RichText::new("触控映射").color(theme::harmony::MUTED));
-            ui.separator();
-            let cur = self.serial();
-            egui::ComboBox::from_id_salt("h_dev")
-                .selected_text(if cur.is_empty() {
-                    "无设备".to_string()
-                } else {
-                    cur
-                })
-                .show_ui(ui, |ui| {
-                    for (i, d) in self.devices.iter().enumerate() {
-                        ui.selectable_value(&mut self.selected, i, d);
-                    }
-                });
-            Self::h_pill(
-                ui,
-                if connected {
-                    "控制已连接"
-                } else {
-                    "未连接"
-                },
-                if connected {
-                    theme::harmony::OK
-                } else {
-                    theme::harmony::DANGER
-                },
-            );
-            let tk = self.shared.lock().unwrap().profile.toggle_key;
-            let tkn = key_name(tk).replace("KEY_", "");
-            Self::h_pill(
-                ui,
-                &format!("映射 {} ({tkn})", if enabled { "开" } else { "关" }),
-                if enabled {
-                    theme::harmony::OK
-                } else {
-                    theme::harmony::MUTED
-                },
-            );
-            // 右侧:主操作(照 HDC UI —— 右侧放实心蓝按钮)
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if Self::h_primary_button(ui, "保存配置").clicked() {
-                    self.save_profile();
-                }
-                if let Some(label) = self.pending_task_label() {
-                    if ui
-                        .add(
-                            egui::Button::new(format!("取消{label}"))
-                                .fill(theme::harmony::DANGER.gamma_multiply(0.25))
-                                .stroke(egui::Stroke::new(
-                                    1.0,
-                                    theme::with_alpha(theme::harmony::DANGER, 190),
-                                )),
-                        )
-                        .clicked()
-                    {
-                        self.cancel_pending_tasks();
-                    }
-                }
-                if connected {
-                    if ui.button("断开").clicked() {
-                        self.disconnect();
-                    }
-                } else if self.connect_rx.is_some() {
-                    ui.label("连接中...");
-                } else if ui.button("连接控制").clicked() {
-                    self.connect_control();
-                }
-                if ui.button("刷新设备").clicked() {
-                    self.act_refresh_devices();
-                }
-                if ui.button("使用说明").clicked() {
-                    self.help_open = true;
-                }
-            });
-        });
-    }
-
-    /// 鸿蒙风格左侧导航:图标 + 文字;选中项淡蓝底 + 蓝字(照 HDC UI)
-    fn h_nav(&mut self, ui: &mut egui::Ui) {
-        for page in HPage::ALL {
-            let (icon, title) = page.icon_title();
-            let selected = self.h_page == page;
-            let (rect, resp) = ui
-                .allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::click());
-            let painter = ui.painter();
-            if selected || resp.hovered() {
-                let fill = if selected {
-                    theme::with_alpha(theme::harmony::PRIMARY, 30)
-                } else {
-                    theme::with_alpha(theme::harmony::PRIMARY, 14)
-                };
-                painter.rect_filled(rect, egui::CornerRadius::same(8), fill);
-            }
-            let fg = if selected {
-                theme::harmony::PRIMARY
-            } else {
-                theme::harmony::TEXT
-            };
-            painter.text(
-                rect.left_center() + egui::vec2(10.0, 0.0),
-                egui::Align2::LEFT_CENTER,
-                format!("{icon}  {title}"),
-                egui::FontId::proportional(15.0),
-                fg,
-            );
-            if resp.clicked() {
-                self.h_page = page;
-            }
-        }
-        // 底部:次要操作(撤销/重做/关于)—— 顶栏只放主操作,避免溢出窗口宽度
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            ui.horizontal(|ui| {
-                if ui.small_button("关于").clicked() {
-                    self.about_open = true;
-                }
-                if ui.small_button("重做").clicked() {
-                    self.redo();
-                }
-                if ui.small_button("撤销").clicked() {
-                    self.undo();
-                }
-            });
-        });
-    }
-
-    /// 鸿蒙风格底部状态栏:最新一条日志(左) + 引擎状态(右)
-    fn h_status_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let last = self.logs.back().cloned().unwrap_or_default();
-            ui.label(
-                egui::RichText::new(last)
-                    .size(12.0)
-                    .color(theme::harmony::MUTED),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                self.ui_engine_status(ui);
-            });
-        });
-    }
-
-    /// 鸿蒙风格中央页:按左侧导航分发到各卡片
-    fn h_page_body(&mut self, ui: &mut egui::Ui, mouse_captured: bool) {
-        match self.h_page {
-            HPage::Connect => {
-                let (connected, _) = {
-                    let g = self.shared.lock().unwrap();
-                    (
-                        g.control
-                            .as_ref()
-                            .map(|c| c.is_connected())
-                            .unwrap_or(false),
-                        g.enabled,
-                    )
-                };
-                let th = self.theme();
-                Self::harmony_card(ui, "设备连接", |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.button("刷新设备").clicked() {
-                            self.act_refresh_devices();
-                        }
-                        let cur = self.serial();
-                        egui::ComboBox::from_id_salt("h_page_dev")
-                            .selected_text(if cur.is_empty() {
-                                "无设备".to_string()
-                            } else {
-                                cur
-                            })
-                            .show_ui(ui, |ui| {
-                                for (i, d) in self.devices.iter().enumerate() {
-                                    ui.selectable_value(&mut self.selected, i, d);
-                                }
-                            });
-                        if connected {
-                            Self::h_pill(ui, "控制已连接", theme::harmony::OK);
-                            if ui.button("断开").clicked() {
-                                self.disconnect();
-                            }
-                        } else if self.connect_rx.is_some() {
-                            ui.label("连接中...");
-                        } else if Self::h_primary_button(ui, "连接控制").clicked() {
-                            self.connect_control();
-                        }
-                    });
-                    if self.devices.is_empty() {
-                        ui.small(
-                            egui::RichText::new("未发现设备:请连接手机并打开 USB 调试")
-                                .color(theme::harmony::MUTED),
-                        );
-                    }
-                });
-                Self::harmony_card(ui, "scrcpy 画面", |ui| {
-                    ui.horizontal(|ui| self.ui_scrcpy_launch_row(ui));
-                    ui.small(
-                        egui::RichText::new(
-                            "画面由 scrcpy 本体窗口显示,与本程序互不干扰;启动后点右侧[截取手机屏幕]取画面。",
-                        )
-                        .color(theme::harmony::MUTED),
-                    );
-                });
-                Self::harmony_card(ui, "映射运行时", |ui| {
-                    self.ui_toggle_key_row(ui);
-                    ui.horizontal(|ui| {
-                        let (enabled, tk) = {
-                            let g = self.shared.lock().unwrap();
-                            (g.enabled, g.profile.toggle_key)
-                        };
-                        let tkn = key_name(tk).replace("KEY_", "");
-                        let txt = if enabled {
-                            format!("映射已开启 ({tkn})")
-                        } else {
-                            format!("开启并开始映射 ({tkn})")
-                        };
-                        let btn = egui::Button::new(egui::RichText::new(txt).color(if enabled {
-                            theme::harmony::TEXT
-                        } else {
-                            egui::Color32::WHITE
-                        }))
-                        .fill(if enabled {
-                            theme::harmony::BTN
-                        } else {
-                            theme::harmony::PRIMARY
-                        })
-                        .stroke(egui::Stroke::NONE);
-                        if ui.add(btn).clicked() {
-                            self.act_toggle_mapping();
-                        }
-                        ui.small(
-                            egui::RichText::new("默认 F8 开关;FPS 模式有独立开关")
-                                .color(theme::harmony::MUTED),
-                        );
-                    });
-                    let _ = th;
-                    self.ui_engine_status(ui);
-                });
-                Self::harmony_card(ui, "scrcpy 管理", |ui| self.ui_scrcpy_manage(ui));
-            }
-            HPage::Macro => Self::harmony_card(ui, "宏", |ui| self.ui_macro_page(ui)),
-            HPage::Keys => {
-                Self::harmony_card(ui, "配置", |ui| self.ui_profile_config(ui));
-                Self::harmony_card(ui, "按键映射", |ui| self.ui_binds(ui));
-                Self::harmony_card(ui, "按键组合 / 切换键位", |ui| self.ui_schemes(ui));
-            }
-            HPage::Wheels => Self::harmony_card(ui, "虚拟轮盘", |ui| self.ui_wheels(ui)),
-            HPage::Fps => {
-                Self::harmony_card(ui, "鼠标瞄准", |ui| self.ui_aim(ui, mouse_captured))
-            }
-            HPage::Look => Self::harmony_card(ui, "外观", |ui| self.ui_look(ui)),
-            HPage::Diag => {
-                Self::harmony_card(ui, "诊断", |ui| self.ui_diagnostics(ui));
-                let h = ui.available_height().max(180.0);
-                Self::harmony_card(ui, "运行日志", |ui| self.ui_log_card(ui, h));
-            }
-        }
-    }
-
-    /// 鸿蒙风格的卡片:白底 + 细描边 + 14px 圆角 + 标题(照 HDC UI 的 card())
-    fn harmony_card(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-        egui::Frame::default()
-            .fill(ui.visuals().window_fill)
-            .stroke(egui::Stroke::new(1.0, theme::harmony::LINE))
-            .corner_radius(egui::CornerRadius::same(theme::harmony::CARD_ROUND as u8))
-            .inner_margin(egui::Margin::same(16))
-            .outer_margin(egui::Margin::symmetric(0, 7))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(
-                    egui::RichText::new(title)
-                        .size(17.0)
-                        .strong()
-                        .color(theme::harmony::TEXT),
-                );
-                ui.add_space(8.0);
-                add(ui);
-            });
-    }
-
-    /// 鸿蒙风格的状态 pill(淡色底 + 同色文字,照 HDC UI)
-    fn h_pill(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
-        egui::Frame::default()
-            .fill(theme::with_alpha(color, 34))
-            .corner_radius(egui::CornerRadius::same(20))
-            .inner_margin(egui::Margin::symmetric(10, 4))
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new(text).size(12.0).color(color));
-            });
-    }
-
-    /// 鸿蒙风格的实心主按钮(蓝底白字)
-    fn h_primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-        ui.add(
-            egui::Button::new(egui::RichText::new(text).color(egui::Color32::WHITE))
-                .fill(theme::harmony::PRIMARY)
-                .stroke(egui::Stroke::NONE),
-        )
-    }
-
     /// 外观设置面板:风格 / 配色 / 控件密度 / 背景图(改动可撤销,随配置保存)
     fn ui_look(&mut self, ui: &mut egui::Ui) {
         let mut pick_bg = false;
         let mut edit = false;
         let mut style_restart: Option<theme::UiStyle> = None;
-        let before = self.shared.lock().unwrap().profile.clone();
+        // 撤销快照的"改动前"只需要本页会改的那一份(`Look`,~17ns/帧);
+        // 整份配置(~5µs/帧,见 W2-3 度量)推迟到真的改了东西那一刻再组装。
+        let look_before = lock_shared(&self.shared).profile.look.clone();
         {
-            let mut g = self.shared.lock().unwrap();
+            let mut g = lock_shared(&self.shared);
             let look = &mut g.profile.look;
 
-            // ---- 界面风格(默认/鸿蒙/可视化) ----
+            // ---- 界面风格(默认/可视化) ----
             // 风格牵动整体布局,选择后需要关闭再重开窗口(见 request_style_restart)。
             // 不能像配色那样热应用,所以这里不进撤销栈(edit 不置位),直接走重启。
             // 注意:选中的值先落在一个临时变量里,由 request_style_restart 统一改
@@ -8571,6 +8830,11 @@ impl PadApp {
             self.dialog_purpose = DialogPurpose::PickBackground;
         }
         if edit {
+            // 组装"改动前"的整份配置:除 `look` 用上面那份旧的,其余字段取当前值。
+            // 本页不会动其余字段,所以这与"进页时整份克隆"等价;若同一帧里别处
+            // 也改了配置,那些改动会保留 —— 撤销只回退外观,这正是想要的粒度。
+            let mut before = lock_shared(&self.shared).profile.clone();
+            before.look = look_before;
             self.push_undo_snapshot(before);
         }
         if let Some(s) = style_restart {
@@ -8682,12 +8946,9 @@ impl PadApp {
         }
         self.look_saved = Some(look.clone());
         let path = look_cache_path();
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
         let res = serde_json::to_string_pretty(look)
             .map_err(|e| e.to_string())
-            .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()));
+            .and_then(|text| write_atomic(&path, &text).map_err(|e| e.to_string()));
         if let Err(e) = res {
             if !self.look_cache_warned {
                 self.look_cache_warned = true;
@@ -8717,18 +8978,17 @@ impl PadApp {
         });
     }
 
-    /// 鼠标瞄准(FPS / 开放世界)。内容**直接展开**(不再套"（开发中）"折叠栏 ——
+    /// 鼠标瞄准(FPS / 开放世界)。内容**直接展开**(不再套折叠栏 ——
     /// 用户明确要求把它放出来,少一层点击)。
     fn ui_aim(&mut self, ui: &mut egui::Ui, captured: bool) {
         ui.heading("鼠标瞄准（FPS / 开放世界）");
-        ui.small("注意：本功能处于开发阶段，实际应用效果可能与描述有出入。");
         self.ui_aim_body(ui, captured);
     }
 
     fn ui_aim_body(&mut self, ui: &mut egui::Ui, captured: bool) {
         let th = self.theme();
         let gamepad_mode = {
-            let mode = self.shared.lock().unwrap().profile.aim.input_mode;
+            let mode = lock_shared(&self.shared).profile.aim.input_mode;
             matches!(
                 mode,
                 ViewInputMode::VirtualGamepadContinuous | ViewInputMode::VirtualGamepadSegmented
@@ -8740,12 +9000,12 @@ impl PadApp {
         } else {
             ui.label("把鼠标的相对位移映射成手机上的手指拖动。FPS 模式用于开镜/射击；开放世界模式用于无需射击的无限水平转向。");
             ui.label("锚点默认不设置。锚点不是游戏准星，而是虚拟手指落下的起点；应放在游戏 UI 之外的干净区域。");
-            ui.label("用法:先开启总映射，再到“瞄准锚点（开发中）”取点，按视角模式开关键进入。");
+            ui.label("用法:先开启总映射，再到“瞄准锚点”取点，按视角模式开关键进入。");
         }
 
         // —— 生效条件自检:直接告诉用户"现在为什么没反应" ——
         let (mapping_enabled, aim_on, anchor_ok, hold_key, connected, space, live) = {
-            let g = self.shared.lock().unwrap();
+            let g = lock_shared(&self.shared);
             let a = &g.profile.aim;
             (
                 g.enabled,
@@ -8763,7 +9023,7 @@ impl PadApp {
         // 锚点在当前坐标空间之外(例如取点后转过屏)——注入会被系统丢弃
         let anchor_outside = match space {
             Some((w, h)) => {
-                let g = self.shared.lock().unwrap();
+                let g = lock_shared(&self.shared);
                 let a = &g.profile.aim;
                 let (ax, ay) = g.profile.mapper((w, h)).point(a.anchor_x, a.anchor_y);
                 a.anchor_set() && (ax < 0 || ay < 0 || ax as u32 >= w || ay as u32 >= h)
@@ -8864,17 +9124,22 @@ impl PadApp {
         let mut pick_hold_key = false;
         let mut pick_toggle_key = false;
         let mut pick_suspend_key = false;
+        let mut pick_recoil_key = false;
         let mut toggled = false;
         // 本帧修改前的快照:面板里任何一处改动都记一次撤销。
         // 连续拖动的数值控件只在"开始编辑"那一帧记录,避免每帧都产生一个撤销步。
-        let undo_before: Option<Profile>;
+        // 快照只要本页会改的那一份(`Aim`),整份配置推迟到真的改了再组装(W2-3)。
+        let undo_before_aim: Aim;
         let mut undo_needed = false;
         // 锚点以像素显示(存储是相对值)
         let am = self.mapper();
 
         {
-            let mut g = self.shared.lock().unwrap();
-            undo_before = Some(g.profile.clone());
+            let mut g = lock_shared(&self.shared);
+            undo_before_aim = g.profile.aim.clone();
+            // 压枪(V2-1)小节要读 aim_live 的运行态(是否生效/当前档),
+            // 在 `aim` 的可变借用建立之前先拷一份(AimLive 是 Copy)。
+            let recoil_live = g.aim_live;
             let aim = &mut g.profile.aim;
 
             if ui.checkbox(&mut aim.enabled, "启用鼠标视角").changed() {
@@ -8948,7 +9213,7 @@ impl PadApp {
 
             if !gamepad_mode {
                 ui.separator();
-                ui.heading("瞄准锚点（开发中）");
+                ui.heading("瞄准锚点");
                 ui.small("锚点是鼠标拖动映射到手机屏幕时，虚拟手指的起点；不是游戏准星。请取在游戏 UI 之外的干净区域。默认不自动设置，未设置时 FPS 模式不会真正落下拖动触点。");
                 ui.horizontal(|ui| {
                     ui.label("锚点:");
@@ -8981,7 +9246,7 @@ impl PadApp {
                         undo_needed = true;
                     }
                     if ui
-                        .checkbox(&mut aim.boundary, "限制在屏幕边界内（开发中）")
+                        .checkbox(&mut aim.boundary, "限制在屏幕边界内")
                         .on_hover_text("关闭后，累计偏移到达回转半径会无缝抬指/重按并保留余量；适合配合指针消隐做无限转向。")
                         .changed()
                     {
@@ -9024,6 +9289,33 @@ impl PadApp {
                     undo_needed = true;
                 }
                 if ui.checkbox(&mut aim.invert_y, "反转 Y").changed() {
+                    undo_needed = true;
+                }
+            });
+
+            ui.horizontal(|ui| {
+                if ui
+                    .checkbox(&mut aim.wheel_zoom, "滚轮缩放(双指捏合)")
+                    .on_hover_text(
+                        "仅 FPS 模式生效：上滚 = 两指张开(放大)，下滚 = 两指捏合(缩小)。\
+                         每齿注入一段瞬发双指手势(按下旧指距 → 移动到新指距 → 抬起)，\n\
+                         屏幕上不会留下手指；缩放围绕锚点进行。勾选后滚轮在本程序内被拦截，\
+                         不再触发系统滚动。",
+                    )
+                    .changed()
+                {
+                    undo_needed = true;
+                }
+                ui.label("每齿:");
+                let r = ui
+                    .add(
+                        egui::DragValue::new(&mut aim.wheel_zoom_step)
+                            .range(5.0..=40.0)
+                            .speed(0.5)
+                            .suffix(" %"),
+                    )
+                    .on_hover_text("一次滚轮齿改变指距的百分比(指数步进，缩小与放大对称)。");
+                if r.drag_started() || r.gained_focus() {
                     undo_needed = true;
                 }
             });
@@ -9141,6 +9433,144 @@ impl PadApp {
                 ui.label("(按住暂时退出 FPS,恢复普通映射并显示鼠标;松开回到 FPS)");
             });
 
+            // ---- 压枪 / 后坐力补偿(V2-1;产品立场:默认关闭、UI 明示) ----
+            // 参数语义对齐 K2er《鼠标宏》专页(原文抄在 keymap::Recoil 的注释里)。
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui
+                    .checkbox(&mut aim.recoil.enabled, "后坐力补偿")
+                    .on_hover_text(
+                        "按住触发键期间,按[控制频率]持续把视角向下拉,补偿枪械后坐力。\n\
+                         需要配合瞄准模式使用(瞄准未激活时不生效);默认关闭、不改变任何既有行为。",
+                    )
+                    .changed()
+                {
+                    undo_needed = true;
+                }
+                if aim.recoil.enabled && recoil_live.recoil_active {
+                    ui.colored_label(th.ok, "生效中");
+                }
+            });
+            if aim.recoil.enabled {
+                let n_strengths = aim.recoil.strengths.len();
+                let cur_idx = if n_strengths == 0 {
+                    0
+                } else {
+                    recoil_live.recoil_index.min(n_strengths - 1)
+                };
+                ui.horizontal(|ui| {
+                    ui.label("触发键:");
+                    let waiting = self.waiting_key == Some(KeySlot::RecoilTrigger);
+                    let shown = if aim.recoil.trigger_key == 0 {
+                        None
+                    } else {
+                        Some(aim.recoil.trigger_key)
+                    };
+                    if Self::key_button(ui, waiting, shown).clicked() {
+                        pick_recoil_key = true;
+                    }
+                    if aim.recoil.trigger_key != 0 && ui.small_button("清除").clicked() {
+                        aim.recoil.trigger_key = 0;
+                        undo_needed = true;
+                    }
+                    if ui
+                        .small_button("用左键")
+                        .on_hover_text("射击键一般是鼠标左键(K2er 原文:一般是鼠标左键)")
+                        .clicked()
+                    {
+                        aim.recoil.trigger_key = crate::keymap::BTN_LEFT;
+                        undo_needed = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("控制频率:");
+                    let rr = ui
+                        .add(
+                            egui::DragValue::new(&mut aim.recoil.rate_hz)
+                                .range(1.0..=240.0)
+                                .speed(1.0)
+                                .suffix(" 次/秒"),
+                        )
+                        .on_hover_text("每秒控制的次数(K2er 语义);默认 60。");
+                    if rr.drag_started() || rr.gained_focus() {
+                        undo_needed = true;
+                    }
+                    ui.label(format!("当前强度:第 {} 档", cur_idx + 1));
+                });
+                // 控制强度档位表:每档一个像素值;删除后自动收敛当前档
+                let mut remove_idx = None;
+                for (i, s) in aim.recoil.strengths.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("  第 {} 档:", i + 1));
+                        let d = ui
+                            .add(
+                                egui::DragValue::new(s)
+                                    .range(0.0..=200.0)
+                                    .speed(0.5)
+                                    .suffix(" px/次"),
+                            )
+                            .on_hover_text(
+                                "每次控制的向下位移(设备像素);20ms 一拍 60 次/秒时,6px ≈ 360px/s。",
+                            );
+                        if d.drag_started() || d.gained_focus() {
+                            undo_needed = true;
+                        }
+                        if n_strengths > 1 && ui.small_button("删除").clicked() {
+                            remove_idx = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove_idx {
+                    aim.recoil.strengths.remove(i);
+                    undo_needed = true;
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("＋ 添加一档")
+                        .on_hover_text("K2er:控制强度可以增加多个强度")
+                        .clicked()
+                    {
+                        let last = aim.recoil.strengths.last().copied().unwrap_or(6.0);
+                        aim.recoil.strengths.push(last);
+                        undo_needed = true;
+                    }
+                    ui.checkbox(&mut aim.recoil.wheel_switch, "滚轮换档")
+                        .on_hover_text(
+                            "触发键按住期间,滚轮从\"缩放\"改为切换控制强度档\n\
+                             (K2er:鼠标滚轮改变强度);没按住触发键时滚轮仍是缩放。",
+                        );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("摇晃:");
+                    let s = ui
+                        .add(
+                            egui::DragValue::new(&mut aim.recoil.shake_px)
+                                .range(0.0..=200.0)
+                                .speed(0.5)
+                                .suffix(" px"),
+                        )
+                        .on_hover_text(
+                            "每次控制在左右方向的随机抖动上限(K2er:随机左右摇晃);0 = 不摇晃。",
+                        );
+                    if s.drag_started() || s.gained_focus() {
+                        undo_needed = true;
+                    }
+                    ui.label("覆盖灵敏度:");
+                    let v = ui
+                        .add(
+                            egui::DragValue::new(&mut aim.recoil.sensitivity)
+                                .range(0.0..=20.0)
+                                .speed(0.1),
+                        )
+                        .on_hover_text(
+                            "触发期间鼠标位移改用该灵敏度(K2er:覆盖瞄准的灵敏度);0 = 不覆盖。",
+                        );
+                    if v.drag_started() || v.gained_focus() {
+                        undo_needed = true;
+                    }
+                });
+            }
+
             if ui
                 .checkbox(&mut aim.capture_mouse, "指针消隐(视角模式下隐藏系统光标)")
                 .changed()
@@ -9157,9 +9587,11 @@ impl PadApp {
 
         // 记录撤销(快照取自本帧修改之前;含刚启用时的自动放置锚点)
         if undo_needed {
-            if let Some(before) = undo_before {
-                self.push_undo_snapshot(before);
-            }
+            // 组装"改动前"的整份配置:除 `aim` 用上面那份旧的,其余字段取当前值
+            // (本页只改 `aim`,与"进页时整份克隆"等价,见 W2-3)
+            let mut before = lock_shared(&self.shared).profile.clone();
+            before.aim = undo_before_aim;
+            self.push_undo_snapshot(before);
         }
 
         if let Some(slot) = to_pick {
@@ -9174,25 +9606,28 @@ impl PadApp {
         if pick_suspend_key {
             self.waiting_key = Some(KeySlot::AimSuspend);
         }
+        if pick_recoil_key {
+            self.waiting_key = Some(KeySlot::RecoilTrigger);
+        }
         if toggled {
             // 用户明确要求锚点默认不设置。这里只提示，不再替用户放置。
-            let needs_anchor = { self.shared.lock().unwrap().profile.aim.enabled };
+            let needs_anchor = { lock_shared(&self.shared).profile.aim.enabled };
             if needs_anchor {
-                self.log("鼠标视角已启用；锚点默认未设置，请在“瞄准锚点（开发中）”中取点");
+                self.log("鼠标视角已启用；锚点默认未设置，请在“瞄准锚点”中取点");
             }
         }
     }
 
     fn ui_switch_keys(&mut self, ui: &mut egui::Ui) {
         let (names, active, n) = {
-            let g = self.shared.lock().unwrap();
+            let g = lock_shared(&self.shared);
             (
                 g.schemes.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
                 g.active_scheme,
                 g.schemes.len(),
             )
         };
-        let rows = self.shared.lock().unwrap().switch_keys.clone();
+        let rows = lock_shared(&self.shared).switch_keys.clone();
         ui.heading("切换键位");
         ui.small("支持单键或最多两个键的组合；按键顺序无关。可在[按键组合]里启用快速切换。");
         let mut delete = None;
@@ -9212,13 +9647,13 @@ impl PadApp {
                         self.waiting_key = Some(KeySlot::SwitchKeySecond(i));
                     }
                     if ui.button("删除组合键").clicked() {
-                        if let Some(s) = self.shared.lock().unwrap().switch_keys.get_mut(i) {
+                        if let Some(s) = lock_shared(&self.shared).switch_keys.get_mut(i) {
                             s.keys.truncate(1);
                         }
                         changed = true;
                     }
                 } else if ui.button("新增组合键").clicked() {
-                    if let Some(s) = self.shared.lock().unwrap().switch_keys.get_mut(i) {
+                    if let Some(s) = lock_shared(&self.shared).switch_keys.get_mut(i) {
                         s.keys = vec![s.key, 0];
                     }
                     changed = true;
@@ -9237,7 +9672,7 @@ impl PadApp {
                         ui.selectable_value(&mut direction, SwitchDirection::Prev, "反向循环");
                     });
                 if direction != original.direction {
-                    if let Some(s) = self.shared.lock().unwrap().switch_keys.get_mut(i) {
+                    if let Some(s) = lock_shared(&self.shared).switch_keys.get_mut(i) {
                         s.direction = direction;
                     }
                     changed = true;
@@ -9254,7 +9689,7 @@ impl PadApp {
                             }
                         });
                     if target != original.target {
-                        if let Some(s) = self.shared.lock().unwrap().switch_keys.get_mut(i) {
+                        if let Some(s) = lock_shared(&self.shared).switch_keys.get_mut(i) {
                             s.target = target;
                         }
                         changed = true;
@@ -9270,7 +9705,7 @@ impl PadApp {
         }
         let next = if n > 1 { (active + 1) % n } else { 0 };
         if ui.button("新增切换键位").clicked() {
-            self.shared.lock().unwrap().switch_keys.push(SwitchKey {
+            lock_shared(&self.shared).switch_keys.push(SwitchKey {
                 key: 0,
                 keys: Vec::new(),
                 target: next,
@@ -9279,12 +9714,20 @@ impl PadApp {
             self.scheme_dirty = true;
         }
         if let Some(i) = delete {
-            self.shared.lock().unwrap().switch_keys.remove(i);
-            self.scheme_dirty = true;
-            if self.waiting_key == Some(KeySlot::SwitchKey(i))
-                || self.waiting_key == Some(KeySlot::SwitchKeySecond(i))
-            {
-                self.waiting_key = None;
+            // 下标核查见 remove_indexed(引擎可能刚换过组合)
+            let removed = {
+                let mut g = lock_shared(&self.shared);
+                remove_indexed(&mut g.switch_keys, i)
+            };
+            if removed {
+                self.scheme_dirty = true;
+                if self.waiting_key == Some(KeySlot::SwitchKey(i))
+                    || self.waiting_key == Some(KeySlot::SwitchKeySecond(i))
+                {
+                    self.waiting_key = None;
+                }
+            } else {
+                self.log("该切换键已不存在,未删除");
             }
         }
     }
@@ -9293,6 +9736,28 @@ impl PadApp {
         info.fps
             .map(|v| format!("{v:.1} Hz"))
             .unwrap_or_else(|| "等待刷新".to_string())
+    }
+
+    /// 真实投屏帧率(来自 scrcpy --print-fps 的实况输出)的显示文本。
+    ///
+    /// 与 [`Self::fps_text`](物理面板刷新率,dumpsys 读数)是两回事:这里才是
+    /// "画面现在每秒实际有多少帧"。scrcpy 每秒打一行;超过几秒没有新行就如实
+    /// 说明(停投/被参数关掉),不拿旧数字糊弄 —— 用户要的正是这个区分。
+    fn stream_fps_text(&self) -> String {
+        match self.stream_fps {
+            Some((v, at)) => {
+                let age = at.elapsed();
+                if age <= Duration::from_secs(5) {
+                    format!("{v:.0} fps (scrcpy 实况输出)")
+                } else {
+                    format!(
+                        "无数据(最后 {v:.0} fps,{:.0} 秒前;投屏已停或参数里没开 --print-fps)",
+                        age.as_secs_f32()
+                    )
+                }
+            }
+            None => "等待 scrcpy 输出(未在投屏,或参数里没开 --print-fps)".to_string(),
+        }
     }
 
     fn resolution_text(info: &RemoteDebugInfo) -> String {
@@ -9311,12 +9776,22 @@ impl PadApp {
             self.debug_info.error = Some("未选择设备".to_string());
             return;
         }
+        // 分辨率 30s 才查一次(见 DEBUG_SIZE_TTL):没到点就这一轮不查,
+        // poll 里沿用旧值。省下的是每轮一条最重的 `dumpsys window displays`。
+        let need_size = self
+            .debug_size_at
+            .map(|t| t.elapsed() >= DEBUG_SIZE_TTL)
+            .unwrap_or(true);
         let (tx, rx) = channel();
         self.debug_rx = Some(rx);
         std::thread::spawn(move || {
             let fps = adb::display_refresh_rate(&serial).ok();
-            let resolution = adb::display_size(&serial).ok();
-            let error = if fps.is_none() || resolution.is_none() {
+            let resolution = if need_size {
+                adb::display_size(&serial).ok()
+            } else {
+                None // "本轮没查",不是"查失败" —— poll 会区分处理
+            };
+            let error = if fps.is_none() || (need_size && resolution.is_none()) {
                 Some("部分调试信息读取失败".to_string())
             } else {
                 None
@@ -9344,7 +9819,14 @@ impl PadApp {
         if let Some(value) = result {
             self.debug_rx = None;
             match value {
-                Ok(info) => self.debug_info = info,
+                Ok(mut info) => {
+                    // 本轮没查分辨率 -> 沿用上一次取到的值,不让界面闪"等待刷新"。
+                    match info.resolution {
+                        Some(_) => self.debug_size_at = Some(Instant::now()),
+                        None => info.resolution = self.debug_info.resolution,
+                    }
+                    self.debug_info = info;
+                }
                 Err(error) => self.debug_info.error = Some(error),
             }
         } else if disconnected {
@@ -9356,7 +9838,7 @@ impl PadApp {
         let wanted = self.debug_overlay_open || self.debug_show_fps || self.debug_show_resolution;
         if wanted
             && self.debug_rx.is_none()
-            && self.debug_last_query.elapsed() >= Duration::from_secs(1)
+            && self.debug_last_query.elapsed() >= DEBUG_POLL_INTERVAL
         {
             self.refresh_debug_info();
         }
@@ -9371,7 +9853,7 @@ impl PadApp {
         let mut cursor_key = 0u16;
         ui.horizontal(|ui| {
             ui.label("切换键:");
-            cursor_key = self.shared.lock().unwrap().profile.cursor_toggle_key;
+            cursor_key = lock_shared(&self.shared).profile.cursor_toggle_key;
             let waiting = self.waiting_key == Some(KeySlot::CursorToggle);
             if Self::key_button(ui, waiting, (cursor_key != 0).then_some(cursor_key)).clicked() {
                 self.waiting_key = Some(KeySlot::CursorToggle);
@@ -9379,7 +9861,7 @@ impl PadApp {
             }
             if cursor_key != 0 && ui.small_button("清除").clicked() {
                 self.push_undo();
-                self.shared.lock().unwrap().profile.cursor_toggle_key = 0;
+                lock_shared(&self.shared).profile.cursor_toggle_key = 0;
                 self.waiting_key = None;
             }
             let hidden = self.cursor_hide_flag.load(Ordering::Relaxed);
@@ -9407,7 +9889,7 @@ impl PadApp {
 
         ui.heading("调试信息");
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.debug_show_fps, "显示当前手机帧率/刷新率");
+            ui.checkbox(&mut self.debug_show_fps, "显示帧率(面板刷新率/投屏实况)");
             ui.checkbox(&mut self.debug_show_resolution, "显示当前手机分辨率");
             ui.checkbox(&mut self.debug_show_aim, "显示鼠标视角位移统计");
             if ui.button("刷新").clicked() {
@@ -9432,13 +9914,17 @@ impl PadApp {
         });
         let info = self.debug_info.clone();
         if self.debug_show_fps {
-            ui.label(format!("手机帧率/刷新率: {}", Self::fps_text(&info)));
+            ui.label(format!(
+                "手机面板刷新率: {}(系统读数,物理屏幕能力,不是投屏帧率)",
+                Self::fps_text(&info)
+            ));
+            ui.label(format!("投屏帧率: {}", self.stream_fps_text()));
         }
         if self.debug_show_resolution {
             ui.label(format!("手机分辨率: {}", Self::resolution_text(&info)));
         }
         if self.debug_show_aim {
-            let live = self.shared.lock().unwrap().aim_live;
+            let live = lock_shared(&self.shared).aim_live;
             ui.label(format!(
                 "鼠标视角: 位移 {} 次，最近 ({:.1}, {:.1})",
                 live.motions, live.last_dx, live.last_dy
@@ -9453,6 +9939,533 @@ impl PadApp {
         if let Some(error) = info.error {
             ui.colored_label(th.danger, error);
         }
+        self.ui_manual_adb(ui);
+    }
+
+    /// 「其他功能 → 手动 adb 命令」:像搭 scrcpy 参数一样拼一条 adb 命令并执行。
+    ///
+    /// 命令栏是 token 列表:加入时查冲突(`adbcmd::check_fragment`),单个参数
+    /// 点一下即移除;内容随 settings.json 持久化(`adb_command`),命名预设
+    /// 另存 `adb_presets.json`(与内置预设同列在一个下拉里)。
+    fn ui_manual_adb(&mut self, ui: &mut egui::Ui) {
+        let th = self.theme();
+        ui.separator();
+        ui.heading("手动 adb 命令");
+        ui.label("像搭 scrcpy 参数一样拼一条 adb 命令(不用写开头的 adb),加入时会检查冲突,点[执行]立即发送;输出显示在下方。");
+        ui.small("参数按空格拆分,引号内的空格不拆(如 input text \"hello world\");未指定 -s/-d/-e/-t 时自动带上当前选中的设备。");
+
+        // ---- 预设行:内置(★)+ 我的(☆)同一个下拉,选中即载入(替换整条) ----
+        let builtins: Vec<&adbcmd::CmdEntry> = adbcmd::builtin_entries()
+            .iter()
+            .filter(|e| e.preset)
+            .collect();
+        let builtin_count = builtins.len();
+        let sel = self.adb_preset_sel;
+        let sel_text = match sel {
+            Some(i) if i < builtin_count => format!("★ {}", builtins[i].name),
+            Some(i) if i - builtin_count < self.adb_user_presets.len() => {
+                format!("☆ {}", self.adb_user_presets[i - builtin_count].name)
+            }
+            _ => "选择预设…".to_string(),
+        };
+        let mut newly_selected: Option<usize> = None;
+        ui.horizontal(|ui| {
+            ui.label("预设:");
+            egui::ComboBox::from_id_salt("adb_preset_combo")
+                .selected_text(sel_text)
+                .width(260.0)
+                .show_ui(ui, |ui| {
+                    for (i, e) in builtins.iter().enumerate() {
+                        if ui
+                            .selectable_label(sel == Some(i), format!("★ {}", e.name))
+                            .clicked()
+                        {
+                            newly_selected = Some(i);
+                            ui.close(); // 选中即收起下拉(载入是"动作"不是"切换显示")
+                        }
+                    }
+                    if !self.adb_user_presets.is_empty() {
+                        ui.separator();
+                        ui.label("我的预设:");
+                        for (j, p) in self.adb_user_presets.iter().enumerate() {
+                            let i = builtin_count + j;
+                            if ui
+                                .selectable_label(sel == Some(i), format!("☆ {}", p.name))
+                                .clicked()
+                            {
+                                newly_selected = Some(i);
+                                ui.close();
+                            }
+                        }
+                    }
+                });
+            if ui.small_button("另存当前为预设").clicked() {
+                self.adb_preset_save_open = !self.adb_preset_save_open;
+            }
+            let is_user = sel.map(|i| i >= builtin_count).unwrap_or(false);
+            if ui
+                .add_enabled(is_user, egui::Button::new("删除选中预设").small())
+                .clicked()
+            {
+                self.adb_delete_preset();
+            }
+        });
+        if let Some(i) = newly_selected {
+            let (name, tokens) = if i < builtin_count {
+                let e = builtins[i];
+                (
+                    e.name.to_string(),
+                    e.tokens.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                )
+            } else {
+                let p = &self.adb_user_presets[i - builtin_count];
+                (p.name.clone(), p.tokens.clone())
+            };
+            self.adb_bar = tokens;
+            self.adb_preset_sel = Some(i);
+            self.adb_msg = Some((true, format!("已载入预设: {name}(替换了整条命令)")));
+            self.remember_now();
+        }
+        if self.adb_preset_save_open {
+            ui.horizontal(|ui| {
+                ui.label("预设名:");
+                ui.add(egui::TextEdit::singleline(&mut self.adb_preset_name).desired_width(160.0));
+                if ui.button("保存").clicked() {
+                    self.adb_save_preset();
+                }
+                if ui.small_button("取消").clicked() {
+                    self.adb_preset_save_open = false;
+                    self.adb_preset_name.clear();
+                }
+            });
+        }
+        // ---- 命令栏:token 芯片,点一下移除 ----
+        ui.label("命令栏:");
+        if self.adb_bar.is_empty() {
+            ui.colored_label(th.muted, "(空 —— 从下面加入参数,或载入一个预设)");
+        } else {
+            let mut remove: Option<usize> = None;
+            ui.horizontal_wrapped(|ui| {
+                for (i, tok) in self.adb_bar.iter().enumerate() {
+                    if ui
+                        .small_button(format!("{tok} ✕"))
+                        .on_hover_text("点击移除该参数")
+                        .clicked()
+                    {
+                        remove = Some(i);
+                    }
+                }
+            });
+            if let Some(i) = remove {
+                let tok = self.adb_bar.remove(i);
+                self.adb_msg = Some((true, format!("已移除: {tok}")));
+                self.log(format!("adb 命令栏移除: {tok}"));
+                self.remember_now();
+            }
+        }
+
+        // ---- 加入参数 / 清空 / 助手 ----
+        ui.horizontal(|ui| {
+            ui.label("加入参数:");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.adb_add_input)
+                    .hint_text("如 settings put system min_refresh_rate 120")
+                    .desired_width(300.0),
+            );
+            let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui.button("添加").clicked() || entered {
+                self.adb_try_add_input();
+                if entered {
+                    resp.request_focus(); // 回车后保持焦点,方便连续输入
+                }
+            }
+            if ui.small_button("清空命令栏").clicked() {
+                self.adb_clear_bar();
+            }
+            if ui.button("常用命令助手").clicked() {
+                self.adb_helper = Some(AdbHelperState {
+                    search: String::new(),
+                    selected: 0,
+                });
+            }
+        });
+
+        // ---- 预览 + 执行 ----
+        let serial = self.serial();
+        if !self.adb_bar.is_empty() {
+            let (_, display) = adbcmd::build_command(&serial, &self.adb_bar);
+            ui.monospace(format!("将执行: {display}"));
+            if serial.trim().is_empty() && !adbcmd::has_device_selector(&self.adb_bar) {
+                ui.colored_label(
+                    th.warn,
+                    "提示: 当前没有选中的设备(左栏选一台,或自行加入 -s 序列号)",
+                );
+            }
+        }
+        let running = self.adb_run.is_some();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !running && !self.adb_bar.is_empty(),
+                    egui::Button::new("执行"),
+                )
+                .clicked()
+            {
+                self.adb_execute();
+            }
+            if running {
+                if ui.button("停止").clicked() {
+                    if let Some(run) = self.adb_run.as_ref() {
+                        run.stop();
+                    }
+                    self.log(
+                        "已请求停止 adb 命令(终止本机 adb 进程;设备端已开始的子命令会继续跑完)",
+                    );
+                }
+                let secs = self
+                    .adb_run_started
+                    .map(|t| t.elapsed().as_secs_f32())
+                    .unwrap_or(0.0);
+                ui.colored_label(th.warn, format!("执行中… 已运行 {secs:.1}s"));
+                ui.ctx().request_repaint();
+            }
+        });
+        if let Some((ok, text)) = &self.adb_msg {
+            ui.colored_label(if *ok { th.ok } else { th.danger }, text);
+        }
+
+        // ---- 输出区 ----
+        if let Some(last) = &self.adb_last {
+            ui.separator();
+            let mut clear_last = false;
+            match &last.done {
+                Err(e) => {
+                    ui.colored_label(th.danger, format!("启动失败: {e}"));
+                }
+                Ok(d) => {
+                    let mut status = format!(
+                        "上次执行: {} — 退出码 {}",
+                        last.display,
+                        d.exit_code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "无".into())
+                    );
+                    status.push_str(&format!(",用时 {} ms", d.millis));
+                    if d.killed {
+                        status.push_str(",已手动停止");
+                    }
+                    if d.truncated {
+                        status.push_str(&format!(
+                            ",输出超过 {} KB 已截断",
+                            adbcmd::OUTPUT_CAP / 1024
+                        ));
+                    }
+                    ui.label(status);
+                    let mut text = d.stdout.clone();
+                    if !d.stderr.is_empty() {
+                        if !text.is_empty() && !text.ends_with('\n') {
+                            text.push('\n');
+                        }
+                        text.push_str("── stderr ──\n");
+                        text.push_str(&d.stderr);
+                    }
+                    if text.trim().is_empty() {
+                        text.push_str("(无输出)");
+                    }
+                    egui::ScrollArea::vertical()
+                        .max_height(170.0)
+                        .id_salt("adb_out_scroll")
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut text.as_str())
+                                    .code_editor()
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                    ui.horizontal(|ui| {
+                        if ui.small_button("复制输出").clicked() {
+                            ui.ctx().copy_text(text.clone());
+                        }
+                        if ui.small_button("清空结果").clicked() {
+                            clear_last = true;
+                        }
+                    });
+                }
+            }
+            if clear_last {
+                self.adb_last = None;
+            }
+        }
+    }
+    /// 「常用命令助手」窗口(仿 scrcpy 参数助手的 take/放回模式)。
+    fn ui_adb_helper(&mut self, ctx: &egui::Context) {
+        let Some(mut h) = self.adb_helper.take() else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new("常用 adb 命令助手")
+            .open(&mut open)
+            .default_width(560.0)
+            .show(ctx, |ui| self.adb_helper_panel(ui, &mut h));
+        if open {
+            self.adb_helper = Some(h);
+        }
+    }
+
+    fn adb_helper_panel(&mut self, ui: &mut egui::Ui, h: &mut AdbHelperState) {
+        let th = self.theme();
+        ui.label("内置离线命令库(不联网)。搜索或翻列表,选中看说明,再[加入命令栏]。★ = 同时出现在预设下拉里。");
+        ui.small("加入规则: 设备定向参数(-s/-d/-e/-t)最多一个且必须在子命令之前;开头参数区不允许同名参数重复;相同片段不能重复加入;设备侧子命令自身的参数(grep -i、pm -3 等)不受限制。");
+        ui.horizontal(|ui| {
+            ui.label("搜索:");
+            ui.add(
+                egui::TextEdit::singleline(&mut h.search)
+                    .hint_text("名称 / 说明 / 参数")
+                    .desired_width(240.0),
+            );
+            if ui.small_button("清除").clicked() {
+                h.search.clear();
+            }
+        });
+        let entries = adbcmd::builtin_entries();
+        let q = h.search.trim().to_lowercase();
+        let matched: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| q.is_empty() || e.matches(&q))
+            .map(|(i, _)| i)
+            .collect();
+        // 过滤结果变化时把选中项拉回可见范围(搜没了就选第一条)
+        if !matched.is_empty() && !matched.contains(&h.selected) {
+            h.selected = matched[0];
+        }
+        egui::ScrollArea::vertical()
+            .max_height(230.0)
+            .id_salt("adb_helper_list")
+            .show(ui, |ui| {
+                if matched.is_empty() {
+                    ui.colored_label(th.muted, "没有匹配的命令");
+                }
+                for &i in &matched {
+                    let e = &entries[i];
+                    let label = format!("{} {}", if e.preset { "★" } else { "·" }, e.name);
+                    if ui.selectable_label(h.selected == i, label).clicked() {
+                        h.selected = i;
+                    }
+                }
+            });
+        if matched.contains(&h.selected) {
+            let e = &entries[h.selected];
+            ui.separator();
+            ui.strong(e.name);
+            ui.monospace(e.tokens.join(" "));
+            ui.label(e.desc);
+            ui.small(format!("使用/注意: {}", e.usage));
+            ui.horizontal(|ui| {
+                if ui.button("加入命令栏").clicked() {
+                    self.adb_helper_apply(e.tokens, false);
+                }
+                if ui.small_button("替换命令栏").clicked() {
+                    self.adb_helper_apply(e.tokens, true);
+                }
+                if ui.small_button("撤去该片段").clicked() {
+                    self.adb_helper_remove(e.tokens);
+                }
+            });
+        }
+        ui.separator();
+        ui.hyperlink_to(
+            "adb 官方文档 (Android Developers)",
+            "https://developer.android.com/tools/adb",
+        );
+    }
+
+    /// 手动 adb 命令:把输入框内容作为一段参数加入(冲突则拒绝并说明)。
+    fn adb_try_add_input(&mut self) {
+        let frag = adbcmd::split_tokens(&self.adb_add_input);
+        if frag.is_empty() {
+            self.adb_msg = Some((false, "输入为空,没有可加入的参数".into()));
+            return;
+        }
+        match adbcmd::check_fragment(&self.adb_bar, &frag) {
+            Ok(()) => {
+                let text = frag.join(" ");
+                self.adb_bar.extend(frag);
+                self.adb_add_input.clear();
+                self.adb_msg = Some((true, format!("已加入: {text}")));
+                self.remember_now();
+            }
+            Err(why) => {
+                self.adb_msg = Some((false, format!("拒绝加入: {why}")));
+                self.log(format!("adb 命令加入被拒: {why}"));
+            }
+        }
+    }
+
+    /// 手动 adb 命令:内置库条目 → 命令栏(false=追加,true=替换整条)。
+    fn adb_helper_apply(&mut self, tokens: &[&'static str], replace: bool) {
+        let frag: Vec<String> = tokens.iter().map(|s| s.to_string()).collect();
+        if replace {
+            self.adb_bar = frag.clone();
+            self.adb_msg = Some((true, format!("命令栏已替换为: {}", frag.join(" "))));
+            self.remember_now();
+            return;
+        }
+        match adbcmd::check_fragment(&self.adb_bar, &frag) {
+            Ok(()) => {
+                self.adb_bar.extend(frag.clone());
+                self.adb_msg = Some((true, format!("已加入: {}", frag.join(" "))));
+                self.remember_now();
+            }
+            Err(why) => {
+                self.adb_msg = Some((false, format!("拒绝加入: {why}")));
+                self.log(format!("adb 命令加入被拒: {why}"));
+            }
+        }
+    }
+
+    /// 手动 adb 命令:从命令栏撤去一段片段(完全匹配才撤)。
+    fn adb_helper_remove(&mut self, tokens: &[&'static str]) {
+        let frag: Vec<String> = tokens.iter().map(|s| s.to_string()).collect();
+        let missing = || Some((false, "命令栏里没有这段参数".to_string()));
+        if frag.is_empty() || frag.len() > self.adb_bar.len() {
+            self.adb_msg = missing();
+            return;
+        }
+        let Some(pos) = self
+            .adb_bar
+            .windows(frag.len())
+            .position(|w| w == frag.as_slice())
+        else {
+            self.adb_msg = missing();
+            return;
+        };
+        self.adb_bar.drain(pos..pos + frag.len());
+        self.adb_msg = Some((true, format!("已撤去: {}", frag.join(" "))));
+        self.remember_now();
+    }
+
+    fn adb_clear_bar(&mut self) {
+        if self.adb_bar.is_empty() {
+            self.adb_msg = Some((false, "命令栏本来就是空的".into()));
+            return;
+        }
+        self.adb_bar.clear();
+        self.adb_msg = Some((true, "命令栏已清空".into()));
+        self.log("adb 命令栏已清空");
+        self.remember_now();
+    }
+
+    /// 把当前命令栏另存为命名预设(落 adb_presets.json)。
+    fn adb_save_preset(&mut self) {
+        let name = self.adb_preset_name.trim().to_string();
+        if name.is_empty() {
+            self.adb_msg = Some((false, "预设名不能为空".into()));
+            return;
+        }
+        if self.adb_bar.is_empty() {
+            self.adb_msg = Some((false, "命令栏为空,没有可保存的内容".into()));
+            return;
+        }
+        if self.adb_user_presets.iter().any(|p| p.name == name) {
+            self.adb_msg = Some((false, format!("已存在同名预设 {name}(先删除它或换个名字)")));
+            return;
+        }
+        self.adb_user_presets.push(adbcmd::UserPreset {
+            name: name.clone(),
+            tokens: self.adb_bar.clone(),
+        });
+        match adbcmd::save_user_presets(&adb_presets_path(), &self.adb_user_presets) {
+            Ok(()) => {
+                let builtin_count = adbcmd::builtin_entries()
+                    .iter()
+                    .filter(|e| e.preset)
+                    .count();
+                self.adb_preset_sel = Some(builtin_count + self.adb_user_presets.len() - 1);
+                self.adb_preset_save_open = false;
+                self.adb_preset_name.clear();
+                self.adb_msg = Some((true, format!("已保存预设: {name}")));
+                self.log(format!("adb 预设已保存: {name}"));
+            }
+            Err(e) => {
+                self.adb_user_presets.pop();
+                self.adb_msg = Some((false, format!("预设保存失败: {e}")));
+            }
+        }
+    }
+
+    /// 删除下拉里选中的用户预设(内置预设不可删)。
+    fn adb_delete_preset(&mut self) {
+        let builtin_count = adbcmd::builtin_entries()
+            .iter()
+            .filter(|e| e.preset)
+            .count();
+        let Some(sel) = self.adb_preset_sel else {
+            return;
+        };
+        if sel < builtin_count || sel - builtin_count >= self.adb_user_presets.len() {
+            self.adb_msg = Some((false, "只有『我的预设』可以删除".into()));
+            return;
+        }
+        let idx = sel - builtin_count;
+        let removed = self.adb_user_presets.remove(idx);
+        self.adb_preset_sel = None;
+        match adbcmd::save_user_presets(&adb_presets_path(), &self.adb_user_presets) {
+            Ok(()) => {
+                self.adb_msg = Some((true, format!("已删除预设: {}", removed.name)));
+                self.log(format!("adb 预设已删除: {}", removed.name));
+            }
+            Err(e) => {
+                // 写盘失败:放回去,别让界面和文件不一致
+                self.adb_user_presets.insert(idx, removed);
+                self.adb_msg = Some((false, format!("删除失败(文件没写成功): {e}")));
+            }
+        }
+    }
+
+    /// 执行命令栏:组装 argv(缺设备定向参数时自动补 -s)并启动。
+    fn adb_execute(&mut self) {
+        if self.adb_run.is_some() {
+            return;
+        }
+        if self.adb_bar.is_empty() {
+            self.adb_msg = Some((false, "命令栏为空,先加入参数或载入预设".into()));
+            return;
+        }
+        let exe = if self.adb_path.trim().is_empty() {
+            adb::adb_bin_now().unwrap_or_else(|| "adb".to_string())
+        } else {
+            self.adb_path.trim().to_string()
+        };
+        let (args, display) = adbcmd::build_command(&self.serial(), &self.adb_bar);
+        self.log(format!("执行 adb 命令: {display}"));
+        self.adb_last = None;
+        self.adb_run = Some(adbcmd::run(&exe, args, display));
+        self.adb_run_started = Some(Instant::now());
+    }
+
+    /// 每帧看一眼正在执行的 adb 命令:完成后收尾、写日志、结果留给输出区。
+    fn poll_adb_run(&mut self) {
+        let Some(run) = self.adb_run.as_ref() else {
+            return;
+        };
+        let Some(outcome) = run.poll() else {
+            return;
+        };
+        self.adb_run = None;
+        self.adb_run_started = None;
+        match &outcome.done {
+            Ok(d) => self.log(format!(
+                "adb 命令结束: 退出码 {},用时 {} ms{}",
+                d.exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "无".into()),
+                d.millis,
+                if d.killed { ",已手动停止" } else { "" }
+            )),
+            Err(e) => self.log(format!("adb 命令启动失败: {e}")),
+        }
+        self.adb_last = Some(outcome);
     }
 
     fn ui_debug_overlay(&mut self, ctx: &egui::Context) {
@@ -9460,13 +10473,14 @@ impl PadApp {
             return;
         }
         let info = self.debug_info.clone();
-        let live = self.shared.lock().unwrap().aim_live;
+        let live = lock_shared(&self.shared).aim_live;
         let mut close = false;
         let data = DebugOverlayData {
             show_fps: self.debug_show_fps,
             show_resolution: self.debug_show_resolution,
             show_aim: self.debug_show_aim,
             fps: Self::fps_text(&info),
+            stream_fps: self.stream_fps_text(),
             resolution: Self::resolution_text(&info),
             aim_motions: live.motions,
             aim_last_dx: live.last_dx,
@@ -9482,14 +10496,15 @@ impl PadApp {
             egui::ViewportBuilder::default()
                 .with_title("scrcpy-pad 调试信息")
                 .with_always_on_top()
-                .with_inner_size([320.0, 150.0])
+                .with_inner_size([340.0, 175.0])
                 .with_min_inner_size([220.0, 90.0])
                 .with_resizable(true),
             |ui, _class| {
                 ui.heading("调试信息");
                 ui.separator();
                 if data.show_fps {
-                    ui.label(format!("手机帧率/刷新率: {}", data.fps));
+                    ui.label(format!("手机面板刷新率: {}", data.fps));
+                    ui.label(format!("投屏帧率: {}", data.stream_fps));
                 }
                 if data.show_resolution {
                     ui.label(format!("手机分辨率: {}", data.resolution));
@@ -9523,7 +10538,7 @@ impl PadApp {
     }
 
     /// 截图取点的按钮行 + 预览画布(不含标题)。
-    /// 默认/可视化风格在"截图取点"标题下;鸿蒙风格在右侧"屏幕预览"面板里 —— 共用这一份。
+    /// 放在"截图取点"标题下(默认/可视化风格共用这一份)。
     fn ui_picker_body(&mut self, ui: &mut egui::Ui) {
         let preview_scale_base = self
             .shot
@@ -9611,7 +10626,7 @@ impl PadApp {
                 // 直接显示当前半径(像素),改没改一眼就能看出来
                 let space = self.screen_size().unwrap_or((1080, 2400));
                 let cur_px = {
-                    let g = self.shared.lock().unwrap();
+                    let g = lock_shared(&self.shared);
                     let m = g.profile.mapper(space);
                     match target {
                         ResizeTarget::Bind(i) => match g.profile.binds.get(i).map(|b| &b.action) {
@@ -9644,19 +10659,42 @@ impl PadApp {
             }
         });
 
-        // 截图方向/尺寸与当前触摸坐标空间不一致时(手机转过屏、或截图是上一次
-        // 方向下截的)必须说清楚:浮层按**截图**绘制(所以画得对),但注入按
-        // **坐标空间**走 —— 这种状态下取点会落偏,重新截一张即可恢复。
-        if let Some((_, sw, sh)) = self.shot.as_ref().map(|(t, w, h)| (t.id(), *w, *h)) {
+        // W2-2 坐标空间一致性守卫:浮层与取点按**截图**画,注入按**坐标空间**走 ——
+        // 纵横比不一致时取点会落偏。不一致 → 醒目提示 + 一键对齐 + 禁用取点
+        // (禁用入口:`begin_pick` 与画布点击两处);对齐后自动恢复,无残留状态。
+        if let Some(m) = self.space_guard() {
+            let th = self.theme();
+            ui.colored_label(th.danger, format!("坐标空间未对齐:{}", m.describe()));
+            ui.colored_label(
+                th.warn,
+                "这种状态下取点会落偏(浮层按截图绘制,注入按坐标空间走),已暂时禁用取点。\
+                 刚截的图 → 点[以截图为准];截图是旧的(刚转过屏) → 点[重新查询屏幕尺寸]或重新截图。",
+            );
+            ui.horizontal(|ui| {
+                if ui
+                    .button("以截图为准(重设坐标空间)")
+                    .on_hover_text("把注入用的触摸坐标空间与配置记录的「设计尺寸」都对齐到当前截图")
+                    .clicked()
+                {
+                    self.adopt_shot_space(m);
+                }
+                if ui
+                    .button("重新查询屏幕尺寸")
+                    .on_hover_text("让 adb 重新读取设备当前显示尺寸,并把坐标空间对齐到它")
+                    .clicked()
+                {
+                    self.refresh_display_space();
+                    self.log("正在重新查询设备屏幕尺寸...");
+                }
+            });
+        } else if let Some((sw, sh)) = self.shot.as_ref().map(|(_, w, h)| (*w, *h)) {
+            // 分辨率不同但比例一致:相对坐标换算不受影响,只留一句说明。
+            // (以前这条与"转过屏"混在同一个警告里,同比例的窗口缩放会被误报成"取点会落偏")
             if let Some((iw, ih)) = self.inject_space() {
                 if (iw, ih) != (sw, sh) {
-                    ui.colored_label(
-                        self.theme().warn,
-                        format!(
-                            "注意: 截图是 {sw}x{sh},当前触摸坐标空间是 {iw}x{ih}(手机转过屏?)\n\
-                             浮层按截图绘制,注入却按坐标空间走 —— 建议重新[截取手机屏幕]后再取点"
-                        ),
-                    );
+                    ui.small(format!(
+                        "截图 {sw}x{sh} 与触摸坐标空间 {iw}x{ih} 分辨率不同但比例一致:取点按相对坐标换算,不受影响"
+                    ));
                 }
             }
         }
@@ -9703,7 +10741,7 @@ impl PadApp {
                     if let Some(pos) = pos {
                         // 目标圆心(像素):键位取自己的坐标,轮盘取圆心
                         let (cx, cy) = {
-                            let g = self.shared.lock().unwrap();
+                            let g = lock_shared(&self.shared);
                             let m = g.profile.mapper((w, h));
                             match target {
                                 ResizeTarget::Bind(i) => {
@@ -9722,7 +10760,7 @@ impl PadApp {
                         let dx = pos.x - (rect.min.x + cx as f32 * scale);
                         let dy = pos.y - (rect.min.y + cy as f32 * scale);
                         let new_r = ((dx * dx + dy * dy).sqrt() / scale).max(0.01);
-                        let mut g = self.shared.lock().unwrap();
+                        let mut g = lock_shared(&self.shared);
                         let m = g.profile.mapper((w, h));
                         match target {
                             ResizeTarget::Bind(i) => {
@@ -9751,12 +10789,19 @@ impl PadApp {
                 if let Some(pos) = resp.interact_pointer_pos() {
                     let px = ((pos.x - rect.min.x) / scale) as i32;
                     let py = ((pos.y - rect.min.y) / scale) as i32;
-                    if let Some(slot) = self.picking.take() {
-                        self.assign_coord(slot, px, py);
-                        // 新增取点后若尚未设键位,立即进入等待按键
-                        if slot == CoordSlot::NewBind && self.draft.key.is_none() {
-                            self.waiting_key = Some(KeySlot::NewBind);
-                            self.log("已取点,请按下要绑定的按键");
+                    if let Some(slot) = self.picking {
+                        // W2-2:武装期间空间失去对齐(手机转了屏 / 截图被换)也要拦住。
+                        // 保持武装不消费 —— 对齐后直接再点即可,不必重新[取点]。
+                        if let Some(m) = self.space_guard() {
+                            self.log(format!("取点被阻止:{},本点未写入", m.describe()));
+                        } else {
+                            self.picking = None;
+                            self.assign_coord(slot, px, py);
+                            // 新增取点后若尚未设键位,立即进入等待按键
+                            if slot == CoordSlot::NewBind && self.draft.key.is_none() {
+                                self.waiting_key = Some(KeySlot::NewBind);
+                                self.log("已取点,请按下要绑定的按键");
+                            }
                         }
                     } else if let Some(i) = self.wheel_at(px, py) {
                         // 点到某个摇杆的响应圈:弹出/收起它的方向键信息卡
@@ -9783,7 +10828,7 @@ impl PadApp {
     /// 多个摇杆重叠时取**最后绘制**的那个(与看到的上下层一致)。
     fn wheel_at(&self, px: i32, py: i32) -> Option<usize> {
         let (profile, space) = {
-            let g = self.shared.lock().unwrap();
+            let g = lock_shared(&self.shared);
             (
                 g.profile.clone(),
                 g.control
@@ -9835,80 +10880,223 @@ fn profile_path() -> PathBuf {
     config_dir().join("profile.yaml")
 }
 
+/// 「手动 adb 命令」用户预设的落盘位置(与 settings.json 同目录)。
+fn adb_presets_path() -> PathBuf {
+    config_dir().join(adbcmd::PRESET_FILE)
+}
+
+/// settings.json 里记着的"上次选用的配置文件";没记(或记的是空白)时返回 None。
+///
+/// 该字段是 W0-9 才加进 `Settings` 的:在此之前,用户在 [配置] 里另选/新建的
+/// 文件路径只活在内存中,重启必定回到默认的 profile.yaml。
+fn remembered_profile_path(saved: &Settings) -> Option<PathBuf> {
+    let s = saved.profile_path.as_deref()?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(s))
+}
+
 /// 外观设置的"程序自用"缓存:与键位配置同目录(便于一起备份/清理),
 /// 只由程序自己读写,不提供给用户选择或编辑。
 fn look_cache_path() -> PathBuf {
     config_dir().join("look.json")
 }
 
-/// 读取外观缓存;不存在或内容损坏时返回 None(退回配置里的外观)
-fn load_look_cache() -> Option<theme::Look> {
+/// 读取外观缓存;不存在或内容损坏时返回 (None, 提示),调用方退回配置里的外观。
+///
+/// 返回值第二项是**要上屏的提示**:读取失败的分级处理见
+/// [`read_config_text_graded`] —— "文件不存在"是正常的,不该打扰用户;
+/// "读不动/解析不了"必须让用户看到,否则只会觉得"我调好的外观自己变了"。
+fn load_look_cache() -> (Option<theme::Look>, Vec<String>) {
     let path = look_cache_path();
-    let text = read_config_text(&path)?;
-    match serde_json::from_str::<theme::Look>(&text) {
-        Ok(l) => Some(l),
+    let mut notes = Vec::new();
+    let text = match read_config_text_graded(&path) {
+        Ok(Some(t)) => t,
+        Ok(None) => return (None, notes),
         Err(e) => {
-            eprintln!("[look] {} 解析失败({e}),改用配置里的外观", path.display());
-            backup_broken_config(&path);
-            None
+            notes.push(format!("{e},本次改回配置里保存的外观"));
+            return (None, notes);
+        }
+    };
+    match serde_json::from_str::<theme::Look>(&text) {
+        Ok(l) => (Some(l), notes),
+        Err(e) => {
+            let mut msg = format!("{} 解析失败({e}),本次改回配置里保存的外观", path.display());
+            match backup_broken_config(&path) {
+                Ok(b) => msg.push_str(&format!(";原文件已备份为 {}", b.display())),
+                Err(be) => msg.push_str(&format!(";备份也失败({be})")),
+            }
+            crate::diag_error!("look", "{msg}");
+            notes.push(msg);
+            (None, notes)
         }
     }
 }
 
-/// 读取键位配置(YAML);不存在或内容损坏时返回 None(调用方用默认值)。
+/// 读取键位配置(YAML);不存在或内容损坏时返回 (None, 提示),调用方用默认值。
 ///
 /// 文件里是**多套按键组合**(见 [`keymap::ConfigFile`]):切换键要指向"哪一套",
 /// 分开存反而要多维护一张名单,所以一份文件装全部。
-fn load_profile() -> Option<ConfigFile> {
+///
+/// 返回值第二项是要上屏的提示(读取错误分级 + 解析失败留档,见 W0-9):
+/// 配置读不进来绝不能是静默的 —— 用户会看到"我的键位全没了"却不知道该找谁。
+fn load_profile() -> (Option<ConfigFile>, Vec<String>) {
     let path = profile_path();
-    let text = read_config_text(&path)?;
+    let mut notes = Vec::new();
+    let text = match read_config_text_graded(&path) {
+        Ok(Some(t)) => t,
+        Ok(None) => return (None, notes),
+        Err(e) => {
+            notes.push(format!("{e},本次按默认键位运行"));
+            return (None, notes);
+        }
+    };
     match serde_norway::from_str::<ConfigFile>(&text) {
         Ok(mut doc) => {
             doc.normalize();
-            Some(doc)
+            (Some(doc), notes)
         }
         Err(e) => {
-            eprintln!("[profile] {} 解析失败({e}),改用默认配置", path.display());
-            backup_broken_config(&path);
-            None
+            let mut msg = format!("{} 解析失败({e}),本次按默认键位运行", path.display());
+            match backup_broken_config(&path) {
+                Ok(b) => msg.push_str(&format!(";原文件已备份为 {}", b.display())),
+                Err(be) => msg.push_str(&format!(";备份也失败({be})")),
+            }
+            crate::diag_error!("profile", "{msg}");
+            notes.push(msg);
+            (None, notes)
         }
     }
 }
 
-/// 读取配置文件文本,容忍 UTF-8 BOM。
+/// 从列表里按下标删除,越界时什么都不做并返回 false(W0-10)。
+///
+/// 必要性:界面上的删除按钮拿到的是**渲染那一行时**的索引,而列表长度是更早
+/// 一次加锁读到的。引擎线程用切换键换组合时会整份替换 `profile`(可能只有
+/// 更少的键位/轮盘),`Vec::remove` 遇到越界索引直接 panic —— 一个后台按键
+/// 就能把界面按崩。这里先确认下标仍有效再删。
+fn remove_indexed<T>(v: &mut Vec<T>, i: usize) -> bool {
+    if i < v.len() {
+        v.remove(i);
+        true
+    } else {
+        false
+    }
+}
+
+/// 原子写盘:先写同目录临时文件,再 rename 覆盖目标(W0-9)。
+///
+/// 为什么:程序里所有配置都是"整份重写"的语义。裸 `fs::write` 写到一半时
+/// 崩溃/断电/被杀进程,磁盘上就留下一份**截断的文件** —— 下次启动解析失败,
+/// 用户的键位配置整份作废。临时文件 + rename 让"新内容"与"旧内容"之间
+/// 只有原子的一步切换:rename 成功前目标始终是完整的旧内容,失败则原样保留。
+///
+/// 两个硬要求:
+///   - 临时文件必须与目标**同目录**(跨卷 rename 在 Windows 上必失败);
+///   - 失败时清掉临时文件,不给配置目录留垃圾。
+///
+/// 只读目标是错误而非静默跳过:`fs::rename` 在 Windows 上是
+/// MoveFileEx(REPLACE_EXISTING),目标是只读文件时会 Access Denied ——
+/// 这正是我们想要的:保存失败必须让用户看见(旧版有些落盘点把错误吞掉)。
+pub(crate) fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = atomic_tmp_path(path);
+    let res = (|| -> std::io::Result<()> {
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(text.as_bytes())?;
+            // 落盘后再 rename:否则断电时可能"名字换了、内容还没写下去"
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
+/// 原子写盘用的临时文件名(与目标同目录)。单独成函数是为了让测试
+/// 能在失败后检查"临时文件确实被清掉了"。
+fn atomic_tmp_path(path: &Path) -> PathBuf {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(path.file_name().unwrap_or_default());
+    name.push(format!(".{}.tmp", std::process::id()));
+    match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(dir) => dir.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+/// 读取配置文件文本,容忍 UTF-8 BOM,并按"是不是正常情况"给失败分级(W0-9)。
 ///
 /// 必要性:Windows 上记事本/若干编辑器保存 UTF-8 时会加上 BOM(EF BB BF),
 /// 而 BOM 会让 serde_json 直接解析失败 —— 程序于是悄悄退回默认值,
 /// 并在下一次落盘时**把用户原本的内容整份覆盖掉**。
 /// 用户反馈的"我设置好 scrcpy 目录后,settings.json 里根本没有位置信息"
 /// 正是这一类的表现;一个字节的差别不该毁掉整份配置,所以读进来先去掉它。
-pub(crate) fn read_config_text(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
+///
+/// 分级(旧版所有读取失败都被 `ok()?` 吞成"没有这个文件",用户只看到
+/// 配置"莫名其妙回到了默认值",日志里什么都没有):
+///   - 文件不存在 -> `Ok(None)`:首次运行/还没保存过,正常情况,不打日志;
+///   - 其他读取错误(权限/被占用/路径是目录…) -> `Err(含路径与原因的说明)`,
+///     调用方必须上屏,让用户知道"没读进来"而不是"内容丢了";
+///   - 内容不是合法 UTF-8 -> 按替换字符读入(原始字节不丢,备份也照原样复制),
+///     若因此解析失败,会走调用方的"解析失败"分支留下 `.broken` 备份。
+pub(crate) fn read_config_text_graded(path: &Path) -> Result<Option<String>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("读取 {} 失败: {e}", path.display())),
+    };
     let text = String::from_utf8_lossy(&bytes).into_owned();
-    Some(match text.strip_prefix('\u{feff}') {
+    Ok(Some(match text.strip_prefix('\u{feff}') {
         Some(rest) => rest.to_string(),
         None => text,
-    })
+    }))
 }
 
-/// 配置解析失败时把原文件另存一份(文件名后追加 `.broken`,如
-/// `profile.yaml` -> `profile.yaml.broken`,look.json 同理)。
+/// 配置解析失败时把原文件另存一份(文件名后追加带时间戳的 `.broken`,
+/// 如 `profile.yaml` -> `profile.yaml.broken-20261006-142530`)。
 ///
 /// 为什么:解析失败后程序按默认值运行,而帧末的"内容变了就落盘"会把默认值
 /// 写回同一个文件 —— 用户辛苦配的内容就此消失。先留个副本,至少还能捞回来。
-pub(crate) fn backup_broken_config(path: &Path) {
-    if path.is_file() {
-        // 用 with_extension 会把原扩展名换掉(profile.yaml -> profile.broken),
-        // 这里要的是"加一个后缀",因此直接在文件名上拼。
-        let mut name = path.file_name().unwrap_or_default().to_os_string();
-        name.push(".broken");
-        let _ = std::fs::copy(path, path.with_file_name(name));
+///
+/// 为什么带时间戳、且把结果返回给调用方(W0-9):旧版固定后缀 `profile.yaml.broken`,
+/// 每次解析失败都覆盖同一份 —— 用户接连改坏两次,第一次的现场就没了;
+/// 复制失败还被 `let _ =` 吞掉,于是"以为有备份、其实没有"、日志里也查不到。
+/// 现在返回备份文件路径,调用方必须把结果写进日志/提示。
+pub(crate) fn backup_broken_config(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_file() {
+        return Err(format!("{} 不存在,无法备份", path.display()));
     }
+    // 用 with_extension 会把原扩展名换掉(profile.yaml -> profile.broken),
+    // 这里要的是"加一个后缀",因此直接在文件名上拼。
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".broken-{}", timestamp_compact()));
+    // 同一秒内连续两次解析失败不能互相覆盖:必要时加序号
+    let mut target = path.with_file_name(&name);
+    let mut n = 2;
+    while target.exists() && n < 100 {
+        let mut cand = name.clone();
+        cand.push(format!("-{n}"));
+        target = path.with_file_name(cand);
+        n += 1;
+    }
+    std::fs::copy(path, &target).map_err(|e| format!("备份 {} 失败: {e}", path.display()))?;
+    Ok(target)
 }
 
 /// 读取并严格校验任意路径下的键位配置(YAML);返回详细中文错误便于排查
 fn read_profile_at(path: &std::path::Path) -> Result<ConfigFile, String> {
-    let text = read_config_text(path).ok_or_else(|| "读取失败".to_string())?;
+    let text = match read_config_text_graded(path)? {
+        Some(t) => t,
+        None => return Err(format!("{} 不存在", path.display())),
+    };
     let mut doc: ConfigFile =
         serde_norway::from_str(&text).map_err(|e| format!("不是合法的键位 yaml: {e}"))?;
     doc.normalize();
@@ -10011,10 +11199,7 @@ fn locate_remembered_scrcpy(remembered: &Settings) -> (Option<PathBuf>, String) 
 /// 向指定路径写入全新默认配置(父目录不存在则自动创建)
 fn write_default_profile(path: &std::path::Path) -> Result<(), String> {
     let text = render_config(&ConfigFile::default())?;
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    std::fs::write(path, text).map_err(|e| format!("写入失败: {e}"))
+    write_atomic(path, &text).map_err(|e| format!("写入失败: {e}"))
 }
 
 /// epoch 秒 -> "2026-09-05 14:25:30"(本地时区,民用历算法)
@@ -10588,7 +11773,7 @@ fn draw_swipe_track<F: Fn(i32, i32) -> egui::Pos2>(
     tone: f32,
 ) {
     use egui::{Align2, FontId, Stroke};
-    let pts: Vec<egui::Pos2> = crate::keymap::swipe_points(path, start, end, 64)
+    let pts: Vec<egui::Pos2> = crate::keymap::swipe_points(path, start, end, SWIPE_SAMPLES)
         .iter()
         .map(|&(x, y)| to_screen(x, y))
         .collect();
@@ -10750,6 +11935,64 @@ fn screenshot_fit_scale(avail_w: f32, window_h: f32, tex_w: u32, tex_h: u32) -> 
         .clamp(0.05, 1.0)
 }
 
+/// 纵横比相对偏差超过它就地"未对齐"(方案 W2-2 定 2%)。
+const SPACE_ASPECT_TOLERANCE: f32 = 0.02;
+
+/// 截图空间与控制通道(注入)空间纵横比不一致的证据(W2-2 守卫,判定见
+/// [`space_mismatch`])。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SpaceMismatch {
+    /// 截图尺寸(浮层绘制与取点所依据的空间)
+    shot: (u32, u32),
+    /// 控制通道尺寸(引擎注入所用坐标空间)
+    inject: (u32, u32),
+    /// 纵横比相对偏差(0.05 = 5%,两方向归一:谁大谁做分子)
+    dev: f32,
+}
+
+impl SpaceMismatch {
+    /// 一句话说明,给日志与面板提示共用(措辞即"提示明确"的验收口径)。
+    fn describe(&self) -> String {
+        let (sw, sh) = self.shot;
+        let (iw, ih) = self.inject;
+        format!(
+            "截图 {sw}x{sh} 与触摸坐标空间 {iw}x{ih} 的纵横比不一致(偏差 {:.0}%)",
+            self.dev * 100.0
+        )
+    }
+}
+
+/// **坐标空间一致性判定**:截图空间 vs 注入空间的纵横比偏差是否超阈值。
+///
+/// 为什么按**纵横比**而不是"尺寸必须相等":配置坐标是相对值,同比例不同分辨率
+/// (截图 1080x2400 / 注入空间 720x1600)取点落点完全一致;真正会让取点落偏的是
+/// **比例**变了 —— 手机转了屏、或截图还是上一次方向下拍的。返回 `None` 表示
+/// "一致或无法判定"(任一侧尺寸未知),调用方按"放行"处理。
+///
+/// 判定用交叉相乘(`sw*ih` vs `sh*iw`),两方向对称:1080x2400 对 2400x1080
+/// 的偏差 ≈ 3.94(394%),会被稳稳拦住。参照 scrcpy PositionMapper 的
+/// "声明尺寸与最新帧不一致就丢事件",
+/// 我们对应做"拒绝取点 + 提示"(注入侧引擎只用控制空间,内部自洽,无需守卫)。
+fn space_mismatch(shot: (u32, u32), inject: (u32, u32)) -> Option<SpaceMismatch> {
+    let ((sw, sh), (iw, ih)) = (shot, inject);
+    if sw == 0 || sh == 0 || iw == 0 || ih == 0 {
+        return None;
+    }
+    let r = (sw as f64 * ih as f64) / (sh as f64 * iw as f64);
+    if !r.is_finite() || r <= 0.0 {
+        return None;
+    }
+    let dev = if r >= 1.0 { r - 1.0 } else { 1.0 / r - 1.0 };
+    if dev <= SPACE_ASPECT_TOLERANCE as f64 {
+        return None;
+    }
+    Some(SpaceMismatch {
+        shot,
+        inject,
+        dev: dev as f32,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10877,6 +12120,175 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// W0-9 落盘纪律:原子写在"目标不存在""目标已存在"两种情况下
+    /// 都必须产出**完整**内容,且不留临时文件。
+    #[test]
+    fn write_atomic_creates_and_overwrites_completely() {
+        let dir = std::env::temp_dir().join(format!("scrcpy-pad-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // 父目录不存在:必须自动创建(各落盘点过去都自己 create_dir_all)
+        let path = dir.join("sub").join("profile.yaml");
+        write_atomic(&path, "第一版\n").expect("首次写入必须成功");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "第一版\n");
+        write_atomic(&path, "第二版\n").expect("覆盖写入必须成功");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "第二版\n",
+            "覆盖必须是整份替换,不能残留旧内容的尾巴"
+        );
+        assert!(
+            !atomic_tmp_path(&path).exists(),
+            "成功路径上不该留下临时文件"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W0-9:写不进去时必须**报错**并清掉临时文件。
+    /// 目标是目录(rename 必失败)用来模拟"写不进去"这种失败,跨平台稳定。
+    #[test]
+    fn write_atomic_failure_is_reported_and_leaves_no_temp() {
+        let dir =
+            std::env::temp_dir().join(format!("scrcpy-pad-atomic-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let target = dir.join("占位目录");
+        std::fs::create_dir_all(&target).unwrap();
+        let err = write_atomic(&target, "内容").expect_err("目标不可写时必须报错,而不是静默");
+        assert!(!err.to_string().is_empty());
+        assert!(
+            !atomic_tmp_path(&target).exists(),
+            "失败后必须清掉临时文件,不给配置目录留垃圾"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W0-9(手工验收的自动化版):目标是只读文件时必须报错。
+    ///
+    /// 为什么重要:旧版有落盘点把写入错误吞掉,用户以为"保存成功",
+    /// 重启才发现改动没写进去。只读文件在 Windows 上正是
+    /// `fs::rename`(MoveFileEx REPLACE_EXISTING)会 Access Denied 的场景。
+    #[cfg(windows)]
+    #[test]
+    fn write_atomic_reports_readonly_target_and_keeps_old_content() {
+        let dir = std::env::temp_dir().join(format!("scrcpy-pad-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("profile.yaml");
+        std::fs::write(&path, "旧内容").unwrap();
+        // 先存下原始权限,结束时原样还原 —— 比 set_readonly(false) 稳,
+        // 后者在 Unix 语义下会把文件放开成 0o666(clippy 也会拦)。
+        let orig_perms = std::fs::metadata(&path).unwrap().permissions();
+        let mut perms = orig_perms.clone();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let err = write_atomic(&path, "新内容").expect_err("只读目标必须报错");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "旧内容",
+            "写失败时原文件必须原样保留 —— 这正是原子写的意义"
+        );
+
+        // 还原权限再清理,免得留下删不掉的只读文件
+        let _ = std::fs::set_permissions(&path, orig_perms);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W0-9 读取分级:不存在 = 正常(静默);读不动(路径是目录)= 要报给用户的错误;
+    /// BOM 照旧被剥掉(不能因为分级把这条老修复弄丢)。
+    #[test]
+    fn read_grading_separates_missing_from_unreadable() {
+        let dir = std::env::temp_dir().join(format!("scrcpy-pad-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(
+            matches!(
+                read_config_text_graded(&dir.join("没有这个文件.yaml")),
+                Ok(None)
+            ),
+            "文件不存在是首次运行的正常情况,必须静默"
+        );
+        let bom = dir.join("bom.json");
+        std::fs::write(&bom, "\u{feff}{\"a\":1}").unwrap();
+        assert_eq!(
+            read_config_text_graded(&bom).unwrap().unwrap(),
+            "{\"a\":1}",
+            "BOM 必须被剥掉(Windows 编辑器会加)"
+        );
+        assert!(
+            read_config_text_graded(&dir).is_err(),
+            "路径是目录时必须报错上屏,不能当成『没有配置文件』"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W0-10:列表删除用的下标来自渲染那一行时,而列表长度是更早一次加锁读到的 ——
+    /// 引擎用切换键换组合(换成更少的键位)时,`Vec::remove(i)` 会越界 panic。
+    /// 删除必须先核查下标:失效就什么都不删,绝不能崩。
+    #[test]
+    fn remove_indexed_never_panics_on_stale_index() {
+        let mut v = vec!["甲", "乙", "丙"];
+        assert!(!remove_indexed(&mut v, 99), "越界下标必须安全失败");
+        assert_eq!(v, vec!["甲", "乙", "丙"], "越界时不得误删别的条目");
+        assert!(!remove_indexed(&mut v, 3), "正好等于长度也是越界");
+        assert!(remove_indexed(&mut v, 1));
+        assert_eq!(v, vec!["甲", "丙"]);
+        assert!(!remove_indexed(&mut v, 2), "删到只剩两条后,原下标已失效");
+        assert!(remove_indexed(&mut v, 0));
+        assert_eq!(v, vec!["丙"]);
+        // 空列表:任何下标都不该 panic
+        v.clear();
+        assert!(!remove_indexed(&mut v, 0));
+    }
+
+    /// W0-9:解析失败的备份必须带时间戳、不互相覆盖,且失败要能报出来。
+    #[test]
+    fn broken_backup_is_timestamped_and_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!("scrcpy-pad-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("look.json");
+        std::fs::write(&path, "{坏掉的").unwrap();
+
+        let first = backup_broken_config(&path).expect("备份必须成功");
+        let second = backup_broken_config(&path).expect("第二次备份也必须成功");
+        assert_ne!(first, second, "两次备份不能互相覆盖(旧版固定后缀就会)");
+        assert!(first.exists() && second.exists());
+        let name = first.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with("look.json.broken-"),
+            "备份名应保留原名并带时间戳后缀: {name}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            "{坏掉的",
+            "备份必须原样"
+        );
+
+        assert!(
+            backup_broken_config(&dir.join("没有这个文件")).is_err(),
+            "没东西可备份时必须报错 —— 旧版 `let _ =` 会让用户以为有备份"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W0-9:`settings.json` 里记的配置路径要能穿过"启动读回"这一步:
+    /// 只有非空、且与默认位置不同的路径才触发恢复。
+    #[test]
+    fn remembered_profile_path_is_trimmed_and_optional() {
+        let mut s = Settings::default();
+        assert_eq!(remembered_profile_path(&s), None, "没记过 -> 走默认配置");
+        s.profile_path = Some("   ".into());
+        assert_eq!(remembered_profile_path(&s), None, "空白等于没记");
+        s.profile_path = Some("  /tmp/我的.yaml  ".into());
+        assert_eq!(
+            remembered_profile_path(&s),
+            Some(PathBuf::from("/tmp/我的.yaml")),
+            "手改过的 settings.json 允许带空白,必须去掉再用"
+        );
+    }
+
     #[test]
     fn legacy_uhid_is_never_auto_added() {
         assert_eq!(
@@ -10982,6 +12394,65 @@ mod tests {
         assert_eq!(rec.steps[1].delay_ms, 100, "抬起延迟应保留真实长按时间");
     }
 
+    /// 录制起点追加不变量(用户 2026-10-07 再次强调):**按下第一个键之前不算录制**。
+    /// 点[开始录制]后哪怕发呆超过空闲时间也不许自动结束 —— 只有录到过步骤,
+    /// 空闲计时才有意义。
+    #[test]
+    fn macro_idle_stop_waits_for_first_key() {
+        let base = Instant::now();
+        let idle_ago = base - Duration::from_secs(10); // 远超默认空闲 800ms
+        let mut rec = MacroRecording {
+            steps: Vec::new(),
+            held: HashSet::new(),
+            last_event: idle_ago,
+            last_step_at: idle_ago,
+            idle_ms: 800,
+        };
+        assert!(!rec.should_auto_stop(), "第一个按键之前绝不能自动停止");
+        PadApp::record_macro_button(&mut rec, 18, true, base);
+        assert!(!rec.should_auto_stop(), "刚按键,空闲时间未到");
+        rec.last_event = base - Duration::from_millis(801);
+        assert!(rec.should_auto_stop(), "有步骤 + 超时 -> 才允许停止");
+    }
+
+    /// 宏起始点(真机反馈 1):**第一个按键事件就是宏的起点**。
+    ///
+    /// 用户点[开始录制]之后翻键盘、想内容的空档不能算进宏里,否则回放会先愣
+    /// 几秒。录制侧已经短路了首步延迟,这里锁住兜底归一化:旧配置 / 导入的 YAML /
+    /// 手工编辑来的宏也必须满足同一条不变量。
+    #[test]
+    fn macro_first_step_delay_is_always_zeroed() {
+        let step = |code: u16, pressed: bool, delay_ms: u32| MacroStep {
+            code,
+            pressed,
+            delay_ms,
+        };
+        // 典型脏数据:第一步带着"开始录制→第一次按键"的空档
+        let mut steps = vec![
+            step(18, true, 4200),
+            step(18, false, 100),
+            step(19, true, 0),
+        ];
+        PadApp::normalize_macro_start(&mut steps);
+        assert_eq!(steps[0].delay_ms, 0, "首步延迟必须归零");
+        assert_eq!(
+            (steps[1].delay_ms, steps[2].delay_ms),
+            (100, 0),
+            "后面的步骤一个都不许动"
+        );
+        // 已经是 0:幂等,不改变任何内容
+        let before = steps.clone();
+        PadApp::normalize_macro_start(&mut steps);
+        assert_eq!(steps, before, "归一化必须幂等");
+        // 单步宏 / 空宏都不 panic
+        let mut one = vec![step(18, true, 999)];
+        PadApp::normalize_macro_start(&mut one);
+        assert_eq!(one[0].delay_ms, 0);
+        let mut empty: Vec<MacroStep> = Vec::new();
+        PadApp::normalize_macro_start(&mut empty);
+        assert!(empty.is_empty());
+    }
+
     #[test]
     fn screenshot_fit_scale_respects_window_height_and_width() {
         let portrait = screenshot_fit_scale(600.0, 900.0, 1080, 2400);
@@ -10992,5 +12463,48 @@ mod tests {
             "横屏应按宽度限制自动缩小"
         );
         assert!(screenshot_fit_scale(0.0, 0.0, 1080, 2400) < 0.1);
+    }
+
+    /// W2-2 验收口径:构造"截图 1080x2400 / 控制通道 2400x1080"必须被拦,
+    /// 同比例不同分辨率不能误伤(相对坐标换算本来就不受影响)。
+    #[test]
+    fn space_guard_blocks_rotated_space_but_allows_same_aspect() {
+        // 旋转对调(验收场景):拦,且提示里两个尺寸都在
+        let m = space_mismatch((1080, 2400), (2400, 1080)).expect("转过屏的空间必须被拦");
+        assert!(m.dev > 3.0, "旋转的偏差应远超阈值,实际 {}", m.dev);
+        let d = m.describe();
+        assert!(
+            d.contains("1080x2400") && d.contains("2400x1080"),
+            "提示: {d}"
+        );
+        assert!(d.contains("纵横比"), "提示: {d}");
+        // 反向对调也拦
+        assert!(space_mismatch((2400, 1080), (1080, 2400)).is_some());
+        // 同比例不同分辨率:放行
+        assert!(space_mismatch((1080, 2400), (720, 1600)).is_none());
+        // 完全相同:放行
+        assert!(space_mismatch((1080, 2400), (1080, 2400)).is_none());
+        // 比例轻微不同(≈2.6%)也要拦;1% 以内不误伤
+        assert!(space_mismatch((1080, 2400), (1080, 2340)).is_some());
+        assert!(space_mismatch((1000, 1000), (1010, 1000)).is_none());
+        // 某一侧尺寸未知:不判定(调用方放行)
+        assert!(space_mismatch((0, 0), (1080, 2400)).is_none());
+        assert!(space_mismatch((1080, 2400), (0, 0)).is_none());
+    }
+
+    /// 断线自动重连的退避节拍(2026-10-06):单调不减、首档必须够快
+    /// (多数断开一秒内就能回来),末档封顶 10s(设备真掉了也别刷 adb 进程)。
+    #[test]
+    fn reconnect_backoff_is_monotonic_and_capped() {
+        let secs: Vec<u64> = (0..PadApp::RECONNECT_MAX_ATTEMPTS + 4)
+            .map(|a| PadApp::reconnect_delay(a).as_secs())
+            .collect();
+        assert!(
+            secs.windows(2).all(|w| w[1] >= w[0]),
+            "退避不得回退: {secs:?}"
+        );
+        assert_eq!(secs[0], 1, "第一次重连不该让玩家干等");
+        assert!(secs.iter().all(|&s| s <= 10), "末档封顶 10s: {secs:?}");
+        assert_eq!(*secs.last().unwrap(), 10, "超过上限后应停在 10s");
     }
 }

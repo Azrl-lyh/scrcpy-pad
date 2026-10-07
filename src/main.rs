@@ -1,4 +1,5 @@
 mod adb;
+mod adbcmd;
 mod app;
 mod capture;
 mod control;

@@ -1,6 +1,0 @@
-{
-  "accessibilityCapabilities": ["gesture", "keyEventObserver"],
-  "accessibilityAbilityTypes": ["all"],
-  "notificationTimeout": 100,
-  "uiNoninteractive": false
-}

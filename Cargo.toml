@@ -40,9 +40,12 @@ rfd = { version = "0.15", default-features = false }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    # Raw Input(RegisterRawInputDevices/GetRawInputData/RAWMOUSE,W1-2)由它带入
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    # GetModuleHandleW:Raw Input 接收窗口要按模块注册窗口类(W1-2)
+    "Win32_System_LibraryLoader",
     "Win32_Graphics_Gdi",
 ] }
 

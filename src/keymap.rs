@@ -28,8 +28,9 @@ pub fn zoom_radius(radius: f32, factor: f32) -> f32 {
 }
 
 /// 鼠标按键的 evdev 码:两平台统一(Windows 侧由低级钩子映射到同一码空间)。
-/// 左键=272、中键=274 未在此列出,因为鼠标按键已可直接当普通键绑定,
-/// 这里只保留瞄准门控最常用的右键。
+/// 左键=272、中键=274;这里列出瞄准门控(右键)与压枪触发键(V2-1,常用左键)
+/// 两处用到的常量 —— 其余鼠标键已可直接当普通键绑定,不必具名。
+pub const BTN_LEFT: u16 = 272;
 pub const BTN_RIGHT: u16 = 273;
 /// 鼠标滚轮的四个方向使用统一码空间的合成键码。
 ///
@@ -80,6 +81,14 @@ fn default_drag_deadzone() -> f32 {
     0.0
 }
 
+fn default_wheel_zoom() -> bool {
+    true
+}
+
+fn default_wheel_zoom_step() -> f32 {
+    20.0
+}
+
 fn default_boundary() -> bool {
     true
 }
@@ -117,8 +126,9 @@ fn default_version() -> u32 {
 }
 
 /// 配置里坐标的单位。
-/// 旧配置(v1)没有这个字段,反序列化后按 [`CoordUnit::Pixel`] 处理,
-/// 由 [`upgrade_profile`] 在得知屏幕尺寸后换算成相对比例。
+/// 旧配置(v1)没有这个字段,反序列化后按 [`CoordUnit::Pixel`] 处理:像素值
+/// **原样直通**使用。v1→v2 的自动换算已删除(O-7=B,2026-10-07):YAML 加载
+/// 时版本字段一律写死为当前版本,不存在需要升级的配置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum CoordUnit {
     /// 屏幕像素(仅旧配置使用)
@@ -315,6 +325,10 @@ impl SwipePath {
     }
 }
 
+/// 圆形轨迹的采样点数:UI 预览(`draw_swipe_track`)与引擎实际路径
+/// (滑动展开)统一用这一份,免得两边密度漂移成"预览圆、实机多边形"。
+pub const SWIPE_SAMPLES: usize = 64;
+
 /// 由轨迹类型与起/终点生成滑动路径采样点(空间折线)。
 pub fn swipe_points(
     path: SwipePath,
@@ -382,14 +396,6 @@ pub struct MacroStep {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum MacroKeyMode {
-    #[default]
-    Tap,
-    Hold,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
 pub enum MacroWheelPart {
     #[default]
     Up,
@@ -406,10 +412,13 @@ pub enum MacroInstruction {
         #[serde(default)]
         ms: u32,
     },
+    /// 按一下键:按下 → 持续 `duration_ms` → 抬起(自包含,不跨步骤保持)。
+    ///
+    /// 历史:`mode: tap/hold` 字段已于 2026-10-06(W2-8)删除——用户拍板
+    /// "宏不需要长按,录制什么释放什么";旧配置里的 `mode` 会被 serde
+    /// 忽略(全仓没有 deny_unknown_fields),行为统一为"按下-持续-抬起"。
     Key {
         code: u16,
-        #[serde(default)]
-        mode: MacroKeyMode,
         #[serde(default = "default_tap_duration_ms")]
         duration_ms: u32,
         #[serde(default)]
@@ -462,6 +471,20 @@ pub enum MacroInstruction {
 }
 
 impl MacroInstruction {
+    /// 本步骤相对上一事件的等待毫秒数(排程用;`Delay` 自身即纯等待)。
+    pub fn delay_ms(&self) -> u32 {
+        match self {
+            Self::Delay { ms } => *ms,
+            Self::Key { delay_ms, .. }
+            | Self::Combo { delay_ms, .. }
+            | Self::Wheel { delay_ms, .. }
+            | Self::Fps { delay_ms, .. }
+            | Self::Click { delay_ms, .. }
+            | Self::Swipe { delay_ms, .. }
+            | Self::Macro { delay_ms, .. } => *delay_ms,
+        }
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             Self::Delay { .. } => "间隔",
@@ -497,7 +520,8 @@ pub struct MacroAction {
 /// 语义与 QtScrcpy 的动作类型一一对应(便于互通与后续控件化布局):
 ///   `Tap`/`Hold` = KMT_CLICK,KMT_DRAG = `Swipe`,
 ///   KMT_STEER_WHEEL = [`Wheel`],mouseMoveMap = [`Aim`],switchKey = [`Profile::toggle_key`]。
-/// 坐标一律是相对值(0..1);旧配置由 [`upgrade_profile`] 自动换算。
+/// 坐标一律是相对值(0..1);旧配置(像素坐标)按 [`CoordUnit::Pixel`] 直通使用,
+/// 不做换算(升级路径已删,见坐标单位说明)。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Action {
     /// 点按:按下时触点落下,持续 duration_ms 后抬起。
@@ -522,7 +546,7 @@ pub enum Action {
     Swipe(Swipe),
     /// 注入 Android 系统键(如返回=4, 主页=3)
     AndroidKey { keycode: u32 },
-    /// 录制并回放的宏（开发中）。第一版依赖已有键位。
+    /// 宏:录制回放,或按语义步骤执行,可选虚拟键位层(见 [`MacroAction`])。
     Macro(MacroAction),
 }
 
@@ -533,7 +557,7 @@ impl Action {
             Action::Hold { .. } => "长按",
             Action::Swipe(_) => "滑动",
             Action::AndroidKey { .. } => "系统键",
-            Action::Macro(_) => "宏（开发中）",
+            Action::Macro(_) => "宏",
         }
     }
 
@@ -691,7 +715,7 @@ impl WheelKind {
         match self {
             Self::Standard => "标准四向",
             Self::Custom => "自定义方向",
-            Self::Execute => "执行轮盘（开发中）",
+            Self::Execute => "执行轮盘",
         }
     }
 }
@@ -760,6 +784,29 @@ pub fn clamp_scope(v: f32) -> f32 {
         v.clamp(SCOPE_MIN, SCOPE_MAX)
     } else {
         DEFAULT_WHEEL_SCOPE
+    }
+}
+
+/// 几何长度(轮盘半径/中心半径这类"相对屏幕宽度的长度")的加载期收敛(W0-8)。
+///
+/// 手改 YAML 写进来的 `NaN`/`inf`/负数/超大值都在这里归一:非有限值回默认,
+/// 其余钳进 `(0, 1]`。不收敛的话,`radius × 屏幕宽` 会算出巨大的推出距离,
+/// 注入点直接飞出屏幕(出屏触摸被设备端整条丢弃,表现为"这个方向推不动"),
+/// debug 构建下 i32 加法还会溢出 panic —— 引擎线程一死,之后全部按键静默失效。
+fn clamp_unit_span(v: f32, fallback: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.001, 1.0)
+    } else {
+        fallback
+    }
+}
+
+/// 相对坐标位置(轮盘中心 cx/cy 这类 0..1 的点)的加载期收敛(W0-8)。
+fn clamp_unit_pos(v: f32, fallback: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        fallback
     }
 }
 
@@ -913,7 +960,10 @@ pub struct EffectiveKeys {
 
 impl EffectiveKeys {
     fn new() -> Self {
-        Self { buf: [0; 2], len: 0 }
+        Self {
+            buf: [0; 2],
+            len: 0,
+        }
     }
 
     fn push(&mut self, key: u16) {
@@ -1271,6 +1321,105 @@ pub struct Aim {
     /// 鼠标视角输入通道。旧 UHID/AOA 配置读取后会迁移为通用触摸拖动。
     #[serde(default)]
     pub input_mode: ViewInputMode,
+    /// FPS 模式内:鼠标滚轮 = 双指缩放(向游戏注入两指张开/捏合手势;
+    /// 上滚=放大两指张开,下滚=缩小两指捏合)。2026-10-07 用户要求。
+    /// 默认开:FPS 模式下滚轮此前本来没有用武之地,开了不改变任何既有行为。
+    #[serde(default = "default_wheel_zoom")]
+    pub wheel_zoom: bool,
+    /// 每齿缩放比例(%):两指间距按 (1±step%) 指数变化 —— 缩放是比例量,
+    /// 固定像素步进在"贴近/拉远"两端的颗数会严重失衡。
+    #[serde(default = "default_wheel_zoom_step")]
+    pub wheel_zoom_step: f32,
+    /// 压枪/后坐力补偿(V2-1)。默认全关;参数语义对齐 K2er《鼠标宏》专页。
+    #[serde(default)]
+    pub recoil: Recoil,
+}
+
+/// 压枪 / 后坐力补偿(V2-1,原 W3-3)。参数语义**直接对齐 K2er 官方《鼠标宏》专页**,
+/// 先把原文抄在这里(教训见方案文档 S-12:参数名 ≠ 语义,抄原文再写代码):
+///
+/// > 鼠标宏需要配合瞄准模式或者瞄准（摇杆）一起使用，绑定触发快捷键触发时，控制视角向下移动。
+/// > 参数:
+/// > - 绑定触发快捷键: 一般是鼠标左键，如果是手柄的话，就是R2。
+/// > - 控制频率: 每秒控制的次数。
+/// > - 控制强度: 可以增加多个强度，每按一次快捷键，就会切换一个强度。也可以开启鼠标滚轮改变强度
+/// > - 鼠标滚轮改变强度: 用鼠标滚轮的滚动来快速切换当前的强度
+/// > - 摇晃: 随机左右摇晃
+/// > - 覆盖灵敏度: 当触发鼠标宏时，覆盖瞄准的灵敏度
+///
+/// (原文出处 https://doc.k2er.com/mappings/recoil_zh.html ,2026-10-07 抓取)
+///
+/// 本程序的落法与对原文的对照:
+/// - **控制频率** = 每秒向下"控制"的次数:引擎按 1/频率 的节拍把增量并进瞄准偏移,
+///   合并成每拍最多一条 touch_move —— **不逐帧发命令**(方案 §4.13 V2-1 的实现要求);
+/// - **控制强度** = 每次控制的向下位移(设备像素,多档)。档位存放在配置里
+///   (`strengths`),"当前用哪一档"是**引擎侧运行状态**(配置只由界面写,引擎不改配置);
+/// - **鼠标滚轮改变强度** = 勾选后,触发键按住期间滚轮从"缩放"改为"换档"(松开触发键,
+///   滚轮仍是缩放)——这样不勾选/没按住时 FPS 滚轮缩放行为完全不变;
+/// - **摇晃** = 每次控制在水平方向叠加 ±shake_px 内的随机量(0 = 不打散);
+/// - **覆盖灵敏度** = 触发期间鼠标位移改用该灵敏度(<=0 = 不覆盖,仍用左右各自的值);
+/// - 原文"需要配合瞄准模式使用"→ 瞄准未激活(不满足 `aim_active`)时整个子系统不生效;
+/// - 本项目为**默认关闭**:开启后界面上明示"后坐力补偿"(产品立场,见方案 §3.2.2)。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Recoil {
+    /// 总开关。默认关闭(WASD+ 一类竞品明确"永不做自动压枪",本项属可选增强)。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 绑定触发快捷键(evdev 码;0 = 未绑定)。K2er 原文:一般是鼠标左键。
+    #[serde(default)]
+    pub trigger_key: u16,
+    /// 控制频率:每秒控制的次数(收敛到 1..=240;默认 60)。
+    #[serde(default = "default_recoil_rate")]
+    pub rate_hz: f32,
+    /// 控制强度:多档,每档 = 每次控制的向下像素位移。空表按单档默认值处理。
+    #[serde(default = "default_recoil_strengths")]
+    pub strengths: Vec<f32>,
+    /// 鼠标滚轮改变强度:触发键按住期间,滚轮优先用于换档(否则仍是 FPS 缩放)。
+    #[serde(default)]
+    pub wheel_switch: bool,
+    /// 摇晃:每次控制在左右方向的随机抖动上限(设备像素;0 = 不摇晃)。
+    #[serde(default)]
+    pub shake_px: f32,
+    /// 覆盖灵敏度:触发期间鼠标位移改用该值(<= 0 表示不覆盖)。
+    #[serde(default)]
+    pub sensitivity: f32,
+}
+
+impl Default for Recoil {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            trigger_key: 0,
+            rate_hz: default_recoil_rate(),
+            strengths: default_recoil_strengths(),
+            wheel_switch: false,
+            shake_px: 0.0,
+            sensitivity: 0.0,
+        }
+    }
+}
+
+fn default_recoil_rate() -> f32 {
+    60.0
+}
+
+fn default_recoil_strengths() -> Vec<f32> {
+    vec![6.0]
+}
+
+impl Recoil {
+    /// 是否具备生效前提(开启 + 绑了触发键)。
+    pub fn armed(&self) -> bool {
+        self.enabled && self.trigger_key != 0
+    }
+
+    /// 第 `index` 档的强度(设备像素;越界收敛,空表返回 0 = 不产生位移)。
+    pub fn strength_at(&self, index: usize) -> f32 {
+        if self.strengths.is_empty() {
+            return 0.0;
+        }
+        self.strengths[index.min(self.strengths.len() - 1)].max(0.0)
+    }
 }
 
 impl Default for Aim {
@@ -1296,6 +1445,9 @@ impl Default for Aim {
             drag_deadzone: default_drag_deadzone(),
             boundary: default_boundary(),
             input_mode: ViewInputMode::TouchDrag,
+            wheel_zoom: default_wheel_zoom(),
+            wheel_zoom_step: default_wheel_zoom_step(),
+            recoil: Recoil::default(),
         }
     }
 }
@@ -1495,6 +1647,29 @@ impl ConfigFile {
                     changed = true;
                 }
             }
+            // W0-8:轮盘几何量一律按相对坐标收敛。v1 像素值不再有换算者
+            // (升级路径已按 O-7=B 删除,2026-10-07):v1 标记现在只可能来自
+            // 手改 YAML 漏写版本字段,数值无从解释 —— 不收敛的话,1e30 级的
+            // 半径会算出巨大推出距离,把引擎(debug 构建)直接算崩。
+            for w in &mut p.wheels {
+                let radius = clamp_unit_span(w.radius, default_wheel_radius());
+                if radius != w.radius {
+                    w.radius = radius;
+                    changed = true;
+                }
+                let cx = clamp_unit_pos(w.cx, 0.5);
+                let cy = clamp_unit_pos(w.cy, 0.5);
+                if cx != w.cx || cy != w.cy {
+                    w.cx = cx;
+                    w.cy = cy;
+                    changed = true;
+                }
+                let cr = clamp_unit_span(w.center_radius, default_center_radius());
+                if cr != w.center_radius {
+                    w.center_radius = cr;
+                    changed = true;
+                }
+            }
             p.combos
                 .retain(|combo| combo.keys.len() >= 2 && combo.keys.iter().all(|key| *key != 0));
             for combo in &mut p.combos {
@@ -1572,6 +1747,7 @@ pub const YAML_HEADER: &str = r#"# =============================================
 #                  每套里另有一份 format_version,由程序自动维护:
 #                  读取时统一按当前格式处理,手改它没有作用。
 #   toggle_key   : 映射总开关的切换键(evdev 码,默认 66=F8)
+#   cursor_toggle_key : 鼠标消隐切换键(按一下隐藏系统光标,再按一下恢复;0=未绑定)
 #   screen       : 设计这套布局时的屏幕尺寸 [宽, 高](仅作参考,可不填)
 #   binds        : 键位绑定列表
 #     - key      : 物理键(evdev 码;鼠标左/右/中=272/273/274,滚轮=277上/278下/279左/280右)
@@ -1588,13 +1764,14 @@ pub const YAML_HEADER: &str = r#"# =============================================
 #     radius     : 视觉半径(相对屏幕宽度的比例)
 #     scope      : 影响范围倍数(手指实际被推离中心的距离 = radius × scope)
 #     mode       : classic(经典)/sensitive(灵敏,同轴后按覆盖)
-#     temp       : 可选。临时轮盘:key = 启用键(evdev 码),mode = hold|toggle
+#     temp       : 可选。临时轮盘:key = 启用键(evdev 码),mode = Hold|Toggle
+#                  (与文件里其它枚举一样,取值首字母大写 —— 这是实际序列化写法)
 #   aim          : 鼠标视角(FPS / 开放世界)
 #     enabled / anchor_x / anchor_y : 是否启用 + 手指落下的锚点(相对坐标)
 #     sensitivity_x / sensitivity_y : 每 1 个鼠标计数对应的设备像素
 #     move_speed : view speed multiplier (0.2..3.0, default 1.0; touch/open-world/gamepad)
 #     invert_y   : 是否反转纵向
-#     recenter   : 归中策略 idle|threshold|never
+#     recenter   : 归中策略 Idle|Threshold|Never(首字母大写,同上)
 #     recenter_idle_ms / recenter_threshold : 静止归中时长 / 阈值归中的偏移阈值
 #     hold_key   : 仅当该鼠标键按住时才瞄准(evdev 码;0 = 始终瞄准)
 #     capture_mouse : FPS 模式指针消隐(默认 true)
@@ -1608,7 +1785,7 @@ pub const YAML_HEADER: &str = r#"# =============================================
 #                  legacy uhid_mouse / aoa_mouse are migrated to touch_drag.
 #   look         : 外观(配色/密度/背景图),随组合一起保存
 #
-# 动作(action)四种写法(注意类型用 YAML 标签标出,即 !Tap 这种写法;
+# 动作(action)五种写法(注意类型用 YAML 标签标出,即 !Tap 这种写法;
 # 手改时要连感叹号一起写,否则解析会失败):
 #   !Tap       : 点按。x, y 为落点(相对坐标),duration_ms=0 表示按住不松手
 #                直到再次按下同一键才抬起;radius 为响应范围
@@ -1616,79 +1793,13 @@ pub const YAML_HEADER: &str = r#"# =============================================
 #   !Swipe     : 滑动。start/end 为起终点,duration_ms 为时长,
 #                easing 为缓动,path 为轨迹(取值见界面里的下拉选项)
 #   !AndroidKey: 注入 Android 系统键。keycode 例:4=返回, 3=主页, 187=最近任务
+#   !Macro     : 宏。steps = 录制得到的按键步骤(自动合并自动重复);
+#                instructions = 设置宏的语义操作,每项用 type 区分:
+#                delay / key / combo / wheel / fps / click / swipe / macro;
+#                virtual_profile 存在时为"扩展宏"的虚拟键位层。
+#                (两项都由界面生成;手改容易与界面状态对不上)
 # ============================================================================
 "#;
-
-/// 这份像素坐标布局是否"装得进"给定坐标空间(所有点都落在画面内)。
-///
-/// 这是防止升级毁配置的关键判据:手机竖着截屏时(宽 1080),横屏布局的像素
-/// 坐标(x 最大约 2772)除以竖屏宽度会得到 >1 的相对值 —— 换算本身"成功"了,
-/// 但键位全部错位。这种方向/尺寸不匹配的情况下直接不升级,保持像素模式:
-/// 像素坐标是原样使用的,不该为了换个单位就把用户辛苦调好的布局算坏。
-fn pixels_fit_space(profile: &Profile, space: (u32, u32)) -> bool {
-    let (w, h) = (space.0 as f32, space.1 as f32);
-    let mut points: Vec<(f32, f32)> = Vec::new();
-    for b in &profile.binds {
-        match &b.action {
-            Action::Tap { x, y, .. } | Action::Hold { x, y, .. } => points.push((*x, *y)),
-            Action::Swipe(s) => {
-                points.push(s.start);
-                points.push(s.end);
-            }
-            Action::AndroidKey { .. } => {}
-            Action::Macro(_) => {}
-        }
-    }
-    for wl in &profile.wheels {
-        points.push((wl.cx, wl.cy));
-    }
-    points
-        .iter()
-        .all(|(x, y)| *x >= -1.0 && *x <= w + 1.0 && *y >= -1.0 && *y <= h + 1.0)
-}
-
-/// 把旧格式(v1,像素坐标)的配置升级为相对坐标。
-/// 需要屏幕尺寸才能换算,因此在"得知当前屏幕尺寸"时调用(连接成功或截图之后),
-/// 且任何注入之前调用,保证不会出现"按错误单位注入"的中间态。
-/// 返回是否发生了升级。
-pub fn upgrade_profile(profile: &mut Profile, space: (u32, u32)) -> bool {
-    let (w, h) = space;
-    if profile.format_version >= PROFILE_VERSION || w == 0 || h == 0 {
-        return false;
-    }
-    // 像素布局"装不进"这个坐标空间时绝不做换算 —— 见 pixels_fit_space 的说明
-    if !pixels_fit_space(profile, space) {
-        return false;
-    }
-    let (fw, fh) = (w as f32, h as f32);
-    let rel_x = |v: f32| v / fw;
-    let rel_y = |v: f32| v / fh;
-    for b in &mut profile.binds {
-        match &mut b.action {
-            Action::Tap { x, y, radius, .. } | Action::Hold { x, y, radius, .. } => {
-                *x = rel_x(*x);
-                *y = rel_y(*y);
-                *radius = rel_x(*radius);
-            }
-            Action::Swipe(s) => {
-                s.start = (rel_x(s.start.0), rel_y(s.start.1));
-                s.end = (rel_x(s.end.0), rel_y(s.end.1));
-            }
-            Action::AndroidKey { .. } => {}
-            Action::Macro(_) => {}
-        }
-    }
-    for wheel in &mut profile.wheels {
-        wheel.cx = rel_x(wheel.cx);
-        wheel.cy = rel_y(wheel.cy);
-        wheel.radius = rel_x(wheel.radius);
-    }
-    profile.aim.anchor_x = rel_x(profile.aim.anchor_x);
-    profile.aim.anchor_y = rel_y(profile.aim.anchor_y);
-    profile.format_version = PROFILE_VERSION;
-    profile.screen = Some(space);
-    true
-}
 
 /// 键码 -> 可读名称(按平台取各自来源的名称,码空间统一)
 #[cfg(target_os = "linux")]
@@ -1759,116 +1870,9 @@ mod tests {
         assert_eq!(zoom_radius(d * 0.99, 1.0), d);
     }
 
-    /// 回归:竖屏截图的尺寸不得用来换算横屏像素布局 —— 那会把键位整体算坏
-    #[test]
-    fn upgrade_refuses_mismatched_orientation() {
-        let mut p = Profile {
-            format_version: 1,
-            binds: vec![KeyBind {
-                fps_only: false,
-                key: 37,
-                action: Action::Hold {
-                    x: 2462.0,
-                    y: 1038.0,
-                    radius: 35.2,
-                },
-            }],
-            ..Profile::default()
-        };
-        // 竖屏空间(宽 1280):横屏的 x=2462 装不进去 —— 必须拒绝升级
-        assert!(!upgrade_profile(&mut p, (1280, 2772)));
-        assert_eq!(p.format_version, 1, "不匹配时不得升级");
-        assert_eq!(
-            p.binds[0].action,
-            Action::Hold {
-                x: 2462.0,
-                y: 1038.0,
-                radius: 35.2,
-            }
-        );
-        // 横屏空间(宽 2772):装得下 —— 正常升级为相对坐标,且位置不变
-        assert!(upgrade_profile(&mut p, (2772, 1280)));
-        assert_eq!(p.format_version, PROFILE_VERSION);
-        let m = p.mapper((2772, 1280));
-        match &p.binds[0].action {
-            Action::Hold { x, y, .. } => {
-                assert!((*x - 2462.0 / 2772.0).abs() < 1e-6);
-                assert_eq!((m.x(*x), m.y(*y)), (2462, 1038));
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    /// 旧配置(像素坐标)升级为相对坐标后,在同一分辨率下注入的像素必须完全一致
-    /// —— 升级不得改变任何既有按键的实际位置。
-    #[test]
-    fn upgrade_profile_keeps_pixel_positions() {
-        let mut p = Profile {
-            format_version: 1,
-            binds: vec![KeyBind {
-                fps_only: false,
-                key: 17,
-                action: Action::Tap {
-                    x: 540.0,
-                    y: 1200.0,
-                    duration_ms: DEFAULT_TAP_DURATION_MS,
-                    radius: 35.2,
-                },
-            }],
-            wheels: vec![Wheel {
-                up: 17,
-                down: 31,
-                left: 30,
-                right: 32,
-                cx: 300.0,
-                cy: 900.0,
-                radius: 120.0,
-                scope: DEFAULT_WHEEL_SCOPE,
-                mode: WheelMode::Classic,
-                kind: WheelKind::Standard,
-                directions: Vec::new(),
-                center_radius: default_center_radius(),
-                execute_duration_ms: default_execute_duration(),
-                temp: None,
-            }],
-            ..Profile::default()
-        };
-        p.aim.anchor_x = 810.0;
-        p.aim.anchor_y = 1200.0;
-
-        assert_eq!(p.coord_unit(), CoordUnit::Pixel);
-        assert_eq!(
-            p.aim.move_speed, 1.0,
-            "old aim configs default to 1.0x speed"
-        );
-        assert!(upgrade_profile(&mut p, (1080, 2400)));
-        assert_eq!(p.format_version, PROFILE_VERSION);
-        assert!(!upgrade_profile(&mut p, (1080, 2400)), "不应重复升级");
-
-        // 同分辨率:像素与升级前逐一相同
-        let m = p.mapper((1080, 2400));
-        match &p.binds[0].action {
-            Action::Tap { x, y, radius, .. } => {
-                assert_eq!((m.x(*x), m.y(*y)), (540, 1200));
-                assert!((m.len(*radius) - 35.2).abs() < 0.01);
-            }
-            _ => unreachable!(),
-        }
-        let w = &p.wheels[0];
-        assert_eq!((m.x(w.cx), m.y(w.cy)), (300, 900));
-        assert!((m.len(w.radius) - 120.0).abs() < 0.01);
-        assert_eq!((m.x(p.aim.anchor_x), m.y(p.aim.anchor_y)), (810, 1200));
-
-        // 换分辨率(如换手机):按比例自适应,不再错位
-        let m2 = p.mapper((720, 1600));
-        match &p.binds[0].action {
-            Action::Tap { x, y, .. } => assert_eq!((m2.x(*x), m2.y(*y)), (360, 800)),
-            _ => unreachable!(),
-        }
-    }
-
-    /// 旧版(0.1.2 及以前)写出的 json 必须仍能原样读入:
+    /// 旧版(0.1.2 及以前)写出的 json 仍能原样读入,并按像素直通使用:
     /// 坐标是整数、没有 format_version / screen / look。
+    /// v1→v2 自动升级已删(2026-10-07 O-7=B)——"直通、不换算"是唯一行为。
     #[test]
     fn legacy_json_still_loads_as_pixels() {
         let legacy = r#"{
@@ -1886,11 +1890,15 @@ mod tests {
                      "recenter_idle_ms": 120, "recenter_threshold": 400, "hold_key": 0,
                      "capture_mouse": true }
         }"#;
-        let mut p: Profile = serde_json::from_str(legacy).expect("旧配置应仍可解析");
+        let p: Profile = serde_json::from_str(legacy).expect("旧配置应仍可解析");
         assert_eq!(p.format_version, 1);
         assert_eq!(p.coord_unit(), CoordUnit::Pixel);
+        assert_eq!(
+            p.aim.move_speed, 1.0,
+            "old aim configs default to 1.0x speed"
+        );
 
-        // 升级前直通像素:与旧版行为逐一致
+        // 像素直通:与旧版行为逐一相同
         let m = p.mapper((1080, 2400));
         match &p.binds[0].action {
             Action::Tap { x, y, .. } => assert_eq!((m.x(*x), m.y(*y)), (540, 1200)),
@@ -1900,16 +1908,8 @@ mod tests {
             Action::Swipe(s) => assert_eq!(m.point(s.start.0, s.start.1), (100, 200)),
             _ => unreachable!(),
         }
-
-        // 升级后重取换算器(单位已变为相对值),落点仍是同一像素
-        assert!(upgrade_profile(&mut p, (1080, 2400)));
-        let m2 = p.mapper((1080, 2400));
-        match &p.binds[0].action {
-            Action::Tap { x, y, .. } => assert_eq!((m2.x(*x), m2.y(*y)), (540, 1200)),
-            _ => unreachable!(),
-        }
-        assert_eq!((m2.x(p.aim.anchor_x), m2.y(p.aim.anchor_y)), (810, 1200));
-        assert_eq!(m2.point(p.wheels[0].cx, p.wheels[0].cy), (300, 900));
+        assert_eq!((m.x(p.aim.anchor_x), m.y(p.aim.anchor_y)), (810, 1200));
+        assert_eq!(m.point(p.wheels[0].cx, p.wheels[0].cy), (300, 900));
     }
 
     /// 新增的"影响范围"字段:老配置(没有该字段)读入后必须是 1.0,
@@ -2113,6 +2113,51 @@ mod tests {
         assert_eq!(back, doc);
     }
 
+    /// V2-1 压枪:老配置(aim 里没有 `recoil` 字段)读入后必须"关闭 + 默认参数";
+    /// 档位取值越界收敛与 armed 前提一并锁死。
+    #[test]
+    fn recoil_defaults_off_and_strength_clamps() {
+        // 老配置:没有 recoil 字段(其余字段按当年 `Aim` 的必填项给全)
+        let old = r#"{
+            "enabled": true, "anchor_x": 0.5, "anchor_y": 0.5,
+            "sensitivity_x": 2.0, "sensitivity_y": 2.0, "invert_y": false,
+            "recenter": "Idle", "recenter_idle_ms": 120, "recenter_threshold": 400,
+            "hold_key": 0
+        }"#;
+        let a: Aim = serde_json::from_str(old).expect("老配置应可解析");
+        assert!(!a.recoil.enabled, "缺省默认必须是关闭");
+        assert_eq!(a.recoil.rate_hz, 60.0);
+        assert_eq!(a.recoil.trigger_key, 0);
+        assert_eq!(a.recoil.strengths, vec![6.0]);
+
+        // armed:开启 + 绑了触发键才算具备前提(只开不绑 = 无处触发)
+        let armed = Recoil {
+            enabled: true,
+            trigger_key: BTN_LEFT,
+            ..Recoil::default()
+        };
+        assert!(armed.armed());
+        let unbound = Recoil {
+            enabled: true,
+            trigger_key: 0,
+            ..Recoil::default()
+        };
+        assert!(!unbound.armed(), "没绑触发键不算 armed");
+
+        // strength_at:越界收敛到最后一档;空表返回 0(不产生位移)
+        let r = Recoil {
+            strengths: vec![3.0, 9.0],
+            ..Recoil::default()
+        };
+        assert_eq!(r.strength_at(0), 3.0);
+        assert_eq!(r.strength_at(9), 9.0, "越界必须收敛到最后一档");
+        let empty = Recoil {
+            strengths: vec![],
+            ..Recoil::default()
+        };
+        assert_eq!(empty.strength_at(0), 0.0);
+    }
+
     /// 手改坏的 YAML 要被规整回自洽状态,而不是让程序崩掉或行为诡异
     #[test]
     fn normalize_repairs_out_of_range_switch_keys() {
@@ -2165,6 +2210,60 @@ mod tests {
         assert_eq!(
             empty.active_profile().map(|p| p.name.as_str()),
             Some("默认配置")
+        );
+    }
+
+    /// W0-8 回归(P0-8):手改 YAML 把轮盘几何量写坏(负数/NaN/超大/出屏),
+    /// 加载后必须收敛成合法值。
+    ///
+    /// 不收敛的后果:半径 × 屏宽算出巨大的推出距离 → 注入点飞出屏幕被设备端
+    /// 整条丢弃("这个方向推不动");debug 构建下 i32 加法还会溢出 panic,
+    /// 引擎线程一死,之后所有按键静默失效。
+    #[test]
+    fn normalize_clamps_wheel_geometry() {
+        let mut doc = ConfigFile::default();
+        let profile = doc.schemes.first_mut().expect("默认组合");
+        profile.wheels[0].radius = 1.0e30; // 超大
+        profile.wheels[0].cx = f32::NAN; // 非有限
+        profile.wheels[0].cy = -3.0; // 负数(出屏)
+        profile.wheels[0].center_radius = f32::INFINITY;
+
+        assert!(doc.normalize(), "写坏的几何量必须报告改动");
+        let w = &doc.schemes[0].wheels[0];
+        assert!(
+            w.radius.is_finite() && w.radius > 0.0 && w.radius <= 1.0,
+            "半径必须收敛到 (0,1],实际 {}",
+            w.radius
+        );
+        assert!(
+            (0.0..=1.0).contains(&w.cx) && (0.0..=1.0).contains(&w.cy),
+            "中心必须落在屏内,实际 ({}, {})",
+            w.cx,
+            w.cy
+        );
+        assert!(
+            w.center_radius.is_finite() && w.center_radius > 0.0 && w.center_radius <= 1.0,
+            "中心半径必须收敛到 (0,1],实际 {}",
+            w.center_radius
+        );
+        assert!(!doc.normalize(), "规整过一次之后就该自洽了");
+
+        // v1 标记(手改 YAML 漏写版本字段)同样一律收敛:升级路径已删
+        // (2026-10-07 O-7=B),像素值已无换算者,原样留着只会让 1e30 级
+        // 坏值绕过保护。radius=150 收敛到上限 1.0,cx=300 收敛到屏内 1.0。
+        let mut legacy = ConfigFile::default();
+        legacy.schemes[0].format_version = 1;
+        legacy.schemes[0].wheels[0].radius = 150.0;
+        legacy.schemes[0].wheels[0].cx = 300.0;
+        assert!(legacy.normalize(), "v1 标记也要收敛并改写成当前版本");
+        assert_eq!(
+            (
+                legacy.schemes[0].wheels[0].radius,
+                legacy.schemes[0].wheels[0].cx,
+                legacy.schemes[0].format_version,
+            ),
+            (1.0, 1.0, PROFILE_VERSION),
+            "v1 像素值不再有豁免:一律按相对坐标收敛"
         );
     }
 }

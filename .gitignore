@@ -3,3 +3,16 @@
 profile.json
 /target-linux-glibc231/
 /target-rebuild/
+
+# 构建产物（2026-10-06 W2-4 ③ / 决策 D5=A：只停止跟踪，不重写 Git 历史）
+harmonyos/**/build/
+release/history/
+
+# 发布产物（2026-10-07 V1-2 ②：release/ 只跟踪构建脚本与 README，
+# 二进制/压缩包留在盘上但不进 Git；历史包统一放 history/）
+/release/linux-x86_64/
+/release/windows-x86_64/
+/release/harmonyos-pc/
+/release/harmonyos-companion/
+/release/scrcpy-pad-*.tar.gz
+/release/scrcpy-pad-*.zip

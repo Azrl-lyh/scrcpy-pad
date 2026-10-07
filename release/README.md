@@ -22,6 +22,8 @@ release/
 
 `linux-x86_64/` 与 `windows-x86_64/` 始终替换为最新构建，均为自包含目录，内含可执行文件、`icons/`、`README.md`、`LICENSE` 与启动脚本；压缩包由这两个目录打包而成。历史版本只保留压缩包，统一放在 `history/`。
 
+**本目录的二进制与压缩包不进 Git**（2026-10-07 起停止跟踪，`.gitignore` 已排除；早前版本仍留在 Git 历史里）。Git 中只跟踪 5 个文件：`build.sh`、`build.ps1`、`build.bat`、`Makefile`、`README.md`。
+
 ## 构建
 
 ### Linux / macOS 主机

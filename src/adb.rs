@@ -712,6 +712,30 @@ fn split_args(input: &str) -> Vec<String> {
     result
 }
 
+/// 从 scrcpy 的一行输出里解析 `--print-fps` 的帧率 —— 投屏流的**真实**帧率。
+///
+/// scrcpy 的 FPS 计数器每秒打印一行,格式(见 scrcpy 源码 `run_fps_counter`):
+/// `%u fps` 或 `%u fps (+%u frames skipped)`;经 scrcpy 的日志器会带上
+/// `INFO: ` 前缀,再经本程序日志通道转发时又会加 `scrcpy stdout: ` 前缀,
+/// 所以两种前缀都剥掉。只认"数字 + fps(+ 可选括号说明)"的干净行,避免把
+/// 别的含 " fps" 的字串(参数回显之类)误吃进来。
+pub(crate) fn parse_scrcpy_fps(line: &str) -> Option<f32> {
+    let t = line.trim();
+    let t = t.strip_prefix("scrcpy stdout: ").unwrap_or(t).trim_start();
+    let t = t
+        .strip_prefix("INFO: ")
+        .or_else(|| t.strip_prefix("DEBUG: "))
+        .unwrap_or(t);
+    let (num, rest) = t.split_once(" fps")?;
+    let v: f32 = num.trim().parse().ok()?;
+    let rest = rest.trim();
+    if !(rest.is_empty() || rest.starts_with('(')) {
+        return None;
+    }
+    // 0 是计数器停摆的占位;"每小时几十万帧"不可能是真实读数,当解析失败
+    (v > 0.0 && v <= 1000.0).then_some(v)
+}
+
 /// 启动常规 scrcpy 窗口。子进程 stdout/stderr 会逐行写入 diagnostics.log，
 /// 同时监控退出码，避免 GUI 只显示“已启动”而实际参数错误导致进程秒退。
 pub fn launch_scrcpy(exe: &str, serial: &str, extra_args: &str) -> Result<Receiver<String>> {
@@ -746,7 +770,13 @@ pub fn launch_scrcpy(exe: &str, serial: &str, extra_args: &str) -> Result<Receiv
         let tx = tx.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                crate::diag_info!("scrcpy", "stdout: {line}");
+                // --print-fps 的行一秒一条:它只服务于界面的"投屏帧率"显示,
+                // 记 info 级会把诊断日志刷爆 —— 降为 debug,需要时开级别看。
+                if parse_scrcpy_fps(&line).is_some() {
+                    crate::diag_debug!("scrcpy", "stdout: {line}");
+                } else {
+                    crate::diag_info!("scrcpy", "stdout: {line}");
+                }
                 let _ = tx.send(format!("scrcpy stdout: {line}"));
             }
         });
@@ -978,5 +1008,27 @@ mod tests {
         assert_eq!(parse_display_size(out), Some((2772, 1280)));
         // 解析不到时回退 None(由调用方退回 wm size)
         assert_eq!(parse_display_size("no size here"), None);
+    }
+
+    /// `--print-fps` 的实况行解析(2026-10-06):只认 "N fps" /
+    /// "N fps (+M frames skipped)" 两种形态,输入可能带着日志前缀;
+    /// 非帧率行与畸形数字绝不能误判成帧率。
+    #[test]
+    fn parses_scrcpy_print_fps_lines() {
+        assert_eq!(parse_scrcpy_fps("INFO: 60 fps"), Some(60.0));
+        assert_eq!(
+            parse_scrcpy_fps("INFO: 59 fps (+2 frames skipped)"),
+            Some(59.0)
+        );
+        assert_eq!(parse_scrcpy_fps("scrcpy stdout: INFO: 61 fps"), Some(61.0));
+        assert_eq!(parse_scrcpy_fps("29.5 fps"), Some(29.5));
+        // 非帧率行与畸形数字
+        assert_eq!(parse_scrcpy_fps("INFO: Texture: 2560x1184"), None);
+        assert_eq!(parse_scrcpy_fps("INFO: Device: QOGQKBXOMFOVC6XS"), None);
+        assert_eq!(parse_scrcpy_fps("INFO: abc fps"), None);
+        assert_eq!(parse_scrcpy_fps("INFO: 60 fpsx"), None);
+        assert_eq!(parse_scrcpy_fps("INFO: 0 fps"), None);
+        assert_eq!(parse_scrcpy_fps("INFO: -1 fps"), None);
+        assert_eq!(parse_scrcpy_fps("INFO: 5000 fps"), None);
     }
 }

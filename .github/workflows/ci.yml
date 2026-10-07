@@ -1,0 +1,122 @@
+# 持续集成（W2-5）。
+#
+# 三件事：
+#   1. windows-latest：主平台全量 —— 单元测试 + `cargo fmt --check` + clippy。
+#      Windows 侧是低级钩子 / Raw Input 的唯一真实编译路径，每次提交都要过。
+#   2. ubuntu-latest：Linux 代码路径的编译与测试（evdev / xdg-portal 等
+#      `#[cfg(target_os = "linux")]` 分支）。
+#      说明：计划里写的 ubuntu-20.04 **已从 GitHub 托管 runner 退役**（2025 年起
+#      不再可用），而 glibc 下限（2.30/2.31）依旧由本地 WSL Ubuntu-20.04 打包保证
+#      （`release/build.sh`）。CI 的 Ubuntu 只负责"编得过 + 测试绿"，不产出发布包。
+#   3. tag 推送（v*）：在 windows-latest 上跑 `release/build.ps1 -Target windows`
+#      的等价步骤，确认发布产物能产出并留档为 artifact；**不自动创建 Release**
+#      ——发布仍由维护者手动确认（见《环境开发注意事项》的"未获明确要求不提交"约定）。
+name: CI
+
+on:
+  push:
+    branches: [main, developing]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows · 测试 / fmt / clippy
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust（含 rustfmt / clippy）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 单元测试
+        run: cargo test --bin scrcpy-pad --locked
+
+      - name: 格式检查
+        run: cargo fmt --check
+
+      # 现阶段是 warning 级：clippy 只在**硬错误**上失败，告警本身不拦提交
+      # （基线见 ci/clippy-baseline.txt，数量与构成记在《全面审计与提升方案》W2-4）。
+      - name: clippy（--all-targets）
+        run: cargo clippy --all-targets --locked
+
+      - name: clippy 与基线比对（信息性，不拦提交）
+        run: python ci/clippy_diff.py
+        continue-on-error: true
+
+  linux:
+    name: Linux · 测试（evdev / xdg-portal 路径）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # egui / eframe（glow + winit）的 X11 / Wayland 头文件；
+      # evdev、rfd 的 xdg-portal 后端都是纯 Rust，不需要额外系统库。
+      - name: 安装图形栈构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev libwayland-dev
+
+      - name: 安装 Rust（含 rustfmt / clippy）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 单元测试
+        run: cargo test --bin scrcpy-pad --locked
+
+      - name: 格式检查
+        run: cargo fmt --check
+
+      - name: clippy（Linux cfg 分支，warning 级）
+        run: cargo clippy --all-targets --locked
+
+  package:
+    name: 发布产物（仅 tag）
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 等价于维护者本地发布的第一步（Windows 包）；-Target linux 走 WSL，
+      # 托管 runner 上没有 WSL，故此处只验证 Windows 产物。
+      - name: 产出 Windows 包
+        shell: pwsh
+        run: pwsh -ExecutionPolicy Bypass -File ./release/build.ps1 -Target windows
+
+      - name: 校验产物存在且非空
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $zip = "release/scrcpy-pad-$version-windows-x86_64.zip"
+          if (-not (Test-Path -LiteralPath $zip)) { throw "未产出 $zip" }
+          if ((Get-Item -LiteralPath $zip).Length -lt 1MB) { throw "$zip 体积异常" }
+          Write-Host "产物就绪: $zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scrcpy-pad-windows-x86_64
+          path: release/scrcpy-pad-*-windows-x86_64.zip
+          if-no-files-found: error
