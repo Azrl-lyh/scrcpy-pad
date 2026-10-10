@@ -25,9 +25,10 @@ use crate::capture::CaptureEvent;
 use crate::control::{ControlClient, GAMEPAD_HID_ID, GAMEPAD_REPORT_DESC};
 use crate::diag_warn;
 use crate::keymap::{
-    Action, Aim, BTN_WHEEL_DOWN, BTN_WHEEL_UP, KeyBind, KeyCombo, MacroAction, MacroInstruction,
-    MacroWheelPart, Mapper, Profile, RecenterMode, SWIPE_SAMPLES, SwitchDirection, SwitchKey,
-    TempMode, ViewInputMode, Wheel, WheelKind, WheelMode, easing_apply, key_name, swipe_points,
+    Action, Aim, BTN_WHEEL_DOWN, BTN_WHEEL_LEFT, BTN_WHEEL_RIGHT, BTN_WHEEL_UP, KeyBind, KeyCombo,
+    KeySet, MacroAction, MacroInstruction, MacroWheelPart, Mapper, Profile, RecenterMode,
+    SWIPE_SAMPLES, SwitchDirection, SwitchKey, TempMode, ViewInputMode, Wheel, WheelKind,
+    WheelMode, easing_apply, is_wheel_code, key_name, swipe_points,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,6 +101,23 @@ mod consts {
     /// 而不是两点乱跳。
     pub const ZOOM_MOVE_STEPS: u64 = 3;
 
+    // ---------- 滚轮"连续触发" ----------
+
+    /// 滚轮停转多久之后,那一齿才算"松手"(用户 2026-10-10 第 2 条:
+    /// "滚轮不再按单键处理,改为连续触发")。
+    ///
+    /// 捕获层把一枚滚轮齿发成"按下 + 立刻抬起"的一对事件(两个平台一致),
+    /// 于是滚轮键在引擎里一直是**单键点按**:滚一下就"按、松、按、松"地抖,
+    /// 长按型动作(长按/摇杆方向/临时摇杆启用键)只能得到一连串瞬发触点,
+    /// 手感是断的。现在把"抬起"扣下来顺延到滚轮真的停转 —— 连续转多久,
+    /// 键位就按多久。
+    ///
+    /// 取值:一齿的间隔常见 10~40ms(高精度滚轮更密),停手后 90ms 内不会
+    /// 再来的概率很高;而 90ms 又短到"松手 → 动作结束"几乎与松手同感。
+    /// 太小(如 30ms)会在正常滚动的齿间隔里断掉,等于没改;
+    /// 太大(如 300ms)会让"滚一下就走"的动作拖着尾巴。
+    pub const WHEEL_HOLD_MS: u64 = 90;
+
     // ---------- 宏触点分配 ----------
     // 公式:pid = MACRO_PID_BASE + (exec % MACRO_EXEC_LANES) * MACRO_EXEC_STRIDE + slot
     // (使用处与理由见 `MacroPlan`)
@@ -145,6 +163,9 @@ mod consts {
     pub const IDLE_SLOW_MS: u64 = 16;
 
     // ---------- 虚拟手柄轴值 ----------
+    // ⚠️【已废弃 deprecated · 2026-10-08】只服务"虚拟手柄右摇杆(连续/分段回中)"
+    // 这个不再维护的视角通道(keymap.rs `ViewInputMode::VirtualGamepad*`)。
+    // 保留现有行为以兼容既有配置:不修复、不扩展、不加新功能。
 
     pub const GAMEPAD_AXIS_CENTER: f32 = 32768.0;
     pub const GAMEPAD_AXIS_MAX: f32 = 65535.0;
@@ -332,15 +353,22 @@ impl ComboGate {
         // 否则功能键被 45/120ms 判定窗口延迟或吞掉。
         // 典型表现就是“按了 F8 也停不下映射”。
         // 这些键是全局控制，优先级高于普通组合键。
-        if event.code == profile.toggle_key
-            || event.code == profile.cursor_toggle_key
-            || event.code == profile.aim.toggle_key
-            || event.code == profile.aim.suspend_key
-            || event.code == profile.aim.hold_key
+        //
+        // 组合键(2026-10-09):判据从"整个键位等于功能键"放宽成"事件是这个
+        // 功能键集合的**成员**"—— 组合键的两个键都得立刻到达引擎,
+        // 谁先按下去都不能被判定窗口扣住。代价:某个普通组合键的成员若同时
+        // 被用作功能键,那个普通组合键不再触发(功能键优先,与单键时代一致)。
+        let system_key_member = profile.toggle_key.contains(&event.code)
+            || profile.cursor_toggle_key.contains(&event.code)
+            || profile.aim.toggle_key.contains(&event.code)
+            || profile.aim.suspend_key.contains(&event.code)
+            || profile.aim.hold_key.contains(&event.code)
+            || profile.aim.recoil.trigger_key.contains(&event.code)
+            || profile.aim.recoil.switch_key.contains(&event.code)
             || switch_keys
                 .iter()
-                .any(|s| s.effective_keys().contains(&event.code))
-        {
+                .any(|s| s.effective_keys().contains(&event.code));
+        if system_key_member {
             return Some(EngineInput::Button(event, Source::Physical));
         }
         if !profile.combos_enabled || profile.combos.is_empty() {
@@ -444,10 +472,13 @@ fn leader_still_possible(combos: &[KeyCombo], leader: &ChordLeader, code: u16) -
 
 fn key_has_single_action(profile: &Profile, code: u16) -> bool {
     profile.binds.iter().any(|bind| bind.key == code)
-        || profile.toggle_key == code
-        || profile.aim.toggle_key == code
-        || profile.aim.suspend_key == code
-        || profile.aim.hold_key == code
+        || profile.toggle_key.contains(&code)
+        || profile.cursor_toggle_key.contains(&code)
+        || profile.aim.toggle_key.contains(&code)
+        || profile.aim.suspend_key.contains(&code)
+        || profile.aim.hold_key.contains(&code)
+        || profile.aim.recoil.trigger_key.contains(&code)
+        || profile.aim.recoil.switch_key.contains(&code)
         || profile.wheels.iter().any(|wheel| wheel.owns_key(code))
 }
 
@@ -565,6 +596,96 @@ impl Held {
     }
 }
 
+/// 滚轮"连续触发"闩锁(用户 2026-10-10 第 2 条)。
+///
+/// 捕获层把一枚滚轮齿发成"按下 + 立刻抬起"**一对**事件(Windows/Linux 都如此,
+/// 见 `capture.rs` 的滚轮分支),于是滚轮键在引擎里一直是单键点按:滚一下就是
+/// "按、松、按、松"地抖。用户要的是"滚轮不再按单键处理,改为连续触发" ——
+/// 所以这里把每方向的那一齿**扣住**:落齿时把到期时刻顺延到 `now + WHEEL_HOLD_MS`,
+/// 真正的"抬起"由定期维护在停转之后发出(见 `run()` 里滚轮闩锁那一段)。
+///
+/// 与 [`Held`] 的分工:`Held` 是"用户的手此刻真的按着什么"的唯一依据,滚轮键在
+/// 里面会**故意残留**到停转为止(所以它同时是普通绑定/轮盘方向/临时摇杆的连续
+/// 依据);`momentary` 是另一件事 —— 它记"这一齿是否已经算过按下",
+/// 于是**每一齿**都还能给出一个上升沿(点按、宏、换档、执行轮盘要的就是这个)。
+#[derive(Default)]
+struct WheelHold {
+    /// 每个方向(上/下/左/右)的到期时刻;滚轮还在转就不断往后顺延。
+    until: [Option<Instant>; 4],
+    /// 每方向"这一齿的按下是否已经算过":捕获层的即时抬起一到就清,
+    /// 于是下一齿仍是一次新的按下。
+    momentary: [bool; 4],
+}
+
+impl WheelHold {
+    /// 方向下标(与 [`Self::until`] 的位置一一对应)。
+    fn dir_of(code: u16) -> Option<usize> {
+        match code {
+            BTN_WHEEL_UP => Some(0),
+            BTN_WHEEL_DOWN => Some(1),
+            BTN_WHEEL_LEFT => Some(2),
+            BTN_WHEEL_RIGHT => Some(3),
+            _ => None,
+        }
+    }
+
+    /// 这一齿是否已经算过一次按下(用于给"每齿一次"的边沿)。
+    fn momentary(&self, code: u16) -> bool {
+        Self::dir_of(code).is_some_and(|d| self.momentary[d])
+    }
+
+    /// 记一次捕获层来的"按下/抬起"。只有按下会顺延到期时刻 ——
+    /// 那个"抬起"是"滚轮这一刻没动",不是用户松手,故不倒扣。
+    fn note(&mut self, code: u16, pressed: bool, now: Instant) {
+        let Some(d) = Self::dir_of(code) else { return };
+        self.momentary[d] = pressed;
+        if pressed {
+            self.until[d] = Some(now + Duration::from_millis(WHEEL_HOLD_MS));
+        }
+    }
+
+    /// 取走第一个"已经停转到点"的方向(每个方向只交出来一次)。
+    ///
+    /// 返回键码而不是方向下标,调用方拿着它去 [`Held::set`] 抬起。
+    /// 用 `Option` 而不是 `Vec`:这个函数每次定期维护都会被问一句
+    /// (每 4~16ms),绝大多数时候无事发生,不该为此分配。
+    fn next_expired(&mut self, now: Instant) -> Option<u16> {
+        const CODES: [u16; 4] = [
+            BTN_WHEEL_UP,
+            BTN_WHEEL_DOWN,
+            BTN_WHEEL_LEFT,
+            BTN_WHEEL_RIGHT,
+        ];
+        let d = self
+            .until
+            .iter()
+            .position(|u| u.is_some_and(|t| now >= t))?;
+        self.until[d] = None;
+        Some(CODES[d])
+    }
+
+    /// 通道断开/映射关闭:闩锁作废,并把还记着"按着"的滚轮键从物理镜像里清掉。
+    ///
+    /// 为什么必须清 [`Held`]:重连时会按物理镜像重建触点(见 `rebuild_now`),
+    /// 残留的一齿会被当成"用户还按着"补一个触点;而且残留还会让用户的下一齿
+    /// 不再是上升沿(点按/宏这类动作会静默失效一次)。
+    fn release_all(&mut self, held: &mut Held) {
+        const CODES: [u16; 4] = [
+            BTN_WHEEL_UP,
+            BTN_WHEEL_DOWN,
+            BTN_WHEEL_LEFT,
+            BTN_WHEEL_RIGHT,
+        ];
+        for (d, code) in CODES.iter().enumerate() {
+            if self.until[d].is_some() {
+                held.set(*code, false);
+            }
+        }
+        self.until = [None; 4];
+        self.momentary = [false; 4];
+    }
+}
+
 /// 引擎运行状态快照(界面诊断显示,回答"为什么按了没反应")
 #[derive(Default, Clone, Copy)]
 pub struct EngineLive {
@@ -574,6 +695,57 @@ pub struct EngineLive {
     pub refused: u64,
     /// 最近一次被放弃的按键(便于定位是哪个键被挤掉)
     pub last_refused: u16,
+}
+
+/// 「按后延迟」的冷却表(用户 2026-10-10 第 2 条)。
+///
+/// 每条键位 / 组合键各自一格"下一次按下最早可以发生的时刻":这一条上一次按下
+/// **结束之后**,按它自己的 `tail_delay_ms` 顺延。冷却还没过就按下来的那次输入
+/// **不丢** —— 它被推迟到冷却结束再执行(见 [`SchedAct::Redispatch`])。
+///
+/// 分条记而不是只记一个全局值:给某个键设了冷却,不该连带把别的键也变钝。
+#[derive(Default)]
+pub struct PressGates {
+    binds: Vec<Option<Instant>>,
+    combos: Vec<Option<Instant>>,
+}
+
+impl PressGates {
+    /// 读第 `i` 格的到期时刻;`None` = 这一条从没冷却过(不受限)。
+    ///
+    /// **读的时候绝不造格子**:造出来的格子只能拿"此刻"当时刻,而调用方紧接着
+    /// 一比就会发现 `now < 此刻` —— 于是**任何**第一次按下都被误判成"冷却里重按"
+    /// 排进推迟队列。表不够长就按"没冷却过"处理。
+    fn gate(v: &[Option<Instant>], i: usize) -> Option<Instant> {
+        v.get(i).copied().flatten()
+    }
+    /// 把第 `i` 格的冷却推到 `until`(只往后推,不提前)。新格子补 `None`(= 不受限),
+    /// 绝不能用"此刻"去填:那会把同一批补出来的其它下标一起锁住。
+    fn push(v: &mut Vec<Option<Instant>>, i: usize, until: Instant) {
+        if v.len() <= i {
+            v.resize(i + 1, None);
+        }
+        if v[i].is_none_or(|t| until > t) {
+            v[i] = Some(until);
+        }
+    }
+    fn bind_gate(&self, i: usize) -> Option<Instant> {
+        Self::gate(&self.binds, i)
+    }
+    fn combo_gate(&self, i: usize) -> Option<Instant> {
+        Self::gate(&self.combos, i)
+    }
+    fn hold_bind(&mut self, i: usize, until: Instant) {
+        Self::push(&mut self.binds, i, until);
+    }
+    fn hold_combo(&mut self, i: usize, until: Instant) {
+        Self::push(&mut self.combos, i, until);
+    }
+    /// 整表作废(断线 / 关映射 / 换组合):下一次按下从头算,不受上一轮的冷却牵连。
+    fn reset(&mut self) {
+        self.binds.clear();
+        self.combos.clear();
+    }
 }
 
 /// 把"普通绑定"的实际按下状态对齐到物理按键状态。
@@ -663,9 +835,12 @@ fn reconcile_wheels(
             break;
         }
         let engaged = w.temp.is_none() || wheels[j].active;
+        // R1:临时摇杆(启用中)对该键位有抢占优先级 —— 被抢走的键位上永久轮盘
+        // 视为"没按下",于是它会立刻回中/抬指(状态是推出来的,不是攒出来的)。
+        // 自己就是临时轮盘时不看这条(临时 vs 临时 = 一起响应,旧行为)。
         if w.kind == WheelKind::Standard {
             for (d, key) in [w.up, w.down, w.left, w.right].iter().enumerate() {
-                let want = engaged && held.has(*key);
+                let want = wheel_dir_wanted(profile, wheels, w.temp.is_some(), engaged, key, held);
                 if want && !wheels[j].pressed[d] {
                     wheels[j].next_seq = wheels[j].next_seq.wrapping_add(1);
                     wheels[j].press_seq[d] = wheels[j].next_seq;
@@ -674,7 +849,7 @@ fn reconcile_wheels(
             }
         } else {
             for (d, (_, key)) in w.active_dirs().iter().take(8).enumerate() {
-                let want = engaged && held.has(*key);
+                let want = wheel_dir_wanted(profile, wheels, w.temp.is_some(), engaged, key, held);
                 if want && !wheels[j].custom_pressed[d] {
                     wheels[j].next_seq = wheels[j].next_seq.wrapping_add(1);
                     wheels[j].custom_seq[d] = wheels[j].next_seq;
@@ -685,7 +860,9 @@ fn reconcile_wheels(
         // 本轮盘此刻若已经按着,update_wheel 不会再去申请新触点,故不必减掉自己
         let reserved = extra_pointers + wheel_pointers(wheels);
         if update_wheel(ctl, m, j, w, &mut wheels[j], reserved) {
-            refuse(live, w.up, RefuseReason::PoolFull);
+            // 上报"是哪个方向键按不下"用的代表码(空方向键集合退回 0,只影响日志文字)
+            let rep = w.up.first().copied().unwrap_or(0);
+            refuse(live, rep, RefuseReason::PoolFull);
         }
     }
 }
@@ -708,7 +885,8 @@ fn rederive_hold_temp_wheels(profile: &Profile, held: &Held, wheels: &mut [Wheel
         }
         if let Some(t) = &w.temp {
             if t.mode == TempMode::Hold {
-                wheels[j].active = held.has(t.key);
+                // 组合键启用键:整个集合都按着才算启用(与 `key_set_down` 同口径)。
+                wheels[j].active = t.key.all_held_by(|k| held.has(k));
             }
         }
     }
@@ -717,12 +895,71 @@ fn rederive_hold_temp_wheels(profile: &Profile, held: &Held, wheels: &mut [Wheel
 fn key_owned_by_wheel(profile: &Profile, wheels: &[WheelState], code: u16) -> bool {
     profile.wheels.iter().enumerate().any(|(j, w)| {
         if let Some(t) = &w.temp {
-            if t.key == code {
+            // 组合键启用键按**成员**判定:它任一成员按键都不能走普通绑定。
+            if t.key.contains(&code) {
                 return true;
             }
         }
         let engaged = w.temp.is_none() || wheels.get(j).map(|s| s.active).unwrap_or(false);
         engaged && w.owns_key(code)
+    })
+}
+
+/// R1(2026-10-08):**临时摇杆 > 永久摇杆**这条优先级。
+///
+/// 同一个物理键既落在"某个**已启用**的临时轮盘"的键位集合里、又落在某个永久轮盘的
+/// 方向键里时,只有临时轮盘响应;永久轮盘在这个键位上视为**没按下** ——
+/// 它要是正推着,会立刻回中/抬指(方向状态是 [`reconcile_wheels`] 按物理键推出来的,
+/// 不是自己攒出来的,所以"让位"是自动的、不留半个状态)。
+///
+/// 为什么要有这条:临时摇杆的语义就是"启用期间**占用/覆盖**普通摇杆的键位",
+/// 用户按住启用键 = 临时借走那几个键。旧行为是"两把轮盘一起响应"(见
+/// [`dispatch_input`] 的方向键分支),两套方向同时推到设备上,谁生效取决于游戏
+/// 怎么读触摸,手感是随机的。
+///
+/// 边界(有意如此):
+///   * 两个**永久**轮盘共用一键仍然一起响应 —— 旧行为,未改;
+///   * 两个**已启用的临时**轮盘之间也不互相让位 —— 这条优先级只管"临时 vs 永久";
+///   * 启用键本身也算临时轮盘的键位(`owns_key` 含启用键),与
+///     [`key_owned_by_wheel`] 同口径。
+fn key_taken_by_active_temp_wheel(profile: &Profile, wheels: &[WheelState], code: u16) -> bool {
+    profile.wheels.iter().enumerate().any(|(j, w)| {
+        w.temp.is_some() && wheels.get(j).map(|s| s.active).unwrap_or(false) && w.owns_key(code)
+    })
+}
+
+/// 对账时"某个方向键此刻该不该生效"的完整判定(纯函数,便于单测 R1 的抢占规则)。
+///
+/// 拆出来是因为 [`reconcile_wheels`] 需要 `&mut [WheelState]`(要写回 `pressed`),
+/// 而它内部又要拿 `wheels` 做只读查询 —— 闭包会同时借用两遍,过不了借用检查。
+/// 摊成一个不吃 `&mut` 的普通函数,`reconcile_wheels` 调用它,单测也调用它,
+/// "被抢占之后永久轮盘确实回中"这句话就直接测在真实代码上,而不是测一份抄写的公式。
+///
+/// `keys` 是该方向的触发键集合(用户 2026-10-10 第 2 条起支持组合键):
+///   * **按下**= 整个集合此刻都按着(`all_held_by`;空集合恒为 false —— 未绑定的方向永不触发);
+///   * **被抢占**= 集合里**任一成员**落在某个已启用临时轮盘的键位里 ——
+///     单键配置下与旧口径逐字一致,组合键下只要有一个成员被临时轮盘占走就让位。
+fn wheel_dir_wanted(
+    profile: &Profile,
+    wheels: &[WheelState],
+    is_temp: bool,
+    engaged: bool,
+    keys: &KeySet,
+    held: &Held,
+) -> bool {
+    let down = keys.all_held_by(|k| held.has(k));
+    let taken = keys
+        .iter()
+        .any(|k| key_taken_by_active_temp_wheel(profile, wheels, *k));
+    engaged && down && (is_temp || !taken)
+}
+
+/// 宏回放的 R1 判定:与 [`key_taken_by_active_temp_wheel`] 同规则,
+/// 只是"哪把临时轮盘启用着"要读宏自己的物理镜像(`MacroResolve::active`)——
+/// 宏回放不继承回放瞬间的实时状态(见 [`MacroResolve`] 的说明)。
+fn macro_key_taken_by_active_temp_wheel(vp: &Profile, rs: &MacroResolve, code: u16) -> bool {
+    vp.wheels.iter().enumerate().any(|(j, w)| {
+        w.temp.is_some() && rs.active.get(j).copied().unwrap_or(false) && w.owns_key(code)
     })
 }
 
@@ -848,11 +1085,29 @@ fn is_physical(source: Source) -> bool {
 
 /// W0-6:功能键命中判定(消隐键、瞄准门控键、FPS 开关/挂起键、总开关键)。
 ///
-/// 两个条件缺一不可:事件必须是物理来源,且键位确实是配置里的功能键。
+/// 两个条件缺一不可:事件必须是物理来源,且键位确实是配置里的功能键
+/// (自 2026-10-09 起功能键也可以是**组合键**,见 [`KeySet`]:此时要求
+/// 事件是这个集合的成员、且集合此刻整个按着 —— 顺序无关)。
 /// "按下的那一瞬间"(上升沿)由调用方另加 —— 但本判定不通过时,连"消耗事件"
 /// 都不算(宏事件会照常落到普通绑定上,和用户手按普通键一样)。
-fn functional_key_hit(source: Source, ev: CaptureKey, key: u16) -> bool {
-    is_physical(source) && key != 0 && ev.code == key
+fn functional_key_hit(source: Source, ev: CaptureKey, keys: &KeySet, held: &Held) -> bool {
+    is_physical(source) && key_set_hit(keys, ev.code, held)
+}
+
+/// 组合键命中:事件是集合成员,**且集合此刻整个按着**。
+///
+/// 顺序无关 —— 先按 `Ctrl` 后按 `X` 与反过来,最后那一下都能命中。
+fn key_set_hit(keys: &KeySet, code: u16, held: &Held) -> bool {
+    keys.contains(&code) && key_set_down(keys, held)
+}
+
+/// 系统键此刻是否"按着"(整个集合都按着;空集合恒为 `false`)。
+///
+/// 按住型的系统键(瞄准门控键、FPS 挂起键、压枪触发键)要的是**状态**而不是边沿,
+/// 而组合键的状态只可能随"某个成员被按下/松开"改变 —— 所以这几个只在
+/// 成员事件到来时重算一次即可,与单键时的写法同构。
+fn key_set_down(keys: &KeySet, held: &Held) -> bool {
+    keys.all_held_by(|k| held.has(k))
 }
 
 /// W0-6:物理按键镜像 [`Held`] 的唯一定稿入口,返回本次是否为上升沿。
@@ -864,6 +1119,29 @@ fn note_physical(held: &mut Held, ev: CaptureKey, source: Source) -> bool {
     let fresh_press = rising_edge(ev.pressed, held.has(ev.code));
     if is_physical(source) {
         held.set(ev.code, ev.pressed);
+    }
+    fresh_press
+}
+
+/// 滚轮齿的镜像入口(用户 2026-10-10 第 2 条"滚轮改为连续触发")。
+///
+/// 与 [`note_physical`] 只差两点,都是"连续"这两个字要的:
+///   * **按下**:照旧落进 [`Held`],并把这个方向的闩锁顺延到 `now + WHEEL_HOLD_MS`;
+///   * **抬起**:**不落库** —— 一齿的"抬起"只是"滚轮这一刻没动",不是用户松手。
+///     真正的抬起由 [`WheelHold`] 到期后在定期维护里发出(见 `run()`)。
+///
+/// 上升沿仍按**每一齿**给(用的是闩锁里那个 `momentary`,不是 [`Held`]):
+/// 闩锁让长按型动作连续,而"又转了一齿"仍必须算一次新的按下 ——
+/// 点按、宏、换挡、执行轮盘要的都是每齿一次的边沿,不能并成一次。
+///
+/// 非物理来源(宏)照老规矩:给边沿,但不动镜像、不动闩锁(同 [`note_physical`])。
+fn note_wheel(held: &mut Held, hold: &mut WheelHold, ev: CaptureKey, source: Source) -> bool {
+    let fresh_press = rising_edge(ev.pressed, hold.momentary(ev.code));
+    if is_physical(source) {
+        hold.note(ev.code, ev.pressed, Instant::now());
+        if ev.pressed {
+            held.set(ev.code, true);
+        }
     }
     fresh_press
 }
@@ -980,7 +1258,7 @@ fn sync_structures(
         // 切换模式是锁存状态,没有可信的物理依据,一律回到未启用(按一下即可再开)
         for (j, w) in profile.wheels.iter().enumerate() {
             if let Some(t) = &w.temp {
-                wheels[j].active = t.mode == TempMode::Hold && held.has(t.key);
+                wheels[j].active = t.mode == TempMode::Hold && t.key.all_held_by(|k| held.has(k));
             }
         }
         changed = true;
@@ -1059,8 +1337,8 @@ fn combos_signature(combos: &[KeyCombo]) -> u64 {
 
 /// 轮盘的结构指纹:数量 + 方向键 + 启用键与模式。
 ///
-/// 只关心会改变**键位归属与 pid 分配**的字段。坐标/半径/影响范围的变化不需要
-/// 重建(下一帧推一下就是新的位置了),否则玩家一边调参一边打会被反复抬手。
+/// 只关心会改变**键位归属与 pid 分配**的字段。坐标/半径/影响范围/手动终点的变化
+/// 不需要重建(下一帧推一下就是新的位置了),否则玩家一边调参一边打会被反复抬手。
 ///
 /// 指纹变化必须"先释放旧触点、再重建状态",否则会同时踩中三种老毛病:
 ///   ① 旧触点永远留在设备上(触点池越用越少 → 新按键按不动);
@@ -1070,7 +1348,9 @@ fn wheel_signature(wheels: &[Wheel]) -> u64 {
     let mut h = wheels.len() as u64;
     for w in wheels {
         for k in [w.up, w.down, w.left, w.right] {
-            h = h.wrapping_mul(0x100_0000_01b3).wrapping_add(k as u64 + 1);
+            for c in k.iter() {
+                h = h.wrapping_mul(0x100_0000_01b3).wrapping_add(*c as u64 + 1);
+            }
         }
         h = h.wrapping_mul(31).wrapping_add(match w.kind {
             WheelKind::Standard => 1,
@@ -1078,9 +1358,10 @@ fn wheel_signature(wheels: &[Wheel]) -> u64 {
             WheelKind::Execute => 3,
         });
         for d in w.directions.iter().take(8) {
+            for c in d.key.iter() {
+                h = h.wrapping_mul(31).wrapping_add(*c as u64 + 1);
+            }
             h = h
-                .wrapping_mul(31)
-                .wrapping_add(d.key as u64 + 1)
                 .wrapping_mul(31)
                 .wrapping_add(d.angle_deg.to_bits() as u64);
         }
@@ -1091,7 +1372,9 @@ fn wheel_signature(wheels: &[Wheel]) -> u64 {
         match &w.temp {
             None => h = h.wrapping_mul(31).wrapping_add(0x9E37_79B9),
             Some(t) => {
-                h = h.wrapping_mul(31).wrapping_add(t.key as u64 + 1);
+                for c in t.key.iter() {
+                    h = h.wrapping_mul(31).wrapping_add(*c as u64 + 1);
+                }
                 h = h.wrapping_mul(31).wrapping_add(match t.mode {
                     TempMode::Hold => 1,
                     TempMode::Toggle => 2,
@@ -1174,8 +1457,18 @@ struct AimState {
     recoil_active: bool,
     /// 压枪随机摇晃的 xorshift64 状态(0 表示尚未播种)。
     recoil_rng: u64,
+    /// 无边界模式(`aim_flush_unbounded`)是否已经扣过本轮拖动的拖动死区。
+    /// 换手是无缝的,死区只该扣一次;`aim_lift`/`aim_recenter` 之类"重新开始一段拖动"
+    /// 的场合会把它清回 false。
+    dead_paid: bool,
 }
 
+/// ⚠️【已废弃 deprecated · 2026-10-08】虚拟手柄右摇杆(连续/分段回中)。
+///
+/// 从本行往下到 [`gamepad_tick`] 这一整块(以及 `Shared` 上的 `gamepad` 字段、
+/// 主循环里的对账调用)都只服务那一个不再维护的视角通道。**零改动策略**:
+/// 行为、序列化、界面全都不动,只为"不再碰它"留一份明确标记 ——
+/// 不修复、不扩展、不合并新功能,新代码不要依赖这里的任何函数。
 #[derive(Default)]
 struct GamepadState {
     created: bool,
@@ -1216,6 +1509,7 @@ fn pointer_should_be_hidden(connected: bool, aim: &Aim, st: &AimState) -> bool {
     connected && aim.capture_mouse && fps_mode_active(aim, st) && !st.released
 }
 
+/// [已废弃 2026-10-08] 虚拟手柄视角通道的模式判据(见 `GamepadState` 上的说明)。
 fn is_gamepad_mode(mode: ViewInputMode) -> bool {
     matches!(
         mode,
@@ -1378,6 +1672,7 @@ fn gamepad_on_motion(
     state.right_y += add_y;
     state.last_motion = Some(at);
 
+    // [已废弃 2026-10-08] 分段回中分支:虚拟手柄通道专用,不再维护。
     let segmented = aim.input_mode == ViewInputMode::VirtualGamepadSegmented;
     if !segmented {
         state.right_x = state.right_x.clamp(0.0, GAMEPAD_AXIS_MAX);
@@ -1453,6 +1748,7 @@ fn aim_lift(ctl: &ControlClient, st: &mut AimState) {
     }
     st.ox = 0.0;
     st.oy = 0.0;
+    st.dead_paid = false;
     st.last_motion = None;
 }
 
@@ -1461,6 +1757,7 @@ fn aim_release_local(st: &mut AimState) {
     st.down = false;
     st.ox = 0.0;
     st.oy = 0.0;
+    st.dead_paid = false;
     st.last_motion = None;
 }
 
@@ -1488,7 +1785,9 @@ fn aim_effective_offset(aim: &Aim, st: &AimState) -> (f32, f32) {
 }
 
 /// 落点 = 锚点 + 有效偏移。有边界时钳制到屏幕内，第三个返回值表示是否触边；
-/// 关闭边界时保留完整偏移，由回转半径负责抬指/重按，避免屏幕边缘截断。
+/// 关闭边界时保留完整偏移(不做屏幕钳制),供「开放世界」的水平跑步机使用 ——
+/// FPS 的「无边界」模式**不再走这里**,它自己按锚点周围的可用矩形拆段换手
+/// (见 [`aim_flush_unbounded`]),触点永不越出屏幕。
 fn aim_target(m: &Mapper, aim: &Aim, st: &AimState) -> (i32, i32, bool) {
     let (ax, ay) = aim_anchor(m, aim);
     let axf = ax as f32;
@@ -1577,6 +1876,7 @@ fn aim_recenter(ctl: &ControlClient, m: &Mapper, aim: &Aim, st: &mut AimState) {
     if !st.down {
         st.ox = 0.0;
         st.oy = 0.0;
+        st.dead_paid = false;
         return;
     }
     let (cx, cy) = st.cur;
@@ -1584,6 +1884,7 @@ fn aim_recenter(ctl: &ControlClient, m: &Mapper, aim: &Aim, st: &mut AimState) {
     st.sent += 1;
     st.ox = 0.0;
     st.oy = 0.0;
+    st.dead_paid = false;
     let (ax, ay) = aim_anchor(m, aim);
     ctl.touch_down(AIM_PID, ax, ay);
     st.sent += 1;
@@ -1592,40 +1893,130 @@ fn aim_recenter(ctl: &ControlClient, m: &Mapper, aim: &Aim, st: &mut AimState) {
     st.last_motion = Some(Instant::now());
 }
 
-/// 无边界模式的回转：抬指、保留超出回转半径的余量、在锚点重按，
-/// 让持续同向移动不会因为触点超出屏幕而被系统丢弃或被边界截断。
-fn aim_recenter_with_carry(
-    ctl: &ControlClient,
-    m: &Mapper,
-    aim: &Aim,
-    st: &mut AimState,
-    radius: f32,
-) {
-    if !st.down {
-        st.ox = 0.0;
-        st.oy = 0.0;
-        return;
+/// 无边界模式换手跑步机的单帧最大段数(纯兜底)。
+///
+/// 正常一帧最多 1~2 段(一帧的鼠标位移 ÷ 回转半径);32 段是给
+/// "锚点贴着屏幕边缘 → 可用矩形只剩几像素" + "单帧巨量位移" 这种病态组合兜底,
+/// 保证不会在这一帧里死循环。手感上永远用不到。
+const AIM_TREADMILL_MAX_HOPS: usize = 32;
+
+/// 无边界模式下,锚点周围"触点可以安全停留"的矩形边界(相对锚点的偏移上下限)。
+///
+/// 返回 `(向左, 向右, 向上, 向下)` 四个方向各自可用的像素数,取三个约束的最小:
+/// 1. **锚点到屏幕四边的实测距离** —— 出屏的触摸会被设备端**整条丢弃**
+///    (`control.rs` 只做下界钳制。旧实现只按回转半径拆段、完全不看边缘,
+///    竖屏手机的锚点离下边缘往往只有两三百像素,向上/向下推几十像素就出屏,
+///    表现就是"上下到某个临界点就不动了");
+/// 2. **回转半径**(`recenter_threshold`,界面上的「回转半径」)—— 决定手指多久抬一次;
+/// 3. 两者取小即可,不做额外下限:锚点贴边时那个方向的可用量就是 0,
+///    这方向本来也转不动(硬推只会把触点推到屏外被丢弃)。
+fn aim_band_limits(m: &Mapper, aim: &Aim, ax: i32, ay: i32) -> (f32, f32, f32, f32) {
+    let band = aim.recenter_threshold.max(8) as f32;
+    let axf = ax as f32;
+    let ayf = ay as f32;
+    (
+        band.min(axf).max(0.0),
+        band.min((m.w - 1.0 - axf).max(0.0)),
+        band.min(ayf).max(0.0),
+        band.min((m.h - 1.0 - ayf).max(0.0)),
+    )
+}
+
+/// 把这一帧的期望偏移拆成若干段,每段都落在可用矩形内(纯计算,便于单测)。
+///
+/// 策略是"能推多少推多少,推不动了就抬指回锚点接着推":
+/// 第一段 = 期望偏移被矩形钳制后的值;剩下的余量在换手之后继续推,直到送完。
+/// 因此设备端收到的**拖动总量恰好等于期望偏移**,这正好修掉两个老毛病:
+/// - 旧实现先按完整偏移注入一次,再按"半径外余量"重推一次,等于把超出半径的
+///   部分注入了两遍 —— 每次越过回转半径视角都会跳一下;
+/// - 旧实现不看屏幕边缘,锚点离边近时那段注入会整条出屏(被设备端丢弃)。
+///
+/// 返回 `(各段偏移, 下一帧继续用的偏移)`。末尾偏移写回 `st.ox/oy`,
+/// 表示"手指现在停在相对锚点的哪个位置",下一帧的位移从这里接着算 ——
+/// 它**始终被钳在可用矩形内**(兜底截断时余量宁可丢掉,也不让累计偏移失控)。
+fn plan_aim_treadmill(
+    ox: f32,
+    oy: f32,
+    lim: (f32, f32, f32, f32),
+    max_hops: usize,
+) -> (Vec<(f32, f32)>, (f32, f32)) {
+    let (left, right, up, down) = lim;
+    let mut rest_x = ox;
+    let mut rest_y = oy;
+    let mut segs: Vec<(f32, f32)> = Vec::new();
+    loop {
+        let sx = rest_x.clamp(-left, right);
+        let sy = rest_y.clamp(-up, down);
+        segs.push((sx, sy));
+        rest_x -= sx;
+        rest_y -= sy;
+        if (rest_x.abs() < 0.5 && rest_y.abs() < 0.5) || segs.len() >= max_hops.max(1) {
+            break;
+        }
     }
-    let (cx, cy) = st.cur;
-    ctl.touch_up(AIM_PID, cx, cy);
-    st.sent += 1;
+    // 下一帧的起点 = 最后一段的落点 + 还没送完的余量(正常情况余量 < 0.5px),
+    // 再钳回矩形:32 段兜底截断时余量可能很大,不能让它污染累计偏移。
+    let (lx, ly) = *segs.last().unwrap_or(&(0.0, 0.0));
+    let (nx, ny) = (lx + rest_x, ly + rest_y);
+    (segs, (nx.clamp(-left, right), ny.clamp(-up, down)))
+}
+
+/// 无边界模式(「无边界」勾选)的注入路径:无缝换手跑步机。
+///
+/// 与有边界路径的唯一区别是落点约束:不钳在屏幕内,而是钳在
+/// [锚点周围的可用矩形](aim_band_limits)内,超出部分抬指重按后接着推。
+/// 于是上下左右四个方向都能无限自由旋转,既不依赖"阈值归中"策略,
+/// 也不会因为触点跑出屏幕而被整条丢弃。
+///
+/// 死区只在这一轮拖动开始时扣一次(`st.dead_paid`):换手在物理上是无缝的,
+/// 若每换一次手都重新扣一个死区,连续转向会越转越慢甚至中途停住。
+fn aim_flush_unbounded(ctl: &ControlClient, m: &Mapper, aim: &Aim, st: &mut AimState) {
+    let dead = aim.drag_deadzone.clamp(0.0, 400.0);
     let mag = st.ox.hypot(st.oy);
-    if mag > radius && mag > f32::EPSILON {
-        let keep = (mag - radius) / mag;
-        st.ox *= keep;
-        st.oy *= keep;
+    let (ox, oy) = if st.dead_paid {
+        (st.ox, st.oy)
+    } else if mag <= dead || mag <= f32::EPSILON {
+        (0.0, 0.0)
     } else {
-        st.ox = 0.0;
-        st.oy = 0.0;
-    }
+        let scale = (mag - dead) / mag;
+        (st.ox * scale, st.oy * scale)
+    };
+
     let (ax, ay) = aim_anchor(m, aim);
-    ctl.touch_down(AIM_PID, ax, ay);
-    st.sent += 1;
-    st.cur = (ax, ay);
-    let (tx, ty, _) = aim_target(m, aim, st);
-    ctl.touch_move(AIM_PID, tx, ty);
-    st.cur = (tx, ty);
-    st.last_motion = Some(Instant::now());
+    let lim = aim_band_limits(m, aim, ax, ay);
+    let (segs, next) = plan_aim_treadmill(ox, oy, lim, AIM_TREADMILL_MAX_HOPS);
+    let axf = ax as f32;
+    let ayf = ay as f32;
+
+    if !st.down {
+        ctl.touch_down(AIM_PID, ax, ay);
+        st.down = true;
+        st.sent += 1;
+        st.cur = (ax, ay);
+    }
+    for (k, (sx, sy)) in segs.iter().enumerate() {
+        let (tx, ty) = ((axf + sx).round() as i32, (ayf + sy).round() as i32);
+        if st.cur != (tx, ty) {
+            ctl.touch_move(AIM_PID, tx, ty);
+            st.sent += 1;
+            st.cur = (tx, ty);
+        }
+        if k + 1 < segs.len() {
+            // 无缝换手:在这一段的落点抬指,回锚点重新按下,下一段从这里继续。
+            // 拖动是增量语义,抬指/重按本身不产生转动,玩家侧只看到视角继续转。
+            ctl.touch_up(AIM_PID, tx, ty);
+            st.sent += 1;
+            ctl.touch_down(AIM_PID, ax, ay);
+            st.sent += 1;
+            st.cur = (ax, ay);
+        }
+    }
+    // 手指现在停在"相对锚点的 next"处;写回累计偏移,下一帧从这里继续累计。
+    // 注意不要在这里改 `last_motion`:它必须是事件的捕获时刻(由 `aim_flush` 统一写入),
+    // 否则排队/宏步进期间静止归中会算错。
+    st.ox = next.0;
+    st.oy = next.1;
+    st.dead_paid = true;
 }
 /// 鼠标相对位移 -> 手机上的拖动。
 /// 返回是否因为触点池已满而没能落下瞄准触点(供诊断计数;落不下就不落下,
@@ -1680,7 +2071,10 @@ fn aim_on_motion(
 fn aim_flush(ctl: &ControlClient, m: &Mapper, aim: &Aim, st: &mut AimState, at: Instant) {
     let dead = aim.drag_deadzone.clamp(0.0, 400.0);
     let mag = st.ox.hypot(st.oy);
-    if mag <= dead {
+    // 无边界模式一旦开始拖动(死区已扣过),余量可能比死区还小 ——
+    // 那部分必须继续送出去,不能按死区丢掉,否则每次换手都会漏掉一截位移。
+    let after_dead = !aim.boundary && st.dead_paid;
+    if !after_dead && mag <= dead {
         // 死区内只累计偏移，不注入移动；last_motion 不刷新，
         // 因此静止归中计时会继续走，稍后自动抬指回锚点。
         return;
@@ -1688,6 +2082,13 @@ fn aim_flush(ctl: &ControlClient, m: &Mapper, aim: &Aim, st: &mut AimState, at: 
     // W1-1:用事件的捕获时刻,而不是引擎处理它的时刻 —— 后者在排队/宏步进
     // 期间会滞后,静止归中会提前触发或延后触发。
     st.last_motion = Some(at);
+
+    if !aim.boundary {
+        // 无边界:走无缝换手跑步机(见 `aim_flush_unbounded`)。
+        // 这条路径不读 `RecenterMode`:换手是它自己维持的,用户选 Never 也能无限转。
+        aim_flush_unbounded(ctl, m, aim, st);
+        return;
+    }
 
     let (tx, ty, hit_edge) = aim_target(m, aim, st);
     if st.down {
@@ -1700,13 +2101,7 @@ fn aim_flush(ctl: &ControlClient, m: &Mapper, aim: &Aim, st: &mut AimState, at: 
     st.cur = (tx, ty);
 
     let th = aim.recenter_threshold.max(8) as f32;
-    if !aim.boundary {
-        // 无边界：把“回转半径”当作换手阈值，抬指后保留超出量继续同向转动。
-        // 即使归中策略是 Never 也保留这条安全机制，否则坐标会无限累积。
-        if mag > th {
-            aim_recenter_with_carry(ctl, m, aim, st, th);
-        }
-    } else if aim.recenter == RecenterMode::Threshold && (st.ox.abs() >= th || st.oy.abs() >= th) {
+    if aim.recenter == RecenterMode::Threshold && (st.ox.abs() >= th || st.oy.abs() >= th) {
         // 有边界：触边后不自动回转，保持“滑到边就不动”的手感；
         // 只有用户明确选择“阈值归中”时才在阈值处回转。
         aim_recenter(ctl, m, aim, st);
@@ -1862,7 +2257,8 @@ fn recoil_tick(
     at: Instant,
 ) {
     let r = &aim.recoil;
-    let active = r.armed() && held.has(r.trigger_key) && aim_active(aim, st) && !aim.open_world;
+    let active =
+        r.armed() && key_set_down(&r.trigger_key, held) && aim_active(aim, st) && !aim.open_world;
     st.recoil_active = active;
     if !active {
         st.recoil_last = None;
@@ -1928,6 +2324,14 @@ pub struct Shared {
     /// 做这件事,顶栏按钮直接改 `enabled` —— 于是"用按钮关映射"会把长按触点
     /// 永久留在屏幕上。现在两条路径共用 [`release_all`] 这一份实现。
     pub toolbar_release: bool,
+    /// 界面请求引擎把压枪"控制强度"切到第几档(0 基,用户 2026-10-10 第 3 条)。
+    ///
+    /// 为什么不能像普通配置那样由界面直接写:当前档是**引擎侧运行状态**
+    /// (见 `AimState.recoil_index` 的注释 —— 配置里只存"档位表"),界面每帧只是
+    /// 读一份镜像 `aim_live.recoil_index` 来显示。所以界面按下[上一档/下一档]
+    /// 只能在这里留一个请求,由引擎在下一轮维护里取走并落到 `aim.recoil_index`,
+    /// 再经同一处镜像回界面 —— 三方(界面按钮 / 换档键 / 滚轮)永远只有一个真相。
+    pub recoil_gear_req: Option<usize>,
     /// 全部"按键组合"(方案)。**`active_scheme` 那一份的内容与 [`Self::profile`] 相同**
     /// —— `profile` 始终是"此刻生效的那套",界面每帧把它同步回来
     /// (见 [`Shared::stash_active`],由 app 的 `sync_scheme_state` 每帧调用)。
@@ -2043,6 +2447,14 @@ enum SchedAct {
         x: i32,
         y: i32,
     },
+    /// 「按后延迟」到期后重放一次被推迟的按下(用户 2026-10-10 第 2 条)。
+    /// `code` 是行这一动作的物理键码 —— 重放前核对一下,防止期间配置被改过、
+    /// 同一个下标已经换成了另一条键位(那就别把新键位按下去)。
+    Redispatch {
+        idx: usize,
+        lane: BindLane,
+        code: u16,
+    },
 }
 
 #[derive(Default, Clone)]
@@ -2082,6 +2494,9 @@ pub(crate) struct EngineState<'a> {
     /// 是否一并释放 FPS 专用键与瞄准状态。关普通映射时为 false,FPS 模式独立。
     release_fps: bool,
     aim: &'a mut AimState,
+    /// 「按后延迟」的冷却表(用户 2026-10-10 第 2 条):收尾时要一并作废,
+    /// 见 [`release_all`] 末尾的说明。
+    gates: &'a mut PressGates,
 }
 
 /// 关闭映射时的收尾:抬起所有按下中的触点、松开系统键、停用全部临时轮盘、
@@ -2170,6 +2585,13 @@ pub(crate) fn release_all(
         ws.custom_pressed = [false; 8];
         ws.active = false;
     }
+    // 「按后延迟」的冷却表一并作废(用户 2026-10-10 第 2 条)。
+    //
+    // 断连 / 关映射 / 换组合之后,同一下标可能已经指向另一条键位,上一轮留下的
+    // 到期时刻会**莫名其妙地挡住新键位的第一次按下**(推迟到冷却结束才执行);
+    // 而且"重新开打的第一下"本来就该立刻生效。所以这里与触点、轮盘、瞄准
+    // 同一步清干净。
+    st.gates.reset();
 }
 
 /// "本地还有没抬起来的东西"判定:控制通道断开时靠它决定要不要走 [`release_all`] 收场
@@ -2242,8 +2664,12 @@ pub fn run(
     let mut combos_sig = 0u64;
     // 物理按键镜像(归属切换对账的唯一依据)
     let mut held = Held::default();
+    // 滚轮"连续触发"闩锁(用户 2026-10-10 第 2 条):滚轮齿的"抬起"被它扣住
+    let mut wheel_hold = WheelHold::default();
     // 引擎运行状态(触点占用/被拒次数),供界面诊断显示
     let mut live = EngineLive::default();
+    // 「按后延迟」的冷却表(用户 2026-10-10 第 2 条)
+    let mut gates = PressGates::default();
     let mut aim = AimState::default();
     let mut gamepad = GamepadState::default();
     // Ctrl+Alt 组合:按下即把鼠标交还给系统,再按一次收回(需用全局钩子判定,
@@ -2478,6 +2904,36 @@ pub fn run(
                                         st.last = (x, y);
                                     }
                                 }
+                                // 「按后延迟」到期:把当初被推迟的那次按下补上
+                                // (用户 2026-10-10 第 2 条)。
+                                SchedAct::Redispatch { idx, lane, code } => {
+                                    let m = g.profile.mapper((c.screen_w, c.screen_h));
+                                    let reserved = wheel_pointers(&wheels)
+                                        + fps_fingers.count
+                                        + combo_fingers.count
+                                        + macro_down.len()
+                                        + usize::from(aim.down);
+                                    redispatch_press(
+                                        c,
+                                        &m,
+                                        &g.profile,
+                                        &held,
+                                        idx,
+                                        lane,
+                                        code,
+                                        &mut macro_exec_seq,
+                                        &mut fingers,
+                                        &mut fps_fingers,
+                                        &mut combo_fingers,
+                                        &mut active_android_keys,
+                                        &mut fps_active_android_keys,
+                                        &mut combo_active_android_keys,
+                                        &mut scheduled,
+                                        reserved,
+                                        &mut live,
+                                        &mut gates,
+                                    );
+                                }
                             }
                         }
                     }
@@ -2515,6 +2971,7 @@ pub fn run(
                         combo_active_android_keys: &mut combo_active_android_keys,
                         release_fps: false,
                         aim: &mut aim,
+                        gates: &mut gates,
                     },
                 );
                 g.control = ctl;
@@ -2584,6 +3041,66 @@ pub fn run(
                     } else {
                         destroy_gamepad(ctl, &mut gamepad);
                     }
+                    // ---- 滚轮"连续触发"到期的那一齿,真正抬起来 ----
+                    // (用户 2026-10-10 第 2 条;闩锁见 [`WheelHold`]、入口见 [`note_wheel`])
+                    //
+                    // 为什么必须在这里、而不能在事件路径里:滚轮**停手之后一个事件
+                    // 都不会再来**,只有与事件无关的定期维护能收尾。这与 `recoil_tick`
+                    // /`wheel_keepalive` 是同一个道理。
+                    //
+                    // 收尾不用"重放一个抬起事件",而是走这套代码本来就在用的办法:
+                    // 把物理镜像里的那一齿清掉,再按**状态重新推导**一遍 ——
+                    // 普通绑定/FPS 键位/轮盘方向/长按型临时轮盘各有一个对账函数,
+                    // 四个都是幂等的,而且只在真的到期时才跑(平时一次时间比较)。
+                    while let Some(code) = wheel_hold.next_expired(Instant::now()) {
+                        held.set(code, false);
+                        // 长按型临时轮盘的启用键可能就绑在滚轮上:先按镜像停用它
+                        rederive_hold_temp_wheels(&s.profile, &held, &mut wheels);
+                        reconcile_binds(
+                            ctl,
+                            &m,
+                            &s.profile,
+                            &wheels,
+                            fps_is_active(&cfg, &aim),
+                            // 只报"瞄准+其它通道"占用的触点:轮盘占用由 reconcile_binds
+                            // 自己在内部按 `wheel_pointers(wheels)` 加上,重复计入会把池子
+                            // 算小、无害但要不得(与其它调用点保持一致)。
+                            fps_fingers.count
+                                + combo_fingers.count
+                                + macro_down.len()
+                                + usize::from(aim.down),
+                            &held,
+                            &mut fingers,
+                            &mut active_android_keys,
+                            &mut live,
+                        );
+                        reconcile_wheels(
+                            ctl,
+                            &m,
+                            &s.profile,
+                            &mut wheels,
+                            &held,
+                            fingers.count
+                                + fps_fingers.count
+                                + combo_fingers.count
+                                + macro_down.len()
+                                + usize::from(aim.down),
+                            &mut live,
+                        );
+                        reconcile_fps_binds(
+                            ctl,
+                            &m,
+                            &s.profile.binds,
+                            &mut fps_fingers,
+                            &mut fps_active_android_keys,
+                            &held,
+                            fingers.count
+                                + wheel_pointers(&wheels)
+                                + macro_down.len()
+                                + usize::from(aim.down),
+                            &mut live,
+                        );
+                    }
                 }
                 _ => {
                     aim_release_local(&mut aim);
@@ -2592,6 +3109,9 @@ pub fn run(
                     gamepad.right_y = GAMEPAD_AXIS_CENTER;
                     gamepad.pending_limit = None;
                     gamepad.pending_residual = None;
+                    // 滚轮闩锁作废:通道不在,没人再去抬这一齿,重连时更不能
+                    // 把它当成"用户还按着"补一个触点(见 [`WheelHold::release_all`])。
+                    wheel_hold.release_all(&mut held);
                 }
             }
             // ---- 控制通道的状态边沿(断连清场 / 重连重建)----
@@ -2644,6 +3164,7 @@ pub fn run(
                             combo_active_android_keys: &mut combo_active_android_keys,
                             release_fps: true,
                             aim: &mut aim,
+                            gates: &mut gates,
                         },
                     );
                     pending_notice = Some(
@@ -2677,6 +3198,18 @@ pub fn run(
                 fps_binds_sig = 0;
                 rebuild_now = true;
                 pending_notice = Some("控制通道已连接:已按当前按键状态重建触点".to_string());
+            }
+            // 界面手动换档(用户 2026-10-10 第 3 条):界面在 `recoil_gear_req` 里留一个
+            // "要第几档",这里取走写进运行状态 —— 界面按钮 / 换档键 / 滚轮三条路最终都
+            // 落在同一个 `aim.recoil_index` 上(见该字段的注释)。放在这里(而不是上面那条
+            // "通道在线"分支里)是因为换档只是改一个下标、不需要注入任何触点:离线时
+            // 界面照样显示"当前第几档",按了就得有反应。紧挨着下面的镜像写回,
+            // 同一轮就把新档送回界面,按钮点下去不会闪一下又跳回去。
+            if let Some(req) = s.recoil_gear_req.take() {
+                let n = s.profile.aim.recoil.strengths.len();
+                if n > 0 {
+                    aim.recoil_index = req.min(n - 1);
+                }
             }
             let l = &mut s.aim_live;
             l.ox = aim.ox;
@@ -2811,6 +3344,7 @@ pub fn run(
                             combo_active_android_keys: &mut combo_active_android_keys,
                             release_fps: true,
                             aim: &mut aim,
+                            gates: &mut gates,
                         },
                     );
                     g.control = ctl;
@@ -2874,6 +3408,7 @@ pub fn run(
                     &mut scheduled,
                     reserved,
                     &mut live,
+                    &mut gates,
                 ) {
                     pending_notice = Some(format!("组合键: {}", reason.hint(key)));
                 }
@@ -2943,12 +3478,19 @@ pub fn run(
         // 的唯一可信依据 —— 归属切换(临时摇杆启用/停用、配置改动)时的对账全靠它;
         // 同时它给出"上升沿",让总开关键与切换模式的启用键不被自动重复连翻。
         // W0-6:只有物理事件写镜像(宏事件照常拿到上升沿,用于普通绑定)。
-        let fresh_press = note_physical(&mut held, ev, source);
+        //
+        // 滚轮齿另走一路(用户 2026-10-10 第 2 条):它的"抬起"不落库,
+        // 由滚轮闩锁顺延到停转之后 —— 见 [`note_wheel`] 与 [`WheelHold`]。
+        let fresh_press = if is_wheel_code(ev.code) {
+            note_wheel(&mut held, &mut wheel_hold, ev, source)
+        } else {
+            note_physical(&mut held, ev, source)
+        };
 
         // 全局鼠标消隐：不依赖 FPS，也不需要总映射开启。按下时翻转状态，
         // 松开不重复触发；原子量由捕获层读取并应用透明系统光标。
         // W0-6:功能键只认物理事件。
-        if functional_key_hit(source, ev, cursor_toggle_key) && fresh_press {
+        if functional_key_hit(source, ev, &cursor_toggle_key, &held) && fresh_press {
             let hidden = !cursor_hide.load(Ordering::Relaxed);
             cursor_hide.store(hidden, Ordering::Relaxed);
             pending_notice = Some(if hidden {
@@ -2961,8 +3503,12 @@ pub fn run(
 
         // 瞄准门控键(如鼠标右键=开镜)的按下/松开。
         // W0-6:它同样是物理真值(用户此刻是否真的按着开镜键),只认物理事件。
-        if functional_key_hit(source, ev, aim_hold_key) {
-            aim.gate_down = ev.pressed;
+        //
+        // 组合键(2026-10-09):门的开合只能由"成员键的按下/松开"改变,所以
+        // 这里不再直接抄 `ev.pressed`(组合里的另一半松开时,事件码是**那个**
+        // 键,`ev.pressed=false` 会把门关错),而是每次都用集合的整体按持状态重算。
+        if physical && aim_hold_key.contains(&ev.code) {
+            aim.gate_down = key_set_down(&aim_hold_key, &held);
         }
 
         // Ctrl+Alt:临时把鼠标交还给系统,再按一次收回。
@@ -2983,7 +3529,7 @@ pub fn run(
             aim.suspended = false;
         } else if aim_cfg.enabled {
             // W0-6:FPS 开关与挂起键是功能键,只认物理事件(宏不能替你开关 FPS)。
-            if functional_key_hit(source, ev, aim_toggle_key) {
+            if functional_key_hit(source, ev, &aim_toggle_key, &held) {
                 fps_consumed = true;
                 if fresh_press {
                     if aim_cfg.anchor_set() {
@@ -2998,12 +3544,36 @@ pub fn run(
                     fps_transition = true;
                 }
             }
-            let want_suspend = aim_suspend_key != 0 && held.has(aim_suspend_key);
+            // ---- 补偿挡位切换键(用户 2026-10-10 第 3 条) ----
+            // 按一下换一档(环绕),按住它时滚轮也能换档(见下面滚轮那一段)。
+            // 放在这里 = 与其它 FPS 系统键同一条纪律:只认物理事件、按下即消费,
+            // **不再落到普通键位映射**(用户:"补偿切换高于一般键位映射")。
+            // 只有"开了后坐力补偿 + 有档位"时才接管,否则这个键留给普通映射用。
+            let recoil_cfg = &aim_cfg.recoil;
+            let gear_switch_live = recoil_cfg.enabled && !recoil_cfg.strengths.is_empty();
+            if gear_switch_live {
+                if functional_key_hit(source, ev, &recoil_cfg.switch_key, &held) {
+                    fps_consumed = true;
+                    if fresh_press {
+                        let n = recoil_cfg.strengths.len();
+                        aim.recoil_index = (aim.recoil_index.min(n - 1) + 1) % n;
+                        pending_notice = Some(format!(
+                            "后坐力补偿:控制强度切换到第 {} 档({})",
+                            aim.recoil_index + 1,
+                            recoil_cfg.strengths[aim.recoil_index]
+                        ));
+                    }
+                }
+                if physical && recoil_cfg.switch_key.contains(&ev.code) {
+                    fps_consumed = true;
+                }
+            }
+            let want_suspend = key_set_down(&aim_suspend_key, &held);
             if want_suspend != aim.suspended {
                 aim.suspended = want_suspend;
                 fps_transition = true;
             }
-            if functional_key_hit(source, ev, aim_suspend_key) {
+            if physical && aim_suspend_key.contains(&ev.code) {
                 fps_consumed = true;
             }
         } else {
@@ -3098,6 +3668,7 @@ pub fn run(
                             &mut scheduled,
                             reserved,
                             &mut live,
+                            &mut gates,
                         ) {
                             pending_notice = Some(format!("FPS 键位: {}", reason.hint(k)));
                         }
@@ -3151,7 +3722,7 @@ pub fn run(
             + macro_down.len()
             + wheel_pointers(&wheels)
             + usize::from(aim.down);
-        if fps_consumed && ev.code != toggle_key {
+        if fps_consumed && !toggle_key.contains(&ev.code) {
             continue;
         }
 
@@ -3189,7 +3760,7 @@ pub fn run(
         // 总开关键:任何时候都生效,但只在**按下的那一瞬间**翻转一次。
         // W0-6:只认物理事件 —— 宏里录了 F8,回放时不能把映射自己关掉
         // (这正是 P0-6 要堵的坑:宏放一半,后面的键位全打不出去)。
-        if functional_key_hit(source, ev, toggle_key) && fresh_press {
+        if functional_key_hit(source, ev, &toggle_key, &held) && fresh_press {
             let mut g = lock_shared(&shared);
             g.enabled = !g.enabled;
             let now_enabled = g.enabled;
@@ -3229,6 +3800,7 @@ pub fn run(
                         combo_active_android_keys: &mut combo_active_android_keys,
                         release_fps: false,
                         aim: &mut aim,
+                        gates: &mut gates,
                     },
                 );
                 g.control = ctl;
@@ -3339,6 +3911,7 @@ pub fn run(
                 &mut fps_active_android_keys,
                 &mut combo_active_android_keys,
                 &mut aim,
+                &mut gates,
             );
             continue;
         }
@@ -3453,6 +4026,7 @@ pub fn run(
             last_refuse_note: &mut last_refuse_note,
             pending_notice: &mut pending_notice,
             aim_st: &mut aim,
+            gates: &mut gates,
         }) {
             continue;
         }
@@ -3494,6 +4068,8 @@ struct Dispatch<'a> {
     active_android_keys: &'a mut HashSet<u16>,
     last_refuse_note: &'a mut Option<Instant>,
     pending_notice: &'a mut Option<String>,
+    /// 「按后延迟」的冷却表(用户 2026-10-10 第 2 条)
+    gates: &'a mut PressGates,
 }
 
 /// 一个按键事件 -> 具体动作(W2-3:从 `run()` 抽出的"派发主干")。
@@ -3523,13 +4099,25 @@ fn dispatch_input(d: &mut Dispatch<'_>) -> bool {
     let mut consumed = false;
     for (j, w) in profile.wheels.iter().enumerate() {
         let Some(t) = &w.temp else { continue };
-        if ev.code != t.key {
+        // 组合键启用键(用户 2026-10-10 第 2 条):事件只要**是集合成员**就归轮盘
+        // 处理(消费事件),集合是否整个按着由下面的 `want_active` 判断 ——
+        // 与 `aim.hold_key` 的门控写法同构(成员事件到来时重算整集合状态)。
+        // 不能在这里就要求"整个集合按着":松开最后一个成员的那一帧 `held` 已经
+        // 不含该键,断言会把**抬起**事件放走,启用键的抬起就不再被消费,停用也
+        // 不再当场发生(旧单键时代这条是一直被消费的)。
+        if !t.key.contains(&ev.code) {
             continue;
         }
         // 目标状态:长按模式 = 按住期间生效;切换模式 = **只在按下的那一瞬间**翻转
         // (同样只认上升沿:否则按住切换键不放,自动重复会把它来回翻转)
         let want_active = match t.mode {
-            TempMode::Hold => ev.pressed,
+            // 组合键:整个集合此刻都按着才算启用;任一成员抬起就立刻停用。
+            // 滚轮键(用户 2026-10-10 第 2 条):一齿的"抬起"不代表松手 ——
+            // 长按型临时轮盘跟着轮齿闩锁一起保持启用,真正的停用由定期维护里
+            // `rederive_hold_temp_wheels` + `reconcile_wheels` 收尾。
+            TempMode::Hold => {
+                key_set_down(&t.key, held) || (is_wheel_code(ev.code) && held.has(ev.code))
+            }
             TempMode::Toggle => {
                 if fresh_press {
                     !wheels[j].active
@@ -3595,12 +4183,22 @@ fn dispatch_input(d: &mut Dispatch<'_>) -> bool {
     // ---- 轮盘方向键(仅生效中的轮盘:永久 或 已启用的临时) ----
     // 方向状态 = "该轮盘此刻是否生效 × 对应物理键是否按着"(见 reconcile_wheels),
     // 所以这里只判断"这个事件是不是某个生效轮盘的方向键",剩下的交给对账。
-    // 多个轮盘共用同一个方向键时,它们会一起响应(与旧行为一致)。
+    // 多个**永久**轮盘共用同一个方向键时,它们会一起响应(与旧行为一致);
+    // 但**已启用的临时轮盘**对永久轮盘有抢占优先级(R1,2026-10-08):
+    // 该键位上只有临时轮盘响应,永久轮盘让位。
     let mut handled = false;
     let mut execute_wheel: Option<usize> = None;
+    // 本键是否已被"已启用的临时轮盘"占走:只算一次,循环里直接判(R1)。
+    let temp_taken = key_taken_by_active_temp_wheel(profile, wheels, ev.code);
     for (j, w) in profile.wheels.iter().enumerate() {
         let engaged = w.temp.is_none() || wheels[j].active;
-        if !engaged || !w.active_dirs().iter().any(|(_, key)| *key == ev.code) {
+        if !engaged
+            || (w.temp.is_none() && temp_taken)
+            || !w
+                .active_dirs()
+                .iter()
+                .any(|(_, key)| key.contains(&ev.code))
+        {
             continue;
         }
         handled = true;
@@ -3617,10 +4215,11 @@ fn dispatch_input(d: &mut Dispatch<'_>) -> bool {
         reconcile_wheels(ctl, &m, profile, wheels, &held, extra, &mut live);
         if let Some(j) = execute_wheel {
             let reserved = extra + wheel_pointers(wheels);
+            // 上报"是哪个方向键按不下"用的代表码(取第一个方向键集合里的第一个码)
             let first_key = profile.wheels[j]
                 .active_dirs()
                 .first()
-                .map(|(_, key)| *key)
+                .and_then(|(_, key)| key.first().copied())
                 .unwrap_or(0);
             if let Some(reason) = execute_wheel_direction(
                 ctl,
@@ -3641,16 +4240,20 @@ fn dispatch_input(d: &mut Dispatch<'_>) -> bool {
     // 上滚 = 两指张开(放大),下滚 = 两指捏合(缩小)。一次"齿"注入一段瞬发
     // 双指序列(按下旧指距 → move 新指距 → 抬起),不在屏幕上留手指。
     // 滚轮的抬起事件也在这里消费 —— 否则会落进下面的普通绑定。
-    if let Some(dir) = wheel_zoom_dir(profile, fps_active, ev.code) {
-        if fresh_press {
-            // ---- 压枪换档(V2-1):触发键按住期间,滚轮优先切换"控制强度" ----
-            // K2er 原文:"鼠标滚轮改变强度: 用鼠标滚轮的滚动来快速切换当前的强度"。
-            // 只在这三个条件都成立时接管(勾选滚轮换档 + 触发键按住 + 至少两档);
-            // 否则滚轮仍是本来的 FPS 缩放,既有行为不变。
-            let r = &profile.aim.recoil;
-            let recoil_takes_wheel =
-                r.armed() && r.wheel_switch && held.has(r.trigger_key) && r.strengths.len() >= 2;
-            if recoil_takes_wheel {
+    //
+    // 用户 2026-10-10(第 3 条):这一段整体提到"缩放判据"**之前** ——
+    // 以前换档裹在 `wheel_zoom_dir`(要求 FPS 模式 + 开了滚轮缩放)里面,
+    // 于是关掉滚轮缩放就没法换档。现在换档只看补偿自己的配置。
+    if ev.code == BTN_WHEEL_UP || ev.code == BTN_WHEEL_DOWN {
+        let dir = if ev.code == BTN_WHEEL_UP { 1.0 } else { -1.0 };
+        // ---- 压枪换档(V2-1 + 2026-10-10):触发键 / 挡位切换键按住期间,
+        // 滚轮优先切换"控制强度" —— K2er 原文:"鼠标滚轮改变强度"。
+        // "补偿优先"的落点就是这里:两者会同时想用滚轮时,补偿先拿走。
+        let r = &profile.aim.recoil;
+        let gear_held = key_set_down(&r.trigger_key, &held) || key_set_down(&r.switch_key, &held);
+        let recoil_takes_wheel = r.enabled && r.wheel_switch && r.strengths.len() >= 2 && gear_held;
+        if recoil_takes_wheel {
+            if fresh_press {
                 let n = r.strengths.len();
                 let i = aim_st.recoil_index.min(n - 1);
                 aim_st.recoil_index = if dir > 0.0 {
@@ -3663,7 +4266,11 @@ fn dispatch_input(d: &mut Dispatch<'_>) -> bool {
                     aim_st.recoil_index + 1,
                     r.strengths[aim_st.recoil_index]
                 ));
-            } else {
+            }
+            return true;
+        }
+        if let Some(dir) = wheel_zoom_dir(profile, fps_active, ev.code) {
+            if fresh_press {
                 let step_pct = profile.aim.wheel_zoom_step.clamp(5.0, 60.0) / 100.0;
                 let max_sep = zoom_max_sep(m);
                 let new_sep = (*zoom_sep * (1.0 + dir * step_pct)).clamp(ZOOM_MIN_SEP, max_sep);
@@ -3681,8 +4288,10 @@ fn dispatch_input(d: &mut Dispatch<'_>) -> bool {
                     *zoom_sep = new_sep;
                 }
             }
+            return true;
         }
-        return true;
+        // 既没换档、也没在缩放:这一齿**放行**给下面的普通绑定
+        // (滚轮上/下滚本来就能在[鼠标映射]里当键位用,不能让这里无声吞掉)。
     }
 
     // ---- 普通绑定(每键独立按/抬状态,最多 MAX_CONCURRENT_KEYS 并发) ----
@@ -3715,6 +4324,7 @@ fn dispatch_input(d: &mut Dispatch<'_>) -> bool {
             &mut scheduled,
             reserved,
             &mut live,
+            d.gates,
         ) {
             refused_note = Some((k, reason));
         }
@@ -3773,6 +4383,7 @@ fn apply_scheme_switch(
     fps_active_android_keys: &mut HashSet<u16>,
     combo_active_android_keys: &mut HashSet<u16>,
     aim: &mut AimState,
+    gates: &mut PressGates,
 ) -> bool {
     let mut g = lock_shared(&shared);
     if target >= g.schemes.len() || target == g.active_scheme {
@@ -3804,6 +4415,7 @@ fn apply_scheme_switch(
             combo_active_android_keys: &mut *combo_active_android_keys,
             release_fps: true,
             aim: &mut *aim,
+            gates: &mut *gates,
         },
     );
     g.control = ctl;
@@ -4082,7 +4694,12 @@ fn release_conflicting_binds(
     active_android_keys: &mut HashSet<u16>,
     w: &Wheel,
 ) {
-    let dirs: Vec<u16> = w.active_dirs().into_iter().map(|(_, key)| key).collect();
+    // 展开每个方向键集合的全部成员:任一成员键上的普通绑定都要让位
+    let dirs: Vec<u16> = w
+        .active_dirs()
+        .into_iter()
+        .flat_map(|(_, key)| key.to_vec())
+        .collect();
     for (i, bind) in profile.binds.iter().enumerate() {
         if !dirs.contains(&bind.key) {
             continue;
@@ -4193,12 +4810,15 @@ fn handle_combo_event(
     scheduled: &mut Vec<(Instant, SchedAct)>,
     reserved: usize,
     live: &mut EngineLive,
+    gates: &mut PressGates,
 ) -> Option<(u16, RefuseReason)> {
     let virtual_code = COMBO_VIRTUAL_BASE.saturating_add(index as u16);
     let bind = KeyBind {
         key: virtual_code,
         action: combo.action.clone(),
         fps_only: combo.fps_only,
+        // 组合键的「按后延迟」跟着组合自己走(用户 2026-10-10 第 2 条)
+        tail_delay_ms: combo.tail_delay_ms,
     };
     handle_bind_event(
         ctl,
@@ -4219,6 +4839,7 @@ fn handle_combo_event(
         scheduled,
         reserved,
         live,
+        gates,
     )
 }
 
@@ -4288,7 +4909,47 @@ fn handle_bind_event(
     scheduled: &mut Vec<(Instant, SchedAct)>,
     reserved: usize,
     live: &mut EngineLive,
+    gates: &mut PressGates,
 ) -> Option<(u16, RefuseReason)> {
+    // ---- 「按后延迟」(用户 2026-10-10 第 2 条) ----
+    // 这一条上一次按下结束之后要等够 `tail_delay_ms` 才接受下一次按下。
+    // 冷却未过就把这次按下**推迟**到冷却结束再执行(`SchedAct::Redispatch`),
+    // 而不是丢掉 —— 快速连点时用户按的每一下都该算数,只是不许和上一动作叠在一起。
+    //
+    // 这是**可选功能**(2026-10-10 晚追加要求):`profile.tail_delay_enabled` 关着时
+    // 每条一律按 0 处理 —— 数值原样留着,打开开关就立刻恢复,不必逐条重填。
+    // 判定放在这一处就够了:按键、组合键、宏触发三条路都从这里过。
+    let now = Instant::now();
+    let tail = if profile.tail_delay_enabled {
+        bind.tail_delay_ms as u64
+    } else {
+        0
+    };
+    let gate = match lane {
+        BindLane::Combo => gates.combo_gate(idx),
+        BindLane::Normal | BindLane::Fps => gates.bind_gate(idx),
+    };
+    // `tail > 0` 这一条不能省:总开关是在**开着打**的时候被用户关掉的,表里会留着
+    // 关之前挂上的冷却 —— 只看 `now < g` 的话,那些陈旧条目仍然会把之后每一次按下
+    // 推迟几百毫秒,而用户以为"我已经把它关了"。冷却是否有效,以**此刻的 `tail`**
+    // 为准,不以表里有没有残值为准。
+    if tail > 0
+        && fresh_press
+        && let Some(g) = gate
+        && now < g
+    {
+        scheduled.push((
+            g,
+            SchedAct::Redispatch {
+                idx,
+                lane,
+                code: bind.key,
+            },
+        ));
+        return None;
+    }
+    // 把这条的冷却推到 `until`(只往后推,不提前)。
+    let mut hold_until: Option<Instant> = None;
     match &bind.action {
         Action::Tap {
             x, y, duration_ms, ..
@@ -4299,6 +4960,7 @@ fn handle_bind_event(
                     if fingers.is_down(idx) {
                         ctl.touch_up(pid, px, py);
                         fingers.release(idx);
+                        hold_until = Some(now + Duration::from_millis(tail));
                     } else if fingers.try_down(idx, reserved) {
                         ctl.touch_down(pid, px, py);
                     } else {
@@ -4315,9 +4977,9 @@ fn handle_bind_event(
                 }
                 if fingers.try_down(idx, reserved) {
                     ctl.touch_down(pid, px, py);
+                    let up_at = now + Duration::from_millis((*duration_ms as u64).max(MIN_TAP_MS));
                     scheduled.push((
-                        Instant::now()
-                            + Duration::from_millis((*duration_ms as u64).max(MIN_TAP_MS)),
+                        up_at,
                         SchedAct::Up {
                             pid,
                             x: px,
@@ -4325,6 +4987,8 @@ fn handle_bind_event(
                             lane,
                         },
                     ));
+                    // 冷却从"这一下抬起"开始算 —— 也就是按住时长跑完之后。
+                    hold_until = Some(up_at + Duration::from_millis(tail));
                 } else {
                     let reason = down_failure_reason(fingers, idx);
                     refuse(live, bind.key, reason);
@@ -4342,8 +5006,13 @@ fn handle_bind_event(
                     refuse(live, bind.key, reason);
                     return Some((bind.key, reason));
                 }
-            } else if fingers.release(idx) {
+            } else if !is_wheel_code(ev.code) && fingers.release(idx) {
+                // 滚轮键(用户 2026-10-10 第 2 条):一齿的"抬起"不是用户松手 ——
+                // 长按型动作要跟着滚轮连续按着,抬起交给引擎的轮齿闩锁到期后按
+                // 状态对账(见 `run()` 里滚轮闩锁那一段)。同样一句守卫也盖住了
+                // FPS 专用键位与组合键(它们走同一个 handle_bind_event)。
                 ctl.touch_up(pid, px, py);
+                hold_until = Some(now + Duration::from_millis(tail));
             }
         }
         Action::Swipe(s) => {
@@ -4359,13 +5028,18 @@ fn handle_bind_event(
                         let (x0, y0) = points[0];
                         ctl.touch_down(pid, x0, y0);
                         scheduled.extend(plan_swipe(
-                            Instant::now(),
+                            now,
                             pid,
                             lane,
                             &points,
                             s.duration_ms as u64,
                             s.easing,
                         ));
+                        // 滑动走完 + 冷却,才允许下一次按下("连续划动时相互干扰")
+                        hold_until = Some(
+                            now + Duration::from_millis(s.duration_ms as u64)
+                                + Duration::from_millis(tail),
+                        );
                     }
                 } else {
                     // W0-7:上一次滑动还没走完的重按是设计内行为("已按着"),
@@ -4382,8 +5056,10 @@ fn handle_bind_event(
                 if active_android_keys.insert(kc) {
                     ctl.key(true, *keycode);
                 }
-            } else if active_android_keys.remove(&kc) {
+            } else if !is_wheel_code(ev.code) && active_android_keys.remove(&kc) {
+                // 同 Hold:滚轮齿的"抬起"不落点,由轮齿闩锁到期后对账收尾。
                 ctl.key(false, *keycode);
+                hold_until = Some(now + Duration::from_millis(tail));
             }
         }
         Action::Macro(mac) => {
@@ -4394,18 +5070,125 @@ fn handle_bind_event(
             if fresh_press {
                 let exec = *macro_exec;
                 *macro_exec = exec.wrapping_add(1);
-                schedule_macro(
-                    mac,
-                    profile,
-                    m,
-                    Instant::now(),
-                    scheduled,
-                    &mut MacroPlan::new(exec),
-                );
+                let total =
+                    schedule_macro(mac, profile, m, now, scheduled, &mut MacroPlan::new(exec));
+                // 整条宏走完(它自己排程出来的总时长)再等 `tail`:宏的每一步
+                // 都不会被"下一次按下"打断。
+                hold_until = Some(now + Duration::from_millis(total) + Duration::from_millis(tail));
             }
         }
     }
+    // `tail == 0`(功能没开、或这一条自己填 0)时**根本不往表里写**:写一个"此刻"
+    // 进去虽然也拦不住任何东西(`now < now` 恒假),但会让 `bind_gate()` 谎报
+    // "这条键位有冷却",日后任何读这张表的代码都会踩坑。
+    if let Some(until) = hold_until.filter(|_| tail > 0) {
+        match lane {
+            BindLane::Combo => gates.hold_combo(idx, until),
+            BindLane::Normal | BindLane::Fps => gates.hold_bind(idx, until),
+        }
+    }
     None
+}
+
+/// 执行一次被「按后延迟」推迟的按下(用户 2026-10-10 第 2 条)。
+///
+/// [`handle_bind_event`] 在冷却没过时会排一个 [`SchedAct::Redispatch`] 而不是把
+/// 这次输入丢掉;排程到期后走到这里,把当初那一下补上。补之前要核对两件事:
+///
+///   ① 同一个下标现在还是**同一条键位** —— 用户可能在这几十毫秒里改了配置,
+///      下标位移后会按到另一条键位上;
+///   ② 长按型 / 系统键的触发键**此刻仍按着** —— 推迟期间已经松手的话,补一次
+///      按下会在设备上留下"只按不抬"的触点,而再没有人会去抬它。
+///
+/// 补发走的是与正常按下**完全相同**的那条路径(同一个 `handle_bind_event` /
+/// `handle_combo_event`,同样 `fresh_press = true`),所以触点池预算、宏排程、
+/// 以及"下一次冷却"全部按正常规则重新算一遍。
+#[allow(clippy::too_many_arguments)]
+fn redispatch_press(
+    ctl: &ControlClient,
+    m: &Mapper,
+    profile: &Profile,
+    held: &Held,
+    idx: usize,
+    lane: BindLane,
+    code: u16,
+    macro_exec: &mut u64,
+    fingers: &mut Fingers,
+    fps_fingers: &mut Fingers,
+    combo_fingers: &mut Fingers,
+    active_android_keys: &mut HashSet<u16>,
+    fps_active_android_keys: &mut HashSet<u16>,
+    combo_active_android_keys: &mut HashSet<u16>,
+    scheduled: &mut Vec<(Instant, SchedAct)>,
+    reserved: usize,
+    live: &mut EngineLive,
+    gates: &mut PressGates,
+) {
+    match lane {
+        BindLane::Combo => {
+            let Some(combo) = profile.combos.get(idx).cloned() else {
+                return;
+            };
+            let _ = handle_combo_event(
+                ctl,
+                m,
+                &combo,
+                profile,
+                macro_exec,
+                idx,
+                true,
+                combo_fingers,
+                combo_active_android_keys,
+                scheduled,
+                reserved,
+                live,
+                gates,
+            );
+        }
+        BindLane::Normal | BindLane::Fps => {
+            let Some(bind) = profile.binds.get(idx).cloned() else {
+                return;
+            };
+            // FPS 专用键位只该由 FPS 车道补发(反过来同理):车道是在按下那一刻
+            // 按 `fps_only` 选的,补发时再核一次,避免配置在冷却期间被改过。
+            if bind.key != code || (matches!(lane, BindLane::Fps) != bind.fps_only) {
+                return;
+            }
+            let stateful = matches!(bind.action, Action::Hold { .. } | Action::AndroidKey { .. });
+            if stateful && !held.has(code) {
+                return;
+            }
+            let (pid, fg, ak) = match lane {
+                BindLane::Fps => (
+                    fps_bind_pid(idx),
+                    &mut *fps_fingers,
+                    &mut *fps_active_android_keys,
+                ),
+                _ => (bind_pid(idx), &mut *fingers, &mut *active_android_keys),
+            };
+            let _ = handle_bind_event(
+                ctl,
+                m,
+                profile,
+                &bind,
+                idx,
+                pid,
+                lane,
+                macro_exec,
+                true,
+                &CaptureKey {
+                    code,
+                    pressed: true,
+                },
+                fg,
+                ak,
+                scheduled,
+                reserved,
+                live,
+                gates,
+            );
+        }
+    }
 }
 
 /// 一次宏执行的触点号分配器。
@@ -4723,9 +5506,9 @@ fn schedule_macro_into(
                                 down: false,
                             },
                         );
-                    } else if let Some(angle) = wheel_part_angle(w, *part) {
+                    } else if wheel_part_angle(w, *part).is_some() {
                         let pid = plan.slot();
-                        schedule_virtual_wheel_once(w, m, angle, pid, at, dur as u32, emit);
+                        schedule_virtual_wheel_once(w, m, *part, pid, at, dur as u32, emit);
                     }
                 }
                 cursor = cursor.saturating_add(dur);
@@ -4817,7 +5600,8 @@ fn emit_step_press(
     let mut consumed = false;
     for (j, w) in vp.wheels.iter().enumerate() {
         let Some(t) = &w.temp else { continue };
-        if t.key != code {
+        // 组合键启用键:与 `dispatch_input` 同口径(成员 + 整个集合按着)。
+        if !(t.key.contains(&code) && t.key.all_held_by(|k| rs.down.contains(&k))) {
             continue;
         }
         consumed = true;
@@ -4834,19 +5618,25 @@ fn emit_step_press(
     if consumed {
         return None;
     }
-    // ② 生效轮盘的方向键:覆盖普通绑定;多把轮盘共用一键时全部响应。
+    // ② 生效轮盘的方向键:覆盖普通绑定;多把**永久**轮盘共用一键时全部响应。
+    // 已启用的临时轮盘优先于永久轮盘(R1,与 `dispatch_input` 同规则):
+    // 被抢走的键位上永久轮盘不响应。
     let mut parts: Vec<(usize, MacroWheelPart)> = Vec::new();
     let mut virtual_gesture = false;
+    let temp_taken = macro_key_taken_by_active_temp_wheel(vp, rs, code);
     for (j, w) in vp.wheels.iter().enumerate() {
         let engaged = w.temp.is_none() || rs.active[j];
-        if !engaged {
+        if !engaged || (w.temp.is_none() && temp_taken) {
             continue;
         }
+        // 组合键方向键:事件是成员**且**整个集合此刻都按着 —— 与真机路径
+        // (`wheel_dir_wanted`)同口径,顺序无关。缺了这一半,`Ctrl+W` 会在只按下
+        // `W` 时就推出摇杆。
         let Some((pos, angle)) = w
             .active_dirs()
             .into_iter()
             .enumerate()
-            .find(|(_, (_, key))| *key == code)
+            .find(|(_, (_, key))| key.contains(&code) && key.all_held_by(|k| rs.down.contains(&k)))
             .map(|(pos, (angle, _))| (pos, angle))
         else {
             continue;
@@ -4865,7 +5655,15 @@ fn emit_step_press(
         } else {
             // 虚拟层的轮盘在设备上不存在:方向键按一次,展开成一次推离手势。
             let pid = plan.slot();
-            schedule_virtual_wheel_once(w, m, angle, pid, at, dur_ms as u32, emit);
+            schedule_virtual_wheel_once(
+                w,
+                m,
+                wheel_part_at(w, pos, angle),
+                pid,
+                at,
+                dur_ms as u32,
+                emit,
+            );
             virtual_gesture = true;
         }
     }
@@ -4899,7 +5697,8 @@ fn emit_step_release(
     // ① 启用键的抬起:按住模式 = 停用;切换模式抬起不翻转。
     for (j, w) in vp.wheels.iter().enumerate() {
         let Some(t) = &w.temp else { continue };
-        if t.key != code || t.mode != TempMode::Hold || !rs.active[j] {
+        // 抬起:集合里的任一成员松开都让"整个集合按着"不成立 —— 于是停用。
+        if !t.key.contains(&code) || t.mode != TempMode::Hold || !rs.active[j] {
             continue;
         }
         rs.active[j] = false;
@@ -4935,22 +5734,61 @@ fn macro_wheel_transition(
     }
     let Some(w) = vp.wheels.get(j) else { return };
     let engaged = rs.active[j];
-    let dirs: Vec<(usize, f32, u16)> = w
+    let dirs: Vec<(usize, f32, KeySet)> = w
         .active_dirs()
         .into_iter()
         .enumerate()
         .map(|(pos, (angle, key))| (pos, angle, key))
         .collect();
-    for (pos, angle, key) in dirs {
-        if !rs.down.contains(&key) {
+    for (pos, angle, keys) in dirs {
+        // 组合键方向键:整个集合都在物理镜像里才算"按着"(与真机路径同口径)。
+        // 缺了这一半,只按下 `Ctrl+W` 里的一个成员就会推摇杆。
+        if !keys.all_held_by(|k| rs.down.contains(&k)) {
             continue;
         }
+        // 方向只能有一个**把手**成员挂在 `pending` 上(抬起时按把手解开)。
+        // 优先沿用已经挂号的那个成员(按下路径按事件键码挂的),否则用集合里
+        // 的第一个成员 —— 两条路在真机上就此汇合,不会各挂一次。
+        let key = keys
+            .iter()
+            .copied()
+            .find(|k| pending.contains_key(k))
+            .or_else(|| keys.first().copied());
+        let Some(key) = key else { continue };
         let part = wheel_part_at(w, pos, angle);
         if engaged {
             // 键还按着:先抬掉它此刻挂着的动作(普通绑定/系统键/别的形态),
             // 再作为本轮盘的方向生效 —— "启用瞬间已按着的键立刻推摇杆"。
             match pending.remove(&key) {
                 Some(MacroPending::Wheel { mut parts }) => {
+                    // R1 的启用侧对偶(停用侧见下面的 heir 交接):本轮盘 j 一生效,
+                    // 键上所有**被它抢占**的部件必须当场抬掉。引擎路径那边方向状态
+                    // 是按物理键现推的(`wheel_dir_wanted`),永久轮盘会自动不推;
+                    // 宏这一侧的状态是排出来的,不补这一抬,两把轮盘就会**同时**
+                    // 把触点推到设备上 —— 正是 R1 要消灭的情形。
+                    //
+                    // 临时轮盘之间不互相抢占(与 `macro_key_taken_by_active_temp_wheel`
+                    // 同口径),只对 `temp.is_none()` 的轮盘动手。先抬后按,与停用侧
+                    // 对称;`MacroEmit` 按 (t, seq) 排序,同刻的抬一定排在按之前。
+                    let mut kept: Vec<(usize, MacroWheelPart)> =
+                        Vec::with_capacity(parts.len() + 1);
+                    for (wj, wp) in parts.drain(..) {
+                        let preempted =
+                            wj != j && vp.wheels.get(wj).is_some_and(|ww| ww.temp.is_none());
+                        if preempted {
+                            emit.push(
+                                at,
+                                SchedAct::MacroWheel {
+                                    wheel: wj,
+                                    part: wp,
+                                    down: false,
+                                },
+                            );
+                        } else {
+                            kept.push((wj, wp));
+                        }
+                    }
+                    parts = kept;
                     if !parts.iter().any(|(wj, _)| *wj == j) {
                         emit.push(
                             at,
@@ -5021,15 +5859,50 @@ fn macro_wheel_transition(
             if pending.contains_key(&key) {
                 continue; // 还归别的生效轮盘
             }
+            // R1 的另一半:这把(刚停用的)临时轮盘可能一直"抢着"某个永久轮盘的
+            // 方向键。它一让位,那个仍然生效、键也还按着的永久轮盘要**立刻接手** ——
+            // 镜像引擎路径的 `reconcile_wheels`(那边方向状态是按物理键推出来的、
+            // 自动就接上了;宏这一侧的状态是排出来的,得自己补上这一推)。
+            // 走到这里说明 `pending` 里已经没有任何人挂在这个键上,所以不会重复按。
+            let mut heirs: Vec<(usize, MacroWheelPart)> = Vec::new();
+            for (jj, ww) in vp.wheels.iter().enumerate() {
+                if ww.temp.is_some() || !rs.active.get(jj).copied().unwrap_or(false) {
+                    continue;
+                }
+                let Some((pos, angle)) = ww
+                    .active_dirs()
+                    .into_iter()
+                    .enumerate()
+                    .find(|(_, (_, k))| k.contains(&key))
+                    .map(|(pos, (angle, _))| (pos, angle))
+                else {
+                    continue;
+                };
+                heirs.push((jj, wheel_part_at(ww, pos, angle)));
+            }
+            if !heirs.is_empty() {
+                for &(jj, part) in &heirs {
+                    emit.push(
+                        at,
+                        SchedAct::MacroWheel {
+                            wheel: jj,
+                            part,
+                            down: true,
+                        },
+                    );
+                }
+                pending.insert(key, MacroPending::Wheel { parts: heirs });
+                continue;
+            }
             // 仍被别的生效轮盘或任意临时轮盘启用键占用 -> 不落回绑定。
             let owned = vp.wheels.iter().enumerate().any(|(jj, ww)| {
                 if let Some(t) = &ww.temp {
-                    if t.key == key {
+                    if t.key.contains(&key) {
                         return true;
                     }
                 }
                 (ww.temp.is_none() || rs.active[jj])
-                    && ww.active_dirs().iter().any(|(_, k)| *k == key)
+                    && ww.active_dirs().iter().any(|(_, k)| k.contains(&key))
             });
             if owned {
                 continue;
@@ -5219,20 +6092,45 @@ fn schedule_macro_swipe(
     );
 }
 
+/// 宏"轮盘"步骤(虚拟层设置步骤展开成一次推离手势)要推到的落点偏移(相对圆心)。
+///
+/// 与按键路径共用同一套口径:该方向有手改终点(`WheelDirection::manual`)就用它,
+/// 否则落在基准圆上(角度 × 影响范围)。上/下/左/右是旧的四向写法,恒按角度算;
+/// 自定义方向用 [`MacroWheelPart::Custom`] 指明下标,手改终点跟着下标走。
+///
+/// 返回 `None` = 这个 part 指的方向在该轮盘上不存在。
+fn wheel_part_offset(w: &Wheel, m: &Mapper, part: MacroWheelPart) -> Option<(f64, f64)> {
+    let push = w.push_px(m);
+    let (cx, cy) = m.point(w.cx, w.cy);
+    let dirs = w.active_dirs();
+    let (angle, manual) = match part {
+        MacroWheelPart::Up => (-90.0, None),
+        MacroWheelPart::Down => (90.0, None),
+        MacroWheelPart::Left => (180.0, None),
+        MacroWheelPart::Right => (0.0, None),
+        MacroWheelPart::Custom(i) => {
+            let (angle, _) = *dirs.get(i)?;
+            (angle, w.directions.get(i).and_then(|d| d.manual))
+        }
+    };
+    Some(wheel_dir_offset(m, cx, cy, angle, manual, push))
+}
+
 fn schedule_virtual_wheel_once(
     wheel: &Wheel,
     m: &Mapper,
-    angle: f32,
+    part: MacroWheelPart,
     pid: u64,
     at: Instant,
     duration_ms: u32,
     emit: &mut MacroEmit,
 ) {
+    let Some((ox, oy)) = wheel_part_offset(wheel, m, part) else {
+        return;
+    };
     let (cx, cy) = m.point(wheel.cx, wheel.cy);
-    let push = wheel.push_px(m);
-    let a = angle.to_radians();
-    let tx = (cx as f32 + a.cos() * push).round() as i32;
-    let ty = (cy as f32 + a.sin() * push).round() as i32;
+    let tx = (cx as f64 + ox).round() as i32;
+    let ty = (cy as f64 + oy).round() as i32;
     let rx = |x: i32| m.rel_x(x).clamp(0.0, 1.0);
     let ry = |y: i32| m.rel_y(y).clamp(0.0, 1.0);
     schedule_macro_swipe(rx(cx), ry(cy), rx(tx), ry(ty), duration_ms, pid, at, emit);
@@ -5266,8 +6164,9 @@ fn wheel_axis_value(
 ///
 /// 出屏的触摸会被设备端整条丢弃(control.rs 只做 `.max(0)` 的下界钳制),
 /// 表现就是"按了没反应 / 摇杆某个方向不动";极端配置(手改 YAML 放大
-/// radius/cx)还会让 i32 加法溢出。瞄准的"无边界/开放世界"模式刻意允许
-/// 超屏,走自己的路径,不要在这里拦。
+/// radius/cx)还会让 i32 加法溢出。瞄准的"开放世界"模式刻意允许超屏
+/// (它自己按半径抬指换手),走自己的路径,不要在这里拦;
+/// FPS 的"无边界"模式则不超屏(见 `aim_band_limits`)。
 fn clamp_to_screen(m: &Mapper, x: i32, y: i32) -> (i32, i32) {
     (
         x.clamp(0, (m.w as i32 - 1).max(0)),
@@ -5297,6 +6196,85 @@ fn wheel_reach_px(m: &Mapper, w: &Wheel, cx: i32, cy: i32, fx: f64, fy: f64) -> 
     clamp_to_screen(m, tx, ty)
 }
 
+/// 当前生效的一个方向键:(按下序号, 角度, 手动终点)。
+///
+/// 按下序号用于裁决"最早按下的两个方向"(见 `update_custom_wheel`);
+/// 手动终点是用户在截图上点出来的落点(没有就是 `None` = 跟随基准圆)。
+type ActiveDir = (u64, f32, Option<(f32, f32)>);
+
+/// 一个方向键的落点偏移(相对轮盘圆心的像素向量)。
+///
+/// - 该方向有手动终点(`WheelDirection::manual`,用户在截图上点出来的那个点):
+///   **直接用它**,不再经过半径/影响范围换算 —— 允许落在基准圆外,也允许落在圆内;
+/// - 没有手动终点:基准圆上的点,方向由 `angle_deg` 决定、距离 = `push`
+///   (即 半径 × 影响范围)。这条是旧行为,一字未改。
+fn wheel_dir_offset(
+    m: &Mapper,
+    cx: i32,
+    cy: i32,
+    angle_deg: f32,
+    manual: Option<(f32, f32)>,
+    push: f32,
+) -> (f64, f64) {
+    match manual {
+        Some((mx, my)) => {
+            let (px, py) = m.point(mx, my);
+            ((px - cx) as f64, (py - cy) as f64)
+        }
+        None => {
+            let a = (angle_deg as f64).to_radians();
+            (a.cos() * push as f64, a.sin() * push as f64)
+        }
+    }
+}
+
+/// 当前生效方向合成的落点偏移(相对圆心)。
+///
+/// 按键口径(2026-10-08 起):
+/// - **一个键**:就是它自己的落点 —— 手动终点优先,否则基准圆上的点;
+/// - **两个键**:最终响应目标 = **两键方向的中点**。两个方向各按上面的规则先算出
+///   自己的落点(有手动终点就用手动终点),取中点后再把距离规整到基准圆上:
+///   方向取两键之间的方位,距离仍是"影响范围"定义的那一个 —— 这正是把影响范围
+///   当**基准**用的含义(单键手感不变,双键不会因为"中点比两端近"而推得更浅)。
+///
+/// 返回 `None` = 合成结果为零向量(两个方向正好互相抵消),调用方应收手。
+fn wheel_combo_offset(
+    m: &Mapper,
+    cx: i32,
+    cy: i32,
+    active: &[(f32, Option<(f32, f32)>)],
+    push: f32,
+) -> Option<(f64, f64)> {
+    match active.len() {
+        0 => None,
+        1 => {
+            let (angle, manual) = active[0];
+            let (vx, vy) = wheel_dir_offset(m, cx, cy, angle, manual, push);
+            if vx.hypot(vy) <= 1e-4 {
+                None
+            } else {
+                Some((vx, vy))
+            }
+        }
+        _ => {
+            let mut sx = 0.0f64;
+            let mut sy = 0.0f64;
+            for &(angle, manual) in active.iter().take(2) {
+                let (vx, vy) = wheel_dir_offset(m, cx, cy, angle, manual, push);
+                sx += vx;
+                sy += vy;
+            }
+            let (mx, my) = (sx / 2.0, sy / 2.0);
+            let mag = mx.hypot(my);
+            if mag <= 1e-4 {
+                return None;
+            }
+            let k = push as f64 / mag;
+            Some((mx * k, my * k))
+        }
+    }
+}
+
 /// 按当前方向状态更新轮盘触点。返回是否因为设备端触点池已满而**放弃**了这次按下
 /// (供调用方计入诊断 —— 这种情况以前会直接把消息发出去、被服务端悄悄丢掉)。
 ///
@@ -5311,13 +6289,20 @@ fn update_custom_wheel(
     reserved: usize,
 ) -> bool {
     let dirs = w.active_dirs();
-    let mut active: Vec<(u64, f32)> = dirs
+    // 手改终点跟着方向下标走:自定义/执行轮盘的 active_dirs 与 directions 一一对应。
+    let mut active: Vec<ActiveDir> = dirs
         .iter()
         .enumerate()
         .filter(|(d, _)| st.custom_pressed.get(*d).copied().unwrap_or(false))
-        .map(|(d, (angle, _))| (st.custom_seq[d], *angle))
+        .map(|(d, (angle, _))| {
+            (
+                st.custom_seq[d],
+                *angle,
+                w.directions.get(d).and_then(|x| x.manual),
+            )
+        })
         .collect();
-    active.sort_by_key(|(seq, _)| *seq);
+    active.sort_by_key(|(seq, _, _)| *seq);
     active.truncate(2);
 
     // 中心也要钳屏:中心落在屏外时,首次按下会被设备端整条丢弃,
@@ -5337,14 +6322,13 @@ fn update_custom_wheel(
     if !st.down && reserved >= DEVICE_MAX_POINTERS {
         return true;
     }
-    let (mut vx, mut vy) = (0.0f32, 0.0f32);
-    for (_, angle) in &active {
-        let a = angle.to_radians();
-        vx += a.cos();
-        vy += a.sin();
-    }
-    let mag = vx.hypot(vy);
-    if mag <= 1e-4 {
+    let push = w.push_px(m);
+    let combo: Vec<(f32, Option<(f32, f32)>)> = active
+        .iter()
+        .map(|(_, angle, manual)| (*angle, *manual))
+        .collect();
+    let Some((ox, oy)) = wheel_combo_offset(m, cx, cy, &combo, push) else {
+        // 合成结果为零(两个方向正好抵消):收手,不留半个状态
         if st.down {
             ctl.touch_move(pid, cx, cy);
             ctl.touch_up(pid, cx, cy);
@@ -5352,15 +6336,12 @@ fn update_custom_wheel(
             st.sent_at = None;
         }
         return false;
-    }
-    vx /= mag;
-    vy /= mag;
-    let push = w.push_px(m);
+    };
     // 落点必须钳屏:出屏的触摸会被设备端整条丢弃,表现为"这个方向推不动"(W0-8)。
     let (tx, ty) = clamp_to_screen(
         m,
-        (cx as f32 + vx * push).round() as i32,
-        (cy as f32 + vy * push).round() as i32,
+        (cx as f64 + ox).round() as i32,
+        (cy as f64 + oy).round() as i32,
     );
     if !st.down {
         ctl.touch_down(pid, cx, cy);
@@ -5402,37 +6383,34 @@ fn execute_wheel_direction(
         return Some(reason);
     }
     let dirs = w.active_dirs();
-    let mut active: Vec<(u64, f32)> = dirs
+    let mut active: Vec<ActiveDir> = dirs
         .iter()
         .enumerate()
         .filter(|(d, _)| st.custom_pressed.get(*d).copied().unwrap_or(false))
-        .map(|(d, (angle, _))| (st.custom_seq[d], *angle))
+        .map(|(d, (angle, _))| {
+            (
+                st.custom_seq[d],
+                *angle,
+                w.directions.get(d).and_then(|x| x.manual),
+            )
+        })
         .collect();
-    active.sort_by_key(|(seq, _)| *seq);
+    active.sort_by_key(|(seq, _, _)| *seq);
     active.truncate(2);
-    if active.is_empty() {
-        return None;
-    }
-    let (mut vx, mut vy) = (0.0f32, 0.0f32);
-    for (_, angle) in &active {
-        let a = angle.to_radians();
-        vx += a.cos();
-        vy += a.sin();
-    }
-    let mag = vx.hypot(vy);
-    if mag <= 1e-4 {
-        return None;
-    }
-    vx /= mag;
-    vy /= mag;
     let (cx, cy) = m.point(w.cx, w.cy);
     let push = w.push_px(m);
-    let tx = (cx as f32 + vx * push)
+    let combo: Vec<(f32, Option<(f32, f32)>)> = active
+        .iter()
+        .map(|(_, angle, manual)| (*angle, *manual))
+        .collect();
+    // 没有可响应方向 / 两键正好抵消 -> 这次触发什么都不做
+    let (ox, oy) = wheel_combo_offset(m, cx, cy, &combo, push)?;
+    let tx = (cx as f64 + ox)
         .round()
-        .clamp(0.0, (m.w - 1.0).max(0.0)) as i32;
-    let ty = (cy as f32 + vy * push)
+        .clamp(0.0, (m.w - 1.0).max(0.0) as f64) as i32;
+    let ty = (cy as f64 + oy)
         .round()
-        .clamp(0.0, (m.h - 1.0).max(0.0)) as i32;
+        .clamp(0.0, (m.h - 1.0).max(0.0) as f64) as i32;
     let pid = wheel_pid(j);
     ctl.touch_down(pid, cx, cy);
     st.down = true;
@@ -5645,6 +6623,7 @@ mod tests {
                     radius: 0.03,
                 },
                 fps_only: false,
+                tail_delay_ms: 0,
             },
             KeyBind {
                 key: BIND_KEY,
@@ -5655,13 +6634,14 @@ mod tests {
                     radius: 0.03,
                 },
                 fps_only: false,
+                tail_delay_ms: 0,
             },
         ];
         profile.wheels = vec![Wheel {
-            up: UP_KEY,
-            down: 0,
-            left: 0,
-            right: 0,
+            up: KeySet::single(UP_KEY),
+            down: KeySet::single(0),
+            left: KeySet::single(0),
+            right: KeySet::single(0),
             cx: 0.5,
             cy: 0.5,
             radius: 0.1,
@@ -5672,7 +6652,7 @@ mod tests {
             center_radius: 0.1,
             execute_duration_ms: 180,
             temp: Some(TempWheel {
-                key: ENABLE,
+                key: KeySet::single(ENABLE),
                 mode: TempMode::Hold,
             }),
         }];
@@ -5687,6 +6667,7 @@ mod tests {
         let mut macro_exec_seq = 0u64;
         let mut scheduled: Vec<(Instant, SchedAct)> = Vec::new();
         let mut live = EngineLive::default();
+        let mut gates = PressGates::default();
         let mut active_android_keys: HashSet<u16> = HashSet::new();
         let mut last_refuse_note: Option<Instant> = None;
         let mut pending_notice: Option<String> = None;
@@ -5739,6 +6720,7 @@ mod tests {
                     last_refuse_note: &mut last_refuse_note,
                     pending_notice: &mut pending_notice,
                     aim_st: &mut aim_state,
+                    gates: &mut gates,
                 });
                 (consumed, wheels[0].active)
             };
@@ -5814,6 +6796,7 @@ mod tests {
         let mut macro_exec_seq = 0u64;
         let mut scheduled: Vec<(Instant, SchedAct)> = Vec::new();
         let mut live = EngineLive::default();
+        let mut gates = PressGates::default();
         let mut active_android_keys: HashSet<u16> = HashSet::new();
         let mut last_refuse_note: Option<Instant> = None;
         let mut pending_notice: Option<String> = None;
@@ -5866,6 +6849,7 @@ mod tests {
                     last_refuse_note: &mut last_refuse_note,
                     pending_notice: &mut pending_notice,
                     aim_st: &mut aim_state,
+                    gates: &mut gates,
                 })
             };
 
@@ -6079,14 +7063,14 @@ mod tests {
 
         // 门控键:按住才生效
         let mut aim = aim_at(0.1, 0.1);
-        aim.hold_key = 273; // BTN_RIGHT
+        aim.hold_key = KeySet::single(273); // BTN_RIGHT
         assert!(!aim_active(&aim, &st));
         st.gate_down = true;
         assert!(aim_active(&aim, &st));
 
         let mut open_world = aim_at(0.1, 0.1);
         open_world.open_world = true;
-        open_world.hold_key = 273;
+        open_world.hold_key = KeySet::single(273);
         st.gate_down = false;
         assert!(aim_active(&open_world, &st), "开放世界模式不依赖射击门控键");
     }
@@ -6118,9 +7102,12 @@ mod tests {
         w.ensure_custom_directions();
         assert_eq!(w.active_dirs().len(), 4, "标准四向应迁移为四个自定义方向");
         w.directions[0].angle_deg = -45.0;
-        w.directions[0].key = 55;
+        w.directions[0].key = KeySet::single(55);
         w.kind = WheelKind::Standard;
-        assert!(w.owns_key(w.up), "切回标准后仍保留原四向");
+        assert!(
+            w.owns_key(w.up.first().copied().unwrap()),
+            "切回标准后仍保留原四向"
+        );
         w.kind = WheelKind::Custom;
         assert_eq!(w.directions[0].angle_deg, -45.0, "切回自定义不能丢角度");
         assert!(w.owns_key(55), "切回自定义不能丢按键");
@@ -6128,6 +7115,79 @@ mod tests {
         assert_eq!(w.directions.len(), 8);
         w.set_direction_count(3);
         assert_eq!(w.directions.len(), 3);
+    }
+
+    /// 轮盘落点口径(2026-10-08「设置位置」):
+    /// 单键 = 手改终点优先(可超出基准圆),否则基准圆上的点;
+    /// 双键 = 两键方向的中点,并且**始终规整到基准圆上**(影响范围只定义"多远");
+    /// 两键正好相反 = 合成零向量 → 收手。
+    #[test]
+    fn wheel_combo_offset_uses_manual_endpoint_and_takes_midpoint() {
+        let m = Mapper::new(crate::keymap::CoordUnit::Rel, (1000, 1000));
+        let (cx, cy) = (500, 500);
+        let push = 100.0f32;
+
+        // 单键、无手改:基准圆上的点(0° = 右,距离 = push)
+        let (ox, oy) = wheel_combo_offset(&m, cx, cy, &[(0.0, None)], push).unwrap();
+        assert!((ox - 100.0).abs() < 1e-3 && oy.abs() < 1e-3, "({ox},{oy})");
+
+        // 单键、有手改:直接落在手改点上(相对圆心 400,-300),**不受影响范围约束**
+        let (ox, oy) = wheel_combo_offset(&m, cx, cy, &[(0.0, Some((0.9, 0.2)))], push).unwrap();
+        assert_eq!((ox.round() as i32, oy.round() as i32), (400, -300));
+        assert!(
+            ox.hypot(oy) > push as f64,
+            "手改点必须允许落在基准圆之外:{}",
+            ox.hypot(oy)
+        );
+
+        // 双键、无手改:0° 与 -90° 的中点方向(右上),距离仍是 push
+        let (ox, oy) = wheel_combo_offset(&m, cx, cy, &[(0.0, None), (-90.0, None)], push).unwrap();
+        assert!(
+            (ox.hypot(oy) - push as f64).abs() < 1e-3,
+            "中点必须规整到基准圆上:{}",
+            ox.hypot(oy)
+        );
+        assert!(ox > 0.0 && oy < 0.0, "中点应落在右上:({ox},{oy})");
+
+        // 双键、其中一键有手改:中点被手改点拽过去(方向明显偏离 -45°)
+        let (ox, oy) =
+            wheel_combo_offset(&m, cx, cy, &[(0.0, None), (-90.0, Some((0.9, 0.4)))], push)
+                .unwrap();
+        assert!((ox.hypot(oy) - push as f64).abs() < 1e-3);
+        let deg = oy.atan2(ox).to_degrees();
+        assert!(deg > -30.0, "手改点应把中点方向拉向它那一侧:{deg}");
+
+        // 两键正好相反:合成零向量 → 收手(None)
+        assert!(wheel_combo_offset(&m, cx, cy, &[(0.0, None), (180.0, None)], push).is_none());
+        assert!(wheel_combo_offset(&m, cx, cy, &[], push).is_none());
+    }
+
+    /// 宏"轮盘"步骤(虚拟层展开成手势)与按键路径同口径:手改终点优先。
+    #[test]
+    fn macro_wheel_part_offset_follows_manual_endpoint() {
+        use crate::keymap::{MacroWheelPart, WheelDirection, WheelKind};
+        let m = Mapper::new(crate::keymap::CoordUnit::Rel, (1000, 1000));
+        let mut w = Wheel::new_default(&m, 0.5, 0.5);
+        w.kind = WheelKind::Custom;
+        w.ensure_custom_directions();
+        w.radius = 0.1; // 1000px 宽 -> 基准圆 100px
+        w.scope = 1.0;
+
+        // 未手改:自定义方向 #1(0° = 右)按基准圆推
+        let (ox, oy) = wheel_part_offset(&w, &m, MacroWheelPart::Custom(1)).unwrap();
+        assert!((ox - 100.0).abs() < 2.0 && oy.abs() < 2.0, "({ox},{oy})");
+
+        // 手改后:同一个方向改推到手改点
+        w.directions[1] = WheelDirection {
+            angle_deg: 0.0,
+            key: w.directions[1].key,
+            manual: Some((0.2, 0.8)),
+        };
+        let (ox, oy) = wheel_part_offset(&w, &m, MacroWheelPart::Custom(1)).unwrap();
+        assert_eq!((ox.round() as i32, oy.round() as i32), (-300, 300));
+
+        // 越界的方向下标 → None(不排任何手势)
+        assert!(wheel_part_offset(&w, &m, MacroWheelPart::Custom(7)).is_none());
     }
 
     #[test]
@@ -6156,6 +7216,133 @@ mod tests {
         assert!(x <= 99 && edge, "有边界时必须钳在屏幕内");
     }
 
+    /// 无边界跑步机的几何锁(本次修复的核心):
+    /// ①可用矩形永远不越出屏幕 —— 锚点再贴边,注入落点也在屏内
+    ///   (出屏触摸会被设备端整条丢弃,那正是"上下到某个临界点就不动了"的成因);
+    /// ②各段之和恰好等于期望偏移 —— 不再像旧实现那样把超出回转半径的部分
+    ///   注入两遍(那正是"视角跳变"的成因);
+    /// ③每一段都落在可用矩形内,且下一帧的起点也在矩形内。
+    #[test]
+    fn unbounded_treadmill_band_is_on_screen_and_delivers_exact_total() {
+        let m = mapper();
+        let aim = Aim {
+            boundary: false,
+            recenter_threshold: 4000,
+            ..aim_at(0.5, 0.5)
+        };
+        for &(ax, ay) in &[
+            (500, 500),
+            (0, 0),
+            (999, 999),
+            (7, 993),
+            (999, 500),
+            (500, 999),
+        ] {
+            let (l, r, u, d) = aim_band_limits(&m, &aim, ax, ay);
+            assert!(l >= 0.0 && r >= 0.0 && u >= 0.0 && d >= 0.0);
+            assert!(
+                (ax as f32 - l) >= 0.0 && (ax as f32 + r) <= 999.0,
+                "x 落点越出屏幕:锚点 {ax},范围 [{}, {}]",
+                ax as f32 - l,
+                ax as f32 + r
+            );
+            assert!(
+                (ay as f32 - u) >= 0.0 && (ay as f32 + d) <= 999.0,
+                "y 落点越出屏幕:锚点 {ay},范围 [{}, {}]",
+                ay as f32 - u,
+                ay as f32 + d
+            );
+        }
+
+        let lim = (100.0, 120.0, 90.0, 80.0);
+        // 帧内实际的偏移量最多是"可用矩形 + 一帧鼠标位移"(每帧都会被钳回矩形),
+        // 所以这些都在 32 段兜底以内,必须精确送达。
+        for &(ox, oy) in &[
+            (250.0, -430.0),
+            (-50.0, 30.0),
+            (0.0, 0.0),
+            (1000.0, 1000.0),
+            (-3000.0, 1234.0),
+        ] {
+            let (segs, next) = plan_aim_treadmill(ox, oy, lim, AIM_TREADMILL_MAX_HOPS);
+            assert!(!segs.is_empty());
+            let sum = segs
+                .iter()
+                .fold((0.0f32, 0.0f32), |a, (x, y)| (a.0 + x, a.1 + y));
+            assert!(
+                (sum.0 - ox).abs() < 0.5 && (sum.1 - oy).abs() < 0.5,
+                "拖动总量必须等于期望偏移:{sum:?} vs ({ox}, {oy})"
+            );
+            for (x, y) in &segs {
+                assert!(
+                    *x <= lim.1 + 1e-3 && *x >= -lim.0 - 1e-3,
+                    "该段 x 越出可用矩形:{x}"
+                );
+                assert!(
+                    *y <= lim.3 + 1e-3 && *y >= -lim.2 - 1e-3,
+                    "该段 y 越出可用矩形:{y}"
+                );
+            }
+            assert!(
+                next.0 <= lim.1 + 0.51 && next.0 >= -lim.0 - 0.51,
+                "下一帧起点 x 越出可用矩形:{:?}",
+                next
+            );
+            assert!(
+                next.1 <= lim.3 + 0.51 && next.1 >= -lim.2 - 0.51,
+                "下一帧起点 y 越出可用矩形:{:?}",
+                next
+            );
+        }
+
+        // 病态输入(远超一帧可能出现的偏移量):32 段兜底会截断没送完的余量,
+        // 但**任何一段都不许越出矩形**(宁可少转一点,也不能把触点推出屏幕)。
+        let (segs, next) = plan_aim_treadmill(-9999.0, 1234.0, lim, AIM_TREADMILL_MAX_HOPS);
+        assert_eq!(segs.len(), AIM_TREADMILL_MAX_HOPS);
+        for (x, y) in &segs {
+            assert!(
+                *x <= lim.1 + 1e-3 && *x >= -lim.0 - 1e-3,
+                "兜底截断时段也必须留在矩形内:{x}"
+            );
+            assert!(*y <= lim.3 + 1e-3 && *y >= -lim.2 - 1e-3, "y 越出矩形:{y}");
+        }
+        assert!(
+            next.0 <= lim.1 + 0.51 && next.0 >= -lim.0 - 0.51,
+            "{next:?}"
+        );
+    }
+
+    /// 换手必须无缝:无边界模式下连续同向推,触点始终留在屏幕内,
+    /// 且每一段都只推"还没送出去的那部分"(不会重复注入)。
+    #[test]
+    fn unbounded_treadmill_keeps_touch_on_screen_while_turning() {
+        let m = mapper();
+        let aim = Aim {
+            boundary: false,
+            recenter_threshold: 400,
+            ..aim_at(0.5, 0.95) // 锚点偏下:向下只剩不到 50px,旧实现一路向下就在这里出屏
+        };
+        let (ax, ay) = aim_anchor(&m, &aim);
+        let (_, _, _, down_room) = aim_band_limits(&m, &aim, ax, ay);
+        assert!(down_room <= 100.0, "这个锚点向下本来就只剩不到 100px");
+
+        // 连续同向推 30 段,每段都按"期望偏移"重算落点
+        let mut off_y = 0.0f32;
+        for _ in 0..30 {
+            off_y += 60.0;
+            let lim = aim_band_limits(&m, &aim, ax, ay);
+            let (segs, next) = plan_aim_treadmill(0.0, off_y, lim, AIM_TREADMILL_MAX_HOPS);
+            for (_, sy) in &segs {
+                let ty = (ay as f32 + sy).round() as i32;
+                assert!(
+                    (0..=m.h as i32 - 1).contains(&ty),
+                    "触点跑到屏幕外了:y={ty}"
+                );
+            }
+            off_y = next.1; // 手指停在 next,下一段从这里继续
+        }
+    }
+
     #[test]
     fn macro_steps_are_serializable_and_change_bind_signature() {
         use crate::keymap::{MacroAction, MacroStep};
@@ -6179,6 +7366,7 @@ mod tests {
             key: 29,
             action: action.clone(),
             fps_only: false,
+            tail_delay_ms: 0,
         };
         assert_ne!(binds_signature(&[bind.clone()]), binds_signature(&[]));
         let text = serde_norway::to_string(&action).unwrap();
@@ -6255,12 +7443,33 @@ mod tests {
             code: 66,
             pressed: true,
         };
+        let mut held = Held::default();
+        held.set(66, true);
+        let single = KeySet::single(66);
         // 宏来源:即使键位匹配、也确实处于"按下",功能键判定一律不通过
-        assert!(!functional_key_hit(Source::Macro, f8, 66));
+        assert!(!functional_key_hit(Source::Macro, f8, &single, &held));
         // 物理来源:键位匹配才通过(键位不配或未配置(0)都不算)
-        assert!(functional_key_hit(Source::Physical, f8, 66));
-        assert!(!functional_key_hit(Source::Physical, f8, 67));
-        assert!(!functional_key_hit(Source::Physical, f8, 0));
+        assert!(functional_key_hit(Source::Physical, f8, &single, &held));
+        assert!(!functional_key_hit(
+            Source::Physical,
+            f8,
+            &KeySet::single(67),
+            &held
+        ));
+        assert!(!functional_key_hit(
+            Source::Physical,
+            f8,
+            &KeySet::new(),
+            &held
+        ));
+        // 组合键:成员按下但集合没整个按着时不算命中;补上另一半才算
+        let chord = KeySet::from_keys([29, 66]);
+        assert!(!key_set_hit(&chord, 66, &held), "只有 F8 按着");
+        held.set(29, true);
+        assert!(key_set_hit(&chord, 66, &held), "Ctrl 也按着 -> 命中");
+        assert!(key_set_hit(&chord, 29, &held), "顺序无关");
+        held.set(29, false);
+        assert!(!key_set_hit(&chord, 66, &held), "松掉一半即失效");
     }
 
     /// W0-7 回归(P0-7):一次 `try_down` 失败必须区分"已按着"与"真挤不下"。
@@ -6418,6 +7627,7 @@ mod tests {
                     radius: 0.03,
                 },
                 fps_only: false,
+                tail_delay_ms: 0,
             },
             KeyBind {
                 key: 272,
@@ -6428,6 +7638,7 @@ mod tests {
                     radius: 0.03,
                 },
                 fps_only: true,
+                tail_delay_ms: 0,
             },
         ];
         assert!(!key_owned_by_fps(&profile, false, 272));
@@ -6448,7 +7659,7 @@ mod tests {
         no_anchor.anchor_y = 0.0;
         assert!(
             pointer_should_be_hidden(true, &no_anchor, &st),
-            "进入视角模式即应消隐，不依赖锚点"
+            "进入 FPS 模式即应消隐,不依赖锚点"
         );
         assert!(!pointer_should_be_hidden(false, &aim, &st));
         st.suspended = true;
@@ -6696,6 +7907,7 @@ mod tests {
                     y: 0.5,
                     radius: 0.03,
                 },
+                tail_delay_ms: 0,
             },
             KeyBind {
                 fps_only: false,
@@ -6705,6 +7917,7 @@ mod tests {
                     y: 0.5,
                     radius: 0.03,
                 },
+                tail_delay_ms: 0,
             },
         ];
         let b0 = binds_signature(&p.binds);
@@ -6726,20 +7939,20 @@ mod tests {
         p.wheels[0].cx = 0.9;
         p.wheels[0].radius = 0.02;
         assert_eq!(wheel_signature(&p.wheels), w0, "只改圆心/半径不算结构变化");
-        p.wheels[0].up = 30;
+        p.wheels[0].up = KeySet::single(30);
         assert_ne!(wheel_signature(&p.wheels), w0, "换方向键必须触发重建");
         let w1 = wheel_signature(&p.wheels);
         p.wheels[0].temp = Some(TempWheel {
-            key: 18,
+            key: KeySet::single(18),
             mode: TempMode::Hold,
         });
         assert_ne!(wheel_signature(&p.wheels), w1, "设置启用键必须触发重建");
         let w2 = wheel_signature(&p.wheels);
         p.wheels.push(crate::keymap::Wheel {
-            up: 1,
-            down: 2,
-            left: 3,
-            right: 4,
+            up: KeySet::single(1),
+            down: KeySet::single(2),
+            left: KeySet::single(3),
+            right: KeySet::single(4),
             cx: 0.5,
             cy: 0.5,
             radius: 0.05,
@@ -6763,10 +7976,10 @@ mod tests {
         p.binds = Vec::new();
         p.wheels = vec![
             crate::keymap::Wheel {
-                up: 17,
-                down: 31,
-                left: 30,
-                right: 32,
+                up: KeySet::single(17),
+                down: KeySet::single(31),
+                left: KeySet::single(30),
+                right: KeySet::single(32),
                 cx: 0.3,
                 cy: 0.4,
                 radius: 0.05,
@@ -6779,10 +7992,10 @@ mod tests {
                 temp: None,
             },
             crate::keymap::Wheel {
-                up: 23,
-                down: 37,
-                left: 36,
-                right: 22,
+                up: KeySet::single(23),
+                down: KeySet::single(37),
+                left: KeySet::single(36),
+                right: KeySet::single(22),
                 cx: 0.7,
                 cy: 0.4,
                 radius: 0.05,
@@ -6793,7 +8006,7 @@ mod tests {
                 center_radius: 0.06,
                 execute_duration_ms: 90,
                 temp: Some(TempWheel {
-                    key: 18,
+                    key: KeySet::single(18),
                     mode: TempMode::Hold,
                 }),
             },
@@ -6816,6 +8029,136 @@ mod tests {
         assert!(!key_owned_by_wheel(&p, &st, 24));
     }
 
+    /// 旧签名的测试适配器:把「单键 + 此刻是否按着」翻译成 [`wheel_dir_wanted`] 的
+    /// `(KeySet, Held)` 入参。组合键方向的语义另有专门的用例覆盖,这里只为让
+    /// "单键 + 抢占" 的既有断言逐字保持原意。
+    fn dir_wanted(
+        profile: &Profile,
+        wheels: &[WheelState],
+        is_temp: bool,
+        engaged: bool,
+        down: bool,
+        code: u16,
+    ) -> bool {
+        let keys = KeySet::single(code);
+        let mut held = Held::default();
+        held.set(code, down);
+        wheel_dir_wanted(profile, wheels, is_temp, engaged, &keys, &held)
+    }
+
+    /// R1(2026-10-08):**临时摇杆 > 永久摇杆** —— 临时摇杆启用时抢占普通摇杆的键位。
+    ///
+    /// 构造:永久轮盘的 `right` = K(37);临时轮盘(Hold,启用键 30)的 `down` 也是 K。
+    /// 于是 K 这根键在两把轮盘手里重复,判定必须唯一:
+    ///   ① 未启用:只有永久轮盘响应(旧行为,不许被这条新规改变);
+    ///   ② 按住启用键之后:K 归临时摇杆,永久轮盘在 K 上被判成"没按下"(回中);
+    ///   ③ 松开启用键之后:永久轮盘自动拿回 K(状态由 `Held` 推出来,不用重按)。
+    /// 另外锁住三条边界:没共用的方向键不受影响;启用键本身也算临时摇杆的键位;
+    /// 两个已启用的**临时**摇杆之间互不让位。
+    #[test]
+    fn active_temp_wheel_preempts_a_permanent_wheel_on_the_shared_key() {
+        use crate::keymap::TempWheel;
+
+        let wheel = |up: u16, down: u16, left: u16, right: u16, temp: Option<TempWheel>| Wheel {
+            up: KeySet::single(up),
+            down: KeySet::single(down),
+            left: KeySet::single(left),
+            right: KeySet::single(right),
+            cx: 0.3,
+            cy: 0.4,
+            radius: 0.05,
+            scope: 1.0,
+            mode: WheelMode::Classic,
+            kind: WheelKind::Standard,
+            directions: Vec::new(),
+            center_radius: 0.06,
+            execute_duration_ms: 90,
+            temp,
+        };
+
+        let mut p = Profile::default();
+        p.binds = Vec::new();
+        p.wheels = vec![
+            // 永久轮盘:right 与临时轮盘的 down 撞在 K(37) 上
+            wheel(17, 31, 30, 37, None),
+            // 临时轮盘(按住型,启用键 E=18):down 也是 K
+            wheel(
+                23,
+                37,
+                36,
+                22,
+                Some(TempWheel {
+                    key: KeySet::single(18),
+                    mode: TempMode::Hold,
+                }),
+            ),
+        ];
+        let mut st = vec![WheelState::default(); 2];
+
+        // ① 未启用:两把各归各的,K 仍然由永久轮盘响应
+        assert!(!key_taken_by_active_temp_wheel(&p, &st, 37));
+        assert!(
+            dir_wanted(&p, &st, false, true, true, 37),
+            "未启用时永久轮盘照旧推 K"
+        );
+        assert!(
+            !dir_wanted(&p, &st, true, false, true, 37),
+            "未启用的临时轮盘不响应(engaged=false)"
+        );
+
+        // ② 按住启用键:K 被临时摇杆借走,永久轮盘让位
+        st[1].active = true;
+        assert!(key_taken_by_active_temp_wheel(&p, &st, 37), "启用即抢占");
+        assert!(
+            !dir_wanted(&p, &st, false, true, true, 37),
+            "被抢占的键位上永久轮盘必须判成没按下(于是回中)"
+        );
+        assert!(dir_wanted(&p, &st, true, true, true, 37), "临时轮盘接手 K");
+        // 没被共用的方向键不受影响
+        assert!(!key_taken_by_active_temp_wheel(&p, &st, 17));
+        assert!(
+            dir_wanted(&p, &st, false, true, true, 17),
+            "没被抢占的键位照常"
+        );
+
+        // ③ 松开启用键:永久轮盘把 K 拿回来(状态是推出来的,不需要重按)
+        st[1].active = false;
+        assert!(!key_taken_by_active_temp_wheel(&p, &st, 37));
+        assert!(dir_wanted(&p, &st, false, true, true, 37), "松手即归还");
+
+        // 边界①:启用键本身也算临时摇杆的键位(与 `key_owned_by_wheel` 同口径),
+        // 所以把永久轮盘的方向键设成别人的启用键,一样要被占走。
+        p.wheels[0].right = KeySet::single(18);
+        st[1].active = true;
+        assert!(key_taken_by_active_temp_wheel(&p, &st, 18));
+        assert!(
+            !dir_wanted(&p, &st, false, true, true, 18),
+            "启用键落在永久轮盘方向上时同样抢占"
+        );
+
+        // 边界②:临时 vs 临时 = 一起响应(这条优先级只管"临时 vs 永久")
+        p.wheels.push(wheel(
+            37,
+            0,
+            0,
+            0,
+            Some(TempWheel {
+                key: KeySet::single(19),
+                mode: TempMode::Hold,
+            }),
+        ));
+        st.push(WheelState::default());
+        st[2].active = true;
+        assert!(
+            dir_wanted(&p, &st, true, true, true, 37),
+            "两个启用中的临时摇杆都响应 K"
+        );
+        assert!(
+            !dir_wanted(&p, &st, false, true, true, 37),
+            "有临时摇杆占着时,永久轮盘仍然让位"
+        );
+    }
+
     /// 用户实测场景(本轮修复的核心):"我按着 K 键正在连招,忽然按下临时摇杆的
     /// 启用键,又松开启用键 —— 这时 K 还按在手上,却必须等松开手再按一次才触发,
     /// 战场瞬息万变,这很被动。"
@@ -6836,12 +8179,13 @@ mod tests {
                 y: 0.8,
                 radius: 0.03,
             },
+            tail_delay_ms: 0,
         }];
         p.wheels = vec![crate::keymap::Wheel {
-            up: 23,
-            down: 37,
-            left: 36,
-            right: 22,
+            up: KeySet::single(23),
+            down: KeySet::single(37),
+            left: KeySet::single(36),
+            right: KeySet::single(22),
             cx: 0.8,
             cy: 0.7,
             radius: 0.05,
@@ -6852,7 +8196,7 @@ mod tests {
             center_radius: 0.06,
             execute_duration_ms: 90,
             temp: Some(TempWheel {
-                key: 18,
+                key: KeySet::single(18),
                 mode: TempMode::Hold,
             }),
         }];
@@ -6894,10 +8238,10 @@ mod tests {
 
         fn wheel_with_temp(temp: Option<TempWheel>) -> Wheel {
             Wheel {
-                up: 17,
-                down: 31,
-                left: 30,
-                right: 32,
+                up: KeySet::single(17),
+                down: KeySet::single(31),
+                left: KeySet::single(30),
+                right: KeySet::single(32),
                 cx: 0.5,
                 cy: 0.5,
                 radius: 0.05,
@@ -6917,12 +8261,12 @@ mod tests {
             wheel_with_temp(None),
             // 长按型临时轮盘,启用键 E(18)
             wheel_with_temp(Some(TempWheel {
-                key: 18,
+                key: KeySet::single(18),
                 mode: TempMode::Hold,
             })),
             // 切换型临时轮盘,启用键 Q(16)
             wheel_with_temp(Some(TempWheel {
-                key: 16,
+                key: KeySet::single(16),
                 mode: TempMode::Toggle,
             })),
         ];
@@ -6947,7 +8291,7 @@ mod tests {
     fn function_keys_bypass_chord_gate() {
         let mut profile = Profile::default();
         profile.combos_enabled = true;
-        profile.toggle_key = 66;
+        profile.toggle_key = KeySet::single(66);
         profile.combos.push(crate::keymap::KeyCombo {
             keys: vec![66, 19],
             action: Action::Tap {
@@ -6957,6 +8301,7 @@ mod tests {
                 radius: 0.03,
             },
             fps_only: false,
+            tail_delay_ms: 0,
         });
         let mut gate = ComboGate::default();
         let ev = CaptureKey {
@@ -6991,6 +8336,7 @@ mod tests {
                 radius: 0.03,
             },
             fps_only: false,
+            tail_delay_ms: 0,
         });
         let mut gate = ComboGate::default();
 
@@ -7067,6 +8413,7 @@ mod tests {
                 radius: 0.03,
             },
             fps_only: false,
+            tail_delay_ms: 0,
         });
         let mut gate = ComboGate::default();
         assert!(
@@ -7107,6 +8454,7 @@ mod tests {
                 radius: 0.03,
             },
             fps_only: false,
+            tail_delay_ms: 0,
         });
         let mut gate = ComboGate::default();
         assert!(
@@ -7152,6 +8500,7 @@ mod tests {
                 radius: 0.03,
             },
             fps_only: false,
+            tail_delay_ms: 0,
         });
         let c0 = combos_signature(&p.combos);
         // 只改坐标/半径:不是结构变化,不该触发抬手重建
@@ -7177,6 +8526,7 @@ mod tests {
             keys: vec![30],
             action: Action::AndroidKey { keycode: 4 },
             fps_only: false,
+            tail_delay_ms: 0,
         });
         assert_ne!(combos_signature(&p.combos), c2, "增删组合必须触发重建");
         p.combos.pop();
@@ -7198,6 +8548,7 @@ mod tests {
                 radius: 0.03,
             },
             fps_only: false,
+            tail_delay_ms: 0,
         });
         let mut gate = ComboGate::default();
         assert!(
@@ -7259,6 +8610,7 @@ mod tests {
                 radius: 0.03,
             },
             fps_only: false,
+            tail_delay_ms: 0,
         });
         let mut gate = ComboGate::default();
         let _ = gate.ingest_button(
@@ -7355,6 +8707,7 @@ mod tests {
                 radius: DEFAULT_RADIUS,
             },
             fps_only: false,
+            tail_delay_ms: 0,
         });
         // 绑定键刻意避开默认轮盘的 W/S/A/D —— 那些键归轮盘(方向键覆盖绑定)
         profile.binds.push(KeyBind {
@@ -7366,6 +8719,7 @@ mod tests {
                 radius: DEFAULT_RADIUS,
             },
             fps_only: false,
+            tail_delay_ms: 0,
         });
         let action = MacroAction {
             virtual_profile: None,
@@ -7475,6 +8829,7 @@ mod tests {
                 radius: DEFAULT_RADIUS,
             },
             fps_only: false,
+            tail_delay_ms: 0,
         });
         let action = MacroAction {
             virtual_profile: None,
@@ -7531,6 +8886,7 @@ mod tests {
                 radius: DEFAULT_RADIUS,
             },
             fps_only: false,
+            tail_delay_ms: 0,
         });
         let action = MacroAction {
             virtual_profile: None,
@@ -7610,6 +8966,7 @@ mod tests {
                 radius: DEFAULT_RADIUS,
             },
             fps_only: false,
+            tail_delay_ms: 0,
         });
         let action = MacroAction {
             steps: vec![
@@ -7678,6 +9035,7 @@ mod tests {
                 radius: DEFAULT_RADIUS,
             },
             fps_only: false,
+            tail_delay_ms: 0,
         });
         let action = MacroAction {
             virtual_profile: None,
@@ -7818,10 +9176,10 @@ mod tests {
         let mut profile = Profile::default();
         profile.wheels.clear();
         profile.wheels.push(Wheel {
-            up: 17, // W
-            down: 0,
-            left: 0,
-            right: 0,
+            up: KeySet::single(17), // W
+            down: KeySet::single(0),
+            left: KeySet::single(0),
+            right: KeySet::single(0),
             cx: 0.5,
             cy: 0.5,
             radius: 0.1,
@@ -7832,7 +9190,7 @@ mod tests {
             center_radius: 0.1,
             execute_duration_ms: 180,
             temp: Some(TempWheel {
-                key: 90, // Z:临时轮盘启用键(按住型)
+                key: KeySet::single(90), // Z:临时轮盘启用键(按住型)
                 mode: TempMode::Hold,
             }),
         });
@@ -7847,6 +9205,7 @@ mod tests {
                     radius: DEFAULT_RADIUS,
                 },
                 fps_only: false,
+                tail_delay_ms: 0,
             });
         }
         let steps = vec![
@@ -7932,6 +9291,239 @@ mod tests {
         );
     }
 
+    /// R1(2026-10-08),宏回放一侧:**临时摇杆 > 永久摇杆**,以及停用时**当场交还**。
+    ///
+    /// 规则与引擎路径相同,但宏的状态是"排出来的"、不是每帧从物理键推出来的,
+    /// 所以停用那一刻必须显式补上那一推(见 `macro_wheel_transition` 的 heir 分支)。
+    /// 场景:永久轮盘 `up` = W(17);临时轮盘(按住型,启用键 Z=90)`up` 也是 W。
+    ///   ① 启用后按 W:只有临时摇杆推(不许两把一起推,也**不许**落回普通绑定);
+    ///   ② 松开启用键时 W 还按着:临时摇杆抬指,永久轮盘当场接手;
+    ///   ③ 松开 W:永久轮盘抬指。
+    /// W 上特意挂了长按绑定当探针 —— 全程一次都不该出现。
+    #[test]
+    fn macro_temp_wheel_takes_over_and_hands_back_the_shared_key() {
+        use crate::keymap::{DEFAULT_RADIUS, MacroStep, TempWheel};
+
+        let m = mapper();
+        let wheel = |temp: Option<TempWheel>| Wheel {
+            up: KeySet::single(17), // W:永久轮盘与临时轮盘撞在同一根键上
+            down: KeySet::single(0),
+            left: KeySet::single(0),
+            right: KeySet::single(0),
+            cx: 0.5,
+            cy: 0.5,
+            radius: 0.1,
+            scope: 1.0,
+            mode: WheelMode::Classic,
+            kind: WheelKind::Standard,
+            directions: Vec::new(),
+            center_radius: 0.1,
+            execute_duration_ms: 180,
+            temp,
+        };
+        let mut profile = Profile::default();
+        profile.wheels.clear();
+        profile.wheels.push(wheel(None));
+        profile.wheels.push(wheel(Some(TempWheel {
+            key: KeySet::single(90), // Z
+            mode: TempMode::Hold,
+        })));
+        profile.binds.clear();
+        profile.binds.push(KeyBind {
+            key: 17,
+            action: Action::Hold {
+                x: 0.9,
+                y: 0.9,
+                radius: DEFAULT_RADIUS,
+            },
+            fps_only: false,
+            tail_delay_ms: 0,
+        });
+        let steps = vec![
+            MacroStep {
+                code: 90,
+                pressed: true,
+                delay_ms: 0,
+            }, // t=0 启用临时摇杆
+            MacroStep {
+                code: 17,
+                pressed: true,
+                delay_ms: 50,
+            }, // t=50 W
+            MacroStep {
+                code: 90,
+                pressed: false,
+                delay_ms: 60,
+            }, // t=110 停用(W 还按着)
+            MacroStep {
+                code: 17,
+                pressed: false,
+                delay_ms: 60,
+            }, // t=170
+        ];
+        let start = Instant::now();
+        let mut scheduled = Vec::new();
+        schedule_macro(
+            &MacroAction {
+                virtual_profile: None,
+                steps,
+                instructions: Vec::new(),
+            },
+            &profile,
+            &m,
+            start,
+            &mut scheduled,
+            &mut MacroPlan::new(0),
+        );
+
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let wheels: Vec<(Instant, usize, bool, MacroWheelPart)> = scheduled
+            .iter()
+            .filter_map(|(t, a)| match a {
+                SchedAct::MacroWheel { wheel, part, down } => Some((*t, *wheel, *down, *part)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            wheels,
+            vec![
+                (at(50), 1, true, MacroWheelPart::Up), // 启用期间:只有临时摇杆推
+                (at(110), 1, false, MacroWheelPart::Up), // 停用:临时摇杆抬指
+                (at(110), 0, true, MacroWheelPart::Up), // 停用:永久轮盘当场接手
+                (at(170), 0, false, MacroWheelPart::Up), // 松 W
+            ],
+            "临时摇杆启用时独占 W,停用后当场交还给永久轮盘"
+        );
+        let clicks = scheduled
+            .iter()
+            .filter(|(_, a)| matches!(a, SchedAct::MacroClick { .. }))
+            .count();
+        assert_eq!(clicks, 0, "W 全程归摇杆,一次都不许落回普通绑定");
+    }
+
+    /// R1 的**启用侧**:方向键**已经被永久轮盘按着**,之后才启用临时轮盘。
+    ///
+    /// 与上一例(先按启用键、后按方向键)是一条规则的两个方向,但走的是不同的
+    /// 代码路径:上一例靠 `emit_step_press` 的 `temp_taken` 把永久轮盘挡在门外;
+    /// 这一例永久轮盘的部件**已经在 `pending` 里了**,只能靠 `macro_wheel_transition`
+    /// 的启用分支把它当场抬掉 —— 少了这一抬,两把轮盘会同时把触点推到设备上。
+    #[test]
+    fn macro_temp_wheel_enable_evicts_the_permanent_wheel_already_on_that_key() {
+        use crate::keymap::{DEFAULT_RADIUS, MacroStep, TempWheel};
+
+        let m = mapper();
+        let wheel = |temp: Option<TempWheel>| Wheel {
+            up: KeySet::single(17), // W:永久轮盘与临时轮盘撞在同一根键上
+            down: KeySet::single(0),
+            left: KeySet::single(0),
+            right: KeySet::single(0),
+            cx: 0.5,
+            cy: 0.5,
+            radius: 0.1,
+            scope: 1.0,
+            mode: WheelMode::Classic,
+            kind: WheelKind::Standard,
+            directions: Vec::new(),
+            center_radius: 0.1,
+            execute_duration_ms: 180,
+            temp,
+        };
+        let mut profile = Profile::default();
+        profile.wheels.clear();
+        profile.wheels.push(wheel(None));
+        profile.wheels.push(wheel(Some(TempWheel {
+            key: KeySet::single(90), // Z
+            mode: TempMode::Hold,
+        })));
+        profile.binds.clear();
+        profile.binds.push(KeyBind {
+            key: 17,
+            action: Action::Hold {
+                x: 0.9,
+                y: 0.9,
+                radius: DEFAULT_RADIUS,
+            },
+            fps_only: false,
+            tail_delay_ms: 0,
+        });
+        let steps = vec![
+            MacroStep {
+                code: 17,
+                pressed: true,
+                delay_ms: 0,
+            }, // t=0 W 先按着 —— 此刻吃它的是永久轮盘
+            MacroStep {
+                code: 90,
+                pressed: true,
+                delay_ms: 50,
+            }, // t=50 这时才启用临时摇杆
+            MacroStep {
+                code: 90,
+                pressed: false,
+                delay_ms: 60,
+            }, // t=110 停用
+            MacroStep {
+                code: 17,
+                pressed: false,
+                delay_ms: 60,
+            }, // t=170
+        ];
+        let start = Instant::now();
+        let mut scheduled = Vec::new();
+        schedule_macro(
+            &MacroAction {
+                virtual_profile: None,
+                steps,
+                instructions: Vec::new(),
+            },
+            &profile,
+            &m,
+            start,
+            &mut scheduled,
+            &mut MacroPlan::new(0),
+        );
+
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let wheels: Vec<(Instant, usize, bool, MacroWheelPart)> = scheduled
+            .iter()
+            .filter_map(|(t, a)| match a {
+                SchedAct::MacroWheel { wheel, part, down } => Some((*t, *wheel, *down, *part)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            wheels,
+            vec![
+                (at(0), 0, true, MacroWheelPart::Up), // 临时摇杆还没启用:永久轮盘先推着
+                (at(50), 0, false, MacroWheelPart::Up), // 启用:永久轮盘当场让位(先抬)
+                (at(50), 1, true, MacroWheelPart::Up), // 启用:临时摇杆接手(后按)
+                (at(110), 1, false, MacroWheelPart::Up), // 停用:临时摇杆抬指
+                (at(110), 0, true, MacroWheelPart::Up), // 停用:永久轮盘当场交还
+                (at(170), 0, false, MacroWheelPart::Up), // 松 W
+            ],
+            "临时摇杆启用瞬间必须把已经按着的永久轮盘抬掉,不能两把同时推"
+        );
+        // 同一时刻必须是"先抬永久、后按临时",否则设备上会短暂出现双触点。
+        let idx = |i: usize| {
+            scheduled
+                .iter()
+                .position(|(t, a)| {
+                    *t == at(50)
+                        && matches!(a, SchedAct::MacroWheel { wheel, down, .. } if *wheel == i && *down == (i == 1))
+                })
+                .expect("t=50 的两条 MacroWheel 都应在")
+        };
+        assert!(
+            idx(0) < idx(1),
+            "同刻的顺序必须是先抬永久轮盘、再按临时轮盘"
+        );
+        let clicks = scheduled
+            .iter()
+            .filter(|(_, a)| matches!(a, SchedAct::MacroClick { .. }))
+            .count();
+        assert_eq!(clicks, 0, "W 全程归摇杆,一次都不许落回普通绑定");
+    }
+
     /// 切换型临时轮盘:每次**按下**翻转,抬起不翻转 —— 宏里同样成立。
     #[test]
     fn macro_temp_wheel_toggle_flips_on_press_only() {
@@ -7941,10 +9533,10 @@ mod tests {
         let mut profile = Profile::default();
         profile.wheels.clear();
         profile.wheels.push(Wheel {
-            up: 17,
-            down: 0,
-            left: 0,
-            right: 0,
+            up: KeySet::single(17),
+            down: KeySet::single(0),
+            left: KeySet::single(0),
+            right: KeySet::single(0),
             cx: 0.5,
             cy: 0.5,
             radius: 0.1,
@@ -7955,7 +9547,7 @@ mod tests {
             center_radius: 0.1,
             execute_duration_ms: 180,
             temp: Some(TempWheel {
-                key: 90,
+                key: KeySet::single(90),
                 mode: TempMode::Toggle,
             }),
         });
@@ -7968,6 +9560,7 @@ mod tests {
                 radius: DEFAULT_RADIUS,
             },
             fps_only: false,
+            tail_delay_ms: 0,
         });
         let steps = vec![
             MacroStep {
@@ -8068,10 +9661,10 @@ mod tests {
         let mut profile = Profile::default();
         profile.wheels.clear();
         profile.wheels.push(Wheel {
-            up: 17,
-            down: 0,
-            left: 0,
-            right: 0,
+            up: KeySet::single(17),
+            down: KeySet::single(0),
+            left: KeySet::single(0),
+            right: KeySet::single(0),
             cx: 0.5,
             cy: 0.5,
             radius: 0.1,
@@ -8082,7 +9675,7 @@ mod tests {
             center_radius: 0.1,
             execute_duration_ms: 180,
             temp: Some(TempWheel {
-                key: 90,
+                key: KeySet::single(90),
                 mode: TempMode::Hold,
             }),
         });
@@ -8095,6 +9688,7 @@ mod tests {
                 radius: DEFAULT_RADIUS,
             },
             fps_only: false,
+            tail_delay_ms: 0,
         });
         let steps = vec![
             MacroStep {
@@ -8297,5 +9891,624 @@ mod tests {
             &no_wheels,
             false,
         ));
+    }
+
+    /// 用户 2026-10-10 第 2 条「滚轮改为连续触发」的底座:[`WheelHold`] 的
+    /// 闩锁 / 到点 / 顺延 / 一齿一次交付 / 断线清场。
+    #[test]
+    fn wheel_hold_latches_each_notch_and_hands_it_back_once() {
+        let t0 = Instant::now();
+        let hold_ms = Duration::from_millis(WHEEL_HOLD_MS);
+        let mut hold = WheelHold::default();
+
+        // 一齿按下:扣住闩锁,本齿算过一次按下
+        hold.note(BTN_WHEEL_UP, true, t0);
+        assert!(hold.momentary(BTN_WHEEL_UP));
+        assert_eq!(
+            hold.next_expired(t0 + hold_ms - Duration::from_millis(1)),
+            None
+        );
+
+        // 捕获层的"抬起"只代表"滚轮这一刻没动":清掉本齿标记,不倒扣闩锁
+        hold.note(BTN_WHEEL_UP, false, t0);
+        assert!(!hold.momentary(BTN_WHEEL_UP));
+        assert_eq!(
+            hold.next_expired(t0 + hold_ms - Duration::from_millis(1)),
+            None,
+            "抬起不提前解除闩锁"
+        );
+
+        // 还在转:新的一齿把到期时刻往后顺延
+        hold.note(BTN_WHEEL_UP, true, t0 + Duration::from_millis(50));
+        assert_eq!(
+            hold.next_expired(t0 + hold_ms),
+            None,
+            "又转了一齿 -> 到期时刻顺延"
+        );
+
+        // 停转到点:交出键码,且一个方向只交一次
+        let at = t0 + Duration::from_millis(50) + hold_ms;
+        assert_eq!(hold.next_expired(at), Some(BTN_WHEEL_UP));
+        assert_eq!(hold.next_expired(at + hold_ms), None, "一个方向只交一次");
+
+        // 四个方向各自独立:左滚的到点不影响上滚
+        hold.note(BTN_WHEEL_LEFT, true, t0);
+        assert_eq!(hold.next_expired(t0 + hold_ms), Some(BTN_WHEEL_LEFT));
+    }
+
+    /// 断线 / 映射关闭:闩锁作废,且还记着"按着"的滚轮键必须从物理镜像里清掉
+    /// —— 残留会被重连当成"用户还按着"补一个假触点,还会让用户的下一齿不再是上升沿。
+    #[test]
+    fn wheel_hold_release_all_clears_the_latch_and_the_physical_mirror() {
+        let t0 = Instant::now();
+        let mut hold = WheelHold::default();
+        let mut held = Held::default();
+        hold.note(BTN_WHEEL_DOWN, true, t0);
+        held.set(BTN_WHEEL_DOWN, true);
+
+        hold.release_all(&mut held);
+        assert!(
+            !held.has(BTN_WHEEL_DOWN),
+            "断线清场必须把残留的一齿从物理镜像里抹掉"
+        );
+        assert_eq!(
+            hold.next_expired(t0 + Duration::from_millis(WHEEL_HOLD_MS * 4)),
+            None
+        );
+        assert!(!hold.momentary(BTN_WHEEL_DOWN));
+
+        // 非滚轮键不会被误伤
+        held.set(30, true);
+        hold.release_all(&mut held);
+        assert!(held.has(30), "release_all 只碰四个滚轮键");
+    }
+
+    /// [`note_wheel`]:每齿给一次**上升沿**(长按型动作要连续,而"又转了一齿"
+    /// 仍必须算一次新的按下),但绝不因为捕获层的抬起把物理镜像清掉。
+    #[test]
+    fn note_wheel_gives_one_edge_per_notch_and_keeps_the_mirror_down() {
+        let mut hold = WheelHold::default();
+        let mut held = Held::default();
+
+        let press = CaptureKey {
+            code: BTN_WHEEL_UP,
+            pressed: true,
+        };
+        let release = CaptureKey {
+            code: BTN_WHEEL_UP,
+            pressed: false,
+        };
+        assert!(note_wheel(&mut held, &mut hold, press, Source::Physical));
+        assert!(held.has(BTN_WHEEL_UP), "落齿要把镜像按下去");
+        assert!(
+            !note_wheel(&mut held, &mut hold, release, Source::Physical),
+            "捕获层的抬起不给边沿"
+        );
+        assert!(held.has(BTN_WHEEL_UP), "一齿的抬起不代表松手,镜像仍按着");
+        assert!(
+            note_wheel(&mut held, &mut hold, press, Source::Physical),
+            "下一齿仍是一次新的按下"
+        );
+
+        // 宏来源:给边沿,但不动物理镜像、不动闩锁(同 `note_physical`)
+        let mut m_held = Held::default();
+        let mut m_hold = WheelHold::default();
+        assert!(note_wheel(&mut m_held, &mut m_hold, press, Source::Macro));
+        assert!(!m_held.has(BTN_WHEEL_UP));
+        assert!(!m_hold.momentary(BTN_WHEEL_UP));
+    }
+
+    /// `KeySet::last()`:捕获经 `canonical_chord` 排序后修饰键在前,最后一个
+    /// 就是那个普通键 —— 宏回放把方向键挂到时间轴上时用的唯一把手。
+    #[test]
+    fn key_set_last_is_the_plain_key_of_a_canonical_chord() {
+        use crate::keymap::canonical_chord;
+        assert_eq!(KeySet::new().last(), None);
+        assert_eq!(KeySet::single(66).last(), Some(66));
+        assert_eq!(
+            KeySet::from_keys([66, 29]).last(),
+            Some(29),
+            "按给定顺序取最后一个"
+        );
+        assert_eq!(
+            canonical_chord(&[66, 29]).last(),
+            Some(66),
+            "排序后修饰键在前,最后一个是普通键 X"
+        );
+    }
+
+    /// 用户 2026-10-10 第 2 条:临时轮盘的**启用键**支持组合键。
+    ///
+    /// 锁三件事:①只按下其中一个成员不启用(整个集合按着才启用);
+    /// ②补上最后一个成员的那一刻启用;③松开任一成员立刻停用,**且这一次
+    /// 抬起事件仍被轮盘分支消费**(成员键不许漏到它上面的普通绑定去)。
+    #[test]
+    fn chord_temp_wheel_enable_key_needs_the_whole_chord() {
+        use crate::keymap::TempWheel;
+        const CTRL: u16 = 29;
+        const EN: u16 = 90;
+
+        let mut profile = Profile::default();
+        profile.binds = Vec::new();
+        profile.wheels = vec![Wheel {
+            temp: Some(TempWheel {
+                key: KeySet::from_keys([CTRL, EN]),
+                mode: TempMode::Hold,
+            }),
+            ..Wheel::new_default(&mapper(), 0.5, 0.5)
+        }];
+
+        let ctl = ControlClient::for_test(1000, 1000);
+        let m = profile.mapper((1000, 1000));
+        let mut held = Held::default();
+        let mut wheels = vec![WheelState::default(); profile.wheels.len()];
+        let mut fingers = Fingers::default();
+        let fps_fingers = Fingers::default();
+        let combo_fingers = Fingers::default();
+        let macro_down: HashMap<u64, (i32, i32)> = HashMap::new();
+        let mut macro_exec_seq = 0u64;
+        let mut scheduled: Vec<(Instant, SchedAct)> = Vec::new();
+        let mut live = EngineLive::default();
+        let mut gates = PressGates::default();
+        let mut active_android_keys: HashSet<u16> = HashSet::new();
+        let mut last_refuse_note: Option<Instant> = None;
+        let mut pending_notice: Option<String> = None;
+        let mut zoom_sep: f32 = ZOOM_BASE_SEP;
+        let mut aim_state = AimState::default();
+
+        let mut drive = |code: u16, pressed: bool| -> (bool, bool) {
+            let fresh = pressed && !held.has(code);
+            held.set(code, pressed);
+            let consumed = dispatch_input(&mut Dispatch {
+                ctl: &ctl,
+                m: &m,
+                profile: &profile,
+                held: &held,
+                ev: CaptureKey { code, pressed },
+                fresh_press: fresh,
+                fps_running: false,
+                fps_active: false,
+                aim_down: false,
+                zoom_sep: &mut zoom_sep,
+                wheels: &mut wheels,
+                fingers: &mut fingers,
+                fps_fingers: &fps_fingers,
+                combo_fingers: &combo_fingers,
+                macro_down: &macro_down,
+                macro_exec_seq: &mut macro_exec_seq,
+                scheduled: &mut scheduled,
+                live: &mut live,
+                active_android_keys: &mut active_android_keys,
+                last_refuse_note: &mut last_refuse_note,
+                pending_notice: &mut pending_notice,
+                aim_st: &mut aim_state,
+                gates: &mut gates,
+            });
+            (consumed, wheels[0].active)
+        };
+
+        // ① 只按下 Ctrl:成员事件被消费,但整个集合没按着 -> 不启用
+        let (consumed, active) = drive(CTRL, true);
+        assert!(consumed, "启用键的成员事件必须被轮盘分支消费");
+        assert!(!active, "只按下一个成员不能启用");
+
+        // ② 补上最后一个成员:整个集合按着 -> 启用
+        let (consumed, active) = drive(EN, true);
+        assert!(consumed);
+        assert!(active, "整个组合键按着才启用");
+
+        // ③ 松开其中一个成员:立刻停用,且这次抬起仍被消费
+        let (consumed, active) = drive(CTRL, false);
+        assert!(consumed, "成员键的抬起也必须被轮盘分支消费");
+        assert!(!active, "任一成员松开即停用");
+    }
+
+    /// 用户 2026-10-10 第 2 条:轮盘**方向键**支持组合键 ——
+    /// 整个集合按着才推;少一个成员就不算(与 `key_set_hit` 同口径)。
+    #[test]
+    fn chord_wheel_direction_needs_the_whole_chord() {
+        let ctrl_w = KeySet::from_keys([29, 17]); // Ctrl+W
+        let mut p = Profile::default();
+        p.binds = Vec::new();
+        p.wheels = vec![Wheel {
+            up: ctrl_w,
+            ..Wheel::new_default(&mapper(), 0.5, 0.5)
+        }];
+        let st = vec![WheelState::default()];
+
+        let mut held = Held::default();
+        held.set(29, true);
+        assert!(
+            !wheel_dir_wanted(&p, &st, false, true, &ctrl_w, &held),
+            "只按下修饰键不算"
+        );
+        held.set(17, true);
+        assert!(
+            wheel_dir_wanted(&p, &st, false, true, &ctrl_w, &held),
+            "整个集合按着才推"
+        );
+        held.set(29, false);
+        assert!(
+            !wheel_dir_wanted(&p, &st, false, true, &ctrl_w, &held),
+            "少一个成员就不算"
+        );
+    }
+
+    /// 触摸指令队列(动作, 触点号)。本轮这几个测试只看这两种字段。
+    fn drain_touches(ctl: &ControlClient) -> Vec<(u8, u64)> {
+        use crate::control::ControlCmd;
+        ctl.take_cmds()
+            .into_iter()
+            .filter_map(|c| match c {
+                ControlCmd::Touch {
+                    action, pointer_id, ..
+                } => Some((action, pointer_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 造一条只含一个"长按"键位的配置 + 这一套引擎状态,专供「按后延迟」用。
+    struct TailFixture {
+        profile: Profile,
+        m: Mapper,
+        ctl: ControlClient,
+        fingers: Fingers,
+        aks: HashSet<u16>,
+        scheduled: Vec<(Instant, SchedAct)>,
+        live: EngineLive,
+        gates: PressGates,
+        macro_exec: u64,
+    }
+
+    impl TailFixture {
+        /// `tail` = 这一条自己的毫秒值,`enabled` = 总开关
+        /// ([`Profile::tail_delay_enabled`],**两层都愿意才生效**)。
+        fn new(key: u16, tail: u32, action: Action, enabled: bool) -> Self {
+            let mut profile = Profile::default();
+            profile.tail_delay_enabled = enabled;
+            profile.binds = vec![KeyBind {
+                key,
+                action,
+                fps_only: false,
+                tail_delay_ms: tail,
+            }];
+            let ctl = ControlClient::for_test(1080, 2400);
+            let m = profile.mapper((1080, 2400));
+            Self {
+                profile,
+                m,
+                ctl,
+                fingers: Fingers::default(),
+                aks: HashSet::new(),
+                scheduled: Vec::new(),
+                live: EngineLive::default(),
+                gates: PressGates::default(),
+                macro_exec: 0,
+            }
+        }
+
+        /// 走一遍 [`handle_bind_event`](正常按下路径),`fresh` = 是不是上升沿。
+        fn fire(&mut self, pressed: bool, fresh: bool) -> Option<(u16, RefuseReason)> {
+            let bind = self.profile.binds[0].clone();
+            handle_bind_event(
+                &self.ctl,
+                &self.m,
+                &self.profile,
+                &bind,
+                0,
+                bind_pid(0),
+                BindLane::Normal,
+                &mut self.macro_exec,
+                fresh,
+                &CaptureKey {
+                    code: bind.key,
+                    pressed,
+                },
+                &mut self.fingers,
+                &mut self.aks,
+                &mut self.scheduled,
+                0,
+                &mut self.live,
+                &mut self.gates,
+            )
+        }
+    }
+
+    /// 「按后延迟」(用户 2026-10-10 第 2 条)的行为锁。
+    ///
+    /// 用户口径:冷却 = **"上一次抬起之后再等 N ms 才准下一次按下"**;冷却没过就
+    /// 按下来的那一下**不丢**,推迟到冷却结束再执行(排程 → [`redispatch_press`]);
+    /// 每条键位各记一个数值,默认 `DEFAULT_TAIL_DELAY_MS`(= `0` = 不等)。
+    ///
+    /// 锁四件事:①设了冷却的键位,按下照常落点、抬起把冷却挂上;②冷却里重按不落点、
+    /// 改成排程到冷却到期那一刻;③**分条记** —— 另一条键位不受牵连;④冷却过后
+    /// 重按直接执行、不再排程。
+    #[test]
+    fn tail_delay_defers_press_until_cooldown_expires() {
+        use crate::control::{ACTION_DOWN, ACTION_UP};
+        const KEY: u16 = 41;
+        let hold = Action::Hold {
+            x: 0.5,
+            y: 0.5,
+            radius: 0.03,
+        };
+
+        // ---- ① 设了冷却(总开关也打开):按下照常落点,抬起把冷却挂上 ----
+        let mut f = TailFixture::new(KEY, 30, hold.clone(), true);
+        assert!(f.fire(true, true).is_none(), "落点成功不该报拒绝");
+        assert_eq!(
+            drain_touches(&f.ctl),
+            vec![(ACTION_DOWN, bind_pid(0))],
+            "按下要照常落点 —— 冷却只管下一次,不管这一次"
+        );
+        assert!(f.scheduled.is_empty(), "按下本身不排程");
+
+        f.fire(false, false);
+        assert_eq!(
+            drain_touches(&f.ctl),
+            vec![(ACTION_UP, bind_pid(0))],
+            "抬起要发 UP"
+        );
+        let cool_until = f.gates.bind_gate(0).expect("抬起后应当挂上冷却");
+        assert!(
+            cool_until > Instant::now(),
+            "冷却从**抬起时刻**开始算,不是从按下算"
+        );
+
+        // ---- ② 冷却里重按:不落点,排程到冷却到期那一刻 ----
+        f.fire(true, true);
+        assert!(
+            drain_touches(&f.ctl).is_empty(),
+            "冷却没过就重按,不许再落点"
+        );
+        assert_eq!(
+            f.scheduled.len(),
+            1,
+            "这一次按下要排进排程等冷却结束,而不是被丢掉"
+        );
+        assert_eq!(f.scheduled[0].0, cool_until, "推迟到冷却到期那一刻执行");
+        match f.scheduled[0].1 {
+            SchedAct::Redispatch { idx, lane, code } => {
+                assert_eq!((idx, code), (0, KEY));
+                assert!(matches!(lane, BindLane::Normal));
+            }
+            _ => panic!("冷却里重按应当排一个 Redispatch"),
+        }
+
+        // ---- ③ 分条记:另一条键位(冷却 0)同一时刻重按立刻生效 ----
+        let mut g = TailFixture::new(42, 0, hold.clone(), true);
+        g.fire(true, true);
+        g.fire(false, false);
+        drain_touches(&g.ctl);
+        g.fire(true, true);
+        assert_eq!(
+            drain_touches(&g.ctl),
+            vec![(ACTION_DOWN, bind_pid(0))],
+            "冷却 0 = 不等,重按立刻落点"
+        );
+        assert!(g.scheduled.is_empty(), "0 冷却的键位不排程");
+
+        // ---- ④ 冷却真的走完之后重按:直接执行,不再排程 ----
+        // 单开一条 1ms 冷却的键位真等过去,这样测的是真实的"到期"分支,
+        // 而不是把表里的时刻手动拨到过去(那测不到 `now >= gate` 的比较)。
+        let mut h = TailFixture::new(KEY, 1, hold.clone(), true);
+        h.fire(true, true);
+        h.fire(false, false);
+        drain_touches(&h.ctl);
+        std::thread::sleep(Duration::from_millis(20));
+        h.fire(true, true);
+        assert_eq!(
+            drain_touches(&h.ctl),
+            vec![(ACTION_DOWN, bind_pid(0))],
+            "冷却过后重按直接执行"
+        );
+        assert!(h.scheduled.is_empty(), "过了冷却就不该再排程");
+    }
+
+    /// 「按后延迟」是**可选功能**:总开关关着时,逐条数值一律按 0 处理
+    /// (用户 2026-10-10 晚追加要求"按后延迟改为可选功能")。
+    ///
+    /// 锁两件事:①开关关着时,即使某条写着 300ms,按下/抬起/再按下全程不挂冷却、
+    /// 不排程、不延迟;②把开关打开(同一份数值原样不动),冷却立刻按那个数值生效 ——
+    /// 也就是"数值留着、开关控制生效",不必逐条重填。
+    #[test]
+    fn tail_delay_is_off_until_the_profile_switch_is_on() {
+        use crate::control::{ACTION_DOWN, ACTION_UP};
+        const KEY: u16 = 41;
+        let hold = Action::Hold {
+            x: 0.5,
+            y: 0.5,
+            radius: 0.03,
+        };
+
+        // ---- ① 开关关着:数值再大也不生效 ----
+        let mut off = TailFixture::new(KEY, 300, hold.clone(), false);
+        off.fire(true, true);
+        assert_eq!(
+            drain_touches(&off.ctl),
+            vec![(ACTION_DOWN, bind_pid(0))],
+            "开关关着,按下照常落点"
+        );
+        off.fire(false, false);
+        assert_eq!(
+            drain_touches(&off.ctl),
+            vec![(ACTION_UP, bind_pid(0))],
+            "开关关着,抬起照常"
+        );
+        assert!(
+            off.gates.bind_gate(0).is_none(),
+            "开关关着时连冷却都不该挂上(挂上会静默挡住之后的重按)"
+        );
+        off.fire(true, true);
+        assert_eq!(
+            drain_touches(&off.ctl),
+            vec![(ACTION_DOWN, bind_pid(0))],
+            "开关关着,紧接着重按立刻落点"
+        );
+        assert!(off.scheduled.is_empty(), "开关关着时一次排程都不该有");
+        // 先把手指抬干净,再测下面那一下(pressing while down 是另一条分支,不该混进来)。
+        off.fire(false, false);
+        drain_touches(&off.ctl);
+
+        // ③**开着打的时候被关掉**:表里会留着关之前挂上的冷却,不能拿它继续拦人。
+        //   (这是真实路径:开关一关,配置里的 `tail_delay_enabled` 立刻变 false,
+        //   但 `PressGates` 没人去清 —— 判据必须以**此刻的数值**为准。)
+        off.gates
+            .hold_bind(0, Instant::now() + Duration::from_millis(500));
+        off.fire(true, true);
+        assert_eq!(
+            drain_touches(&off.ctl),
+            vec![(ACTION_DOWN, bind_pid(0))],
+            "开关已关:表里的陈旧冷却不许再推迟按下"
+        );
+        assert!(off.scheduled.is_empty(), "开关已关:陈旧冷却也不许排程");
+
+        // ---- ② 同一份数值,把开关打开就生效 ----
+        let mut on = TailFixture::new(KEY, 300, hold, true);
+        on.fire(true, true);
+        on.fire(false, false);
+        drain_touches(&on.ctl);
+        let cool_until = on.gates.bind_gate(0).expect("开关打开后应当挂上冷却");
+        assert!(cool_until > Instant::now(), "冷却从抬起时刻起算");
+        on.fire(true, true);
+        assert!(
+            drain_touches(&on.ctl).is_empty(),
+            "开关打开后,300ms 冷却内的重按不该落点"
+        );
+        assert_eq!(on.scheduled.len(), 1, "而应当排程等冷却结束");
+    }
+
+    /// 推迟的按下补发([`redispatch_press`])的两道守卫。
+    ///
+    /// 补发发生在几十毫秒之后,期间用户可能已经松手、或改过配置,所以:
+    ///   ① 长按型动作的触发键**已经松手**时不许补 —— 补了会在设备上留下
+    ///      只按不抬的触点,而且没人再去抬它;
+    ///   ② 同一个下标已经不是当初那条键位时不许补 —— 那会按到用户没碰的键上。
+    #[test]
+    fn redispatch_press_checks_trigger_is_still_held_and_slot_unchanged() {
+        use crate::control::ACTION_DOWN;
+        const KEY: u16 = 41;
+        let hold = Action::Hold {
+            x: 0.5,
+            y: 0.5,
+            radius: 0.03,
+        };
+        let mut f = TailFixture::new(KEY, 30, hold, true);
+        let mut held = Held::default();
+
+        // ① 触发键已经松手:不补。
+        redispatch_press(
+            &f.ctl,
+            &f.m,
+            &f.profile,
+            &held,
+            0,
+            BindLane::Normal,
+            KEY,
+            &mut f.macro_exec,
+            &mut f.fingers,
+            &mut Fingers::default(),
+            &mut Fingers::default(),
+            &mut f.aks,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &mut f.scheduled,
+            0,
+            &mut f.live,
+            &mut f.gates,
+        );
+        assert!(
+            drain_touches(&f.ctl).is_empty(),
+            "松手后补一次按下会留下没人抬的触点,必须跳过"
+        );
+
+        // ② 触发键仍按着:补上。
+        held.set(KEY, true);
+        redispatch_press(
+            &f.ctl,
+            &f.m,
+            &f.profile,
+            &held,
+            0,
+            BindLane::Normal,
+            KEY,
+            &mut f.macro_exec,
+            &mut f.fingers,
+            &mut Fingers::default(),
+            &mut Fingers::default(),
+            &mut f.aks,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &mut f.scheduled,
+            0,
+            &mut f.live,
+            &mut f.gates,
+        );
+        assert_eq!(
+            drain_touches(&f.ctl),
+            vec![(ACTION_DOWN, bind_pid(0))],
+            "还按着就该补上那一次按下"
+        );
+
+        // ③ 下标已被改成另一条键位:不补。
+        f.profile.binds[0].action = Action::Hold {
+            x: 0.6,
+            y: 0.6,
+            radius: 0.03,
+        };
+        f.profile.binds[0].key = KEY + 1;
+        redispatch_press(
+            &f.ctl,
+            &f.m,
+            &f.profile,
+            &held,
+            0,
+            BindLane::Normal,
+            KEY,
+            &mut f.macro_exec,
+            &mut f.fingers,
+            &mut Fingers::default(),
+            &mut Fingers::default(),
+            &mut f.aks,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &mut f.scheduled,
+            0,
+            &mut f.live,
+            &mut f.gates,
+        );
+        assert!(
+            drain_touches(&f.ctl).is_empty(),
+            "同一个下标已换成别的键位,补发会按到用户没碰的键上"
+        );
+    }
+
+    /// 冷却表分条存、并且能被整表作废(收尾路径 `release_all` 依赖这一点)。
+    #[test]
+    fn press_gates_reset_clears_every_lane() {
+        let mut gates = PressGates::default();
+        // 没冷却过的下标一律不受限 —— 这正是"读的时候绝不造格子"要保证的。
+        assert_eq!(gates.bind_gate(0), None, "没冷却过 = 不受限");
+        assert_eq!(gates.combo_gate(7), None);
+
+        let far = Instant::now() + Duration::from_secs(60);
+        gates.hold_bind(0, far);
+        gates.hold_bind(3, far);
+        gates.hold_combo(2, far);
+        assert_eq!(gates.bind_gate(0), Some(far), "按下标、按车道各存各的");
+        assert_eq!(gates.bind_gate(3), Some(far));
+        assert_eq!(gates.combo_gate(2), Some(far));
+        // 只写一格不该顺手把中间那些格子也锁上。
+        assert_eq!(gates.bind_gate(1), None, "补出来的格子必须是不受限的");
+
+        gates.reset();
+        assert_eq!(
+            gates.bind_gate(0),
+            None,
+            "断连/关映射/换组合后冷却必须一起作废,否则重新开打的第一下会被静默推迟"
+        );
+        assert_eq!(gates.bind_gate(3), None);
+        assert_eq!(gates.combo_gate(2), None);
     }
 }

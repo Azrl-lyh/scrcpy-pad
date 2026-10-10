@@ -5,8 +5,8 @@ use crate::control::ControlClient;
 use crate::engine::{Shared, SharedState, lock_shared};
 use crate::keyboard;
 use crate::keymap::{
-    Action, Aim, ConfigFile, Easing, KeyBind, KeyCombo, MacroAction, MacroInstruction, MacroStep,
-    MacroWheelPart, Mapper, Profile, RecenterMode, SWIPE_SAMPLES, Swipe, SwipePath,
+    Action, Aim, ConfigFile, Easing, KeyBind, KeyCombo, KeySet, MacroAction, MacroInstruction,
+    MacroStep, MacroWheelPart, Mapper, Profile, RecenterMode, SWIPE_SAMPLES, Swipe, SwipePath,
     SwitchDirection, SwitchKey, TempMode, TempWheel, ViewInputMode, Wheel, WheelKind, WheelMode,
     key_name,
 };
@@ -51,6 +51,16 @@ const DEBUG_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 /// `dumpsys window displays` 是这组查询里最重的一条,单独降到 30s 一次:
 /// 稳态只剩"每 2s 一次 SurfaceFlinger 延迟查询"。
 const DEBUG_SIZE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 压枪"控制强度档位表"默认展开的上限档数(用户 2026-10-10 第 3 条:
+/// "挡位过多时,非添加模式自动折叠")。
+///
+/// 档位是这个面板里唯一会"越加越长"的列表,档位一多就把下面的[摇晃]/[覆盖灵敏度]
+/// 顶出屏幕。所以档数超过这个数时,档位表**第一次出现**就默认收起,只留一行标题;
+/// 用户点标题可展开/收起,点[＋ 添加一档]时强制展开(正在添加,不该藏)。
+/// 注意这是"默认值"而非"每当档数变多就强制收起":一旦用户自己点过标题,
+/// 之后就以用户的选择为准 —— 正在调档时列表自己收起来,才是真的难用。
+const RECOIL_TIER_COLLAPSE_AT: usize = 4;
 
 // ============================ 界面风格切换的重启标志 ============================
 //
@@ -252,10 +262,16 @@ enum KeySlot {
     AimSuspend,
     /// 压枪/后坐力补偿的触发键(V2-1;K2er 原文:一般是鼠标左键)
     RecoilTrigger,
-    /// 切换键位(第 i 行:按下该键即切到它指向的那套组合)
+    /// 压枪"控制强度"挡位切换键(用户 2026-10-10 第 3 条):按一下换一档(环绕),
+    /// 按住它时滚轮也用来换档。与 [`Self::RecoilTrigger`] 一样是组合键槽
+    /// (见 [`Self::takes_chord`])——用户要求"可容纳单次/多次按下的按键绑定控件"。
+    RecoilSwitch,
+    /// 切换键位(第 i 行:按下那一组键即切到它指向的那套组合)。
+    ///
+    /// 用户 2026-10-09(第 4 条):这里不再有"第一个键/第二个键"两个槽 ——
+    /// 整行就是**一个**组合键槽(`SwitchKey.keys`),用一个按钮捕获,
+    /// 与总开关键那类系统键同一套交互(见 [`Self::keys_button`])。
     SwitchKey(usize),
-    /// 切换键位的第二个组合键（最多两个）
-    SwitchKeySecond(usize),
     /// 组合键中的第 `slot` 个物理键
     ComboKey {
         combo: usize,
@@ -270,6 +286,66 @@ enum KeySlot {
         instruction: usize,
         slot: usize,
     },
+    // ---------- R4(2026-10-08)：扩展宏弹窗里的"点虚拟键盘选键" ----------
+    // 这一组和上面最大的不同：它们**不写实时配置**，只写弹窗里那份
+    // `MacroVirtualEditor.profile`（宏草稿）。见 `assign_virtual_key`。
+    /// 弹窗点[＋ 按键]之后等一次键盘点击（新建虚拟键位，随后自动进入截图取点）
+    MacroVirtualNewBind,
+    /// 弹窗里虚拟组合键的第 `slot` 个物理键
+    MacroVirtualComboKey {
+        combo: usize,
+        slot: usize,
+    },
+    /// 弹窗里虚拟轮盘的方向键（`dir`：标准轮盘 0上 1下 2左 3右；多向/执行轮盘 = `directions` 下标）
+    MacroVirtualWheelDir {
+        wheel: usize,
+        dir: usize,
+    },
+    /// 弹窗里虚拟轮盘的启用键（设了就是临时摇杆）
+    MacroVirtualWheelEnable(usize),
+}
+
+impl KeySlot {
+    /// 是否属于「扩展宏弹窗」的虚拟取键（只写宏草稿，不碰实时配置）。
+    ///
+    /// 关窗/取消/删除目标时要靠它把这些"待完成操作"清掉 —— 否则虚拟键盘
+    /// 会一直举着"按任意键..."，用户按下的键写进一个已经不存在的弹窗。
+    fn is_virtual(self) -> bool {
+        matches!(
+            self,
+            Self::MacroVirtualNewBind
+                | Self::MacroVirtualComboKey { .. }
+                | Self::MacroVirtualWheelDir { .. }
+                | Self::MacroVirtualWheelEnable(_)
+        )
+    }
+
+    /// 该槽位存的是**一个按键集合**([`KeySet`]:单个键或最多两个键的组合),
+    /// 而不是单个键码 —— 用户 2026-10-09 第 4 条要求的正是这些"系统键"槽位。
+    ///
+    /// 走这条路的槽位统一:一个按钮捕获(见 `PadApp::keys_button`)、
+    /// 显示 `Ctrl+X`、匹配时顺序无关、**不提供**任何时长/间隔参数。
+    /// `binds[]`(按键设置)与 `combos[]`(组合键设置)是用户明确划在外的两块,
+    /// 它们各自的编辑器按原样工作。
+    ///
+    /// 用户 2026-10-10 第 2 条把**轮盘方向键**与**临时轮盘启用键**也并了进来 ——
+    /// 这正是上一轮文档里点名"唯一未覆盖"的两个槽位(`Wheel.up/down/left/right`、
+    /// `WheelDirection.key`、`Wheel.temp.key`)。
+    fn takes_chord(self) -> bool {
+        matches!(
+            self,
+            Self::Toggle
+                | Self::CursorToggle
+                | Self::AimHold
+                | Self::AimToggle
+                | Self::AimSuspend
+                | Self::RecoilTrigger
+                | Self::RecoilSwitch
+                | Self::SwitchKey(_)
+                | Self::WheelDir { .. }
+                | Self::WheelEnable(_)
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -277,6 +353,11 @@ enum CoordSlot {
     NewBind,
     Bind(usize),
     WheelCenter(usize),
+    /// 轮盘某个方向的**手动终点**(在截图上直接点一个点;可超出/不足影响范围圆)
+    WheelDirEnd {
+        wheel: usize,
+        dir: usize,
+    },
     /// 已有滑动的起点
     SwipeStart(usize),
     /// 已有滑动的终点
@@ -302,6 +383,63 @@ enum CoordSlot {
     /// 宏页"滑动"步骤的起点/终点
     MacroSwipeStart(usize),
     MacroSwipeEnd(usize),
+    /// R4(2026-10-08):扩展宏弹窗里的取点 —— 只写弹窗那份虚拟键位表(宏草稿)。
+    ///
+    /// 存成"哪一类 + 第几个"而不是直接存堆下标,是为了让删除列表项之后
+    /// 剩下的索引仍然自洽(`assign_virtual_coord` 取不到就什么都不做)。
+    MacroVirtual(MacroVirtualPick),
+}
+
+impl CoordSlot {
+    /// 是否属于「扩展宏弹窗」的虚拟取点。
+    ///
+    /// 截图浮层靠它决定"画实时配置还是画弹窗里那套虚拟键位",关窗/取消时也靠它
+    /// 把待完成的取点清干净(不留"键位垃圾",用户 2026-10-08 明确要求)。
+    fn is_virtual(self) -> bool {
+        matches!(self, Self::MacroVirtual(_))
+    }
+}
+
+/// R4(2026-10-08):扩展宏弹窗里"在截图上取点"的目标。
+///
+/// 四类正好对应弹窗里能新增的四种东西(用户口径):轮盘、组合键、按键、锚点。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacroVirtualPick {
+    /// 虚拟按键(点按/长按)的落点
+    Bind(usize),
+    /// 虚拟组合键的落点
+    Combo(usize),
+    /// 虚拟轮盘的圆心
+    WheelCenter(usize),
+    /// 虚拟锚点(= 瞄准锚点;`aim.anchor_*`)
+    AimAnchor,
+}
+
+/// R4(2026-10-08):扩展宏弹窗"虚拟层清单"上的一次操作请求。
+///
+/// 清单里的每一行都是**纯函数**(只读写虚拟层自己的数据,不碰 `Shared`,也不碰
+/// `App`),所以"要在截图上取点 / 要在虚拟键盘上取键 / 删掉这一项"这类需要
+/// `&mut App` 的动作只能回抛出来,由 [`App::apply_virtual_act`] 统一落地。
+///
+/// 这样分的好处:①弹窗里那套控件永远改不到实时配置;②取点/取键仍然是
+/// **同一个** `picking` / `waiting_key` 机制,与主界面共用一套交互(强复用);
+/// ③关窗/取消时把请求列表一丢就干净了。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MacroVirtualAct {
+    /// 取虚拟按键的落点
+    PickBind(usize),
+    /// 取虚拟组合键的落点
+    PickComboPoint(usize),
+    /// 取虚拟轮盘的圆心
+    PickWheelCenter(usize),
+    /// 取虚拟锚点
+    PickAimAnchor,
+    /// 等一次键盘点击(组合键第几个键 / 轮盘方向键 / 轮盘启用键)
+    TakeKey(KeySlot),
+    /// 删掉第 i 个虚拟组合键
+    RemoveCombo(usize),
+    /// 删掉第 i 个虚拟轮盘
+    RemoveWheel(usize),
 }
 
 /// 正在"修改响应范围"的目标。键位的响应圈和轮盘的半径用的是同一套交互
@@ -435,10 +573,8 @@ enum VkSel {
         dir: usize,
     },
     WheelEnable(usize),
-    /// 组合键切换键
+    /// 组合键切换键(整行一个组合键槽)
     SwitchKey(usize),
-    /// 组合键切换键的第二个键
-    SwitchKeySecond(usize),
     /// 组合键成员
     ComboKey {
         combo: usize,
@@ -584,11 +720,58 @@ impl MacroRecording {
     }
 }
 
+/// `pending_task_label` 的全部取值(与那里的分支一一对应,`debug_assert` 盯着它们同步)。
+///
+/// 单列出来是为了让顶栏[取消…]按钮能按**最长**的一条预留固定宽度 —— 按钮随任务出现
+/// 和消失,宽度还会随标签变化,不预留的话整排按钮会左右横跳、甚至换行顶到下面
+/// (用户 2026-10-09 明确要求不要这种抖动)。
+/// 注意这里**没有"按键捕获"**:顶栏那个[取消按键捕获]已按用户 2026-10-10 第 1 条
+/// 移除 —— 它离捕获现场太远,点它那一刻的鼠标按下还会被当成"要绑的键"录进去
+/// (见 `note_cancel_zone`)。退出捕获一律用就地的那一个[取消设置]。
+const PENDING_TASK_LABELS: [&str; 9] = [
+    "连接",
+    "截图",
+    "坐标刷新",
+    "音频唤醒",
+    "日志收集",
+    "宏录制",
+    "取点",
+    "范围修改",
+    "曲线编辑",
+];
+
+/// egui 临时存储里存放"就地取消/停止控件矩形表"的键(见 `App::note_cancel_zone`)。
+///
+/// 放 egui 存储而不是放进 `App` 字段的原因:`cancel_bind_button` 这类控件渲染函数是
+/// **没有 `self` 的关联函数**(十来个调用点都在借用 `self` 的其他部分),做成字段就得
+/// 把它们的签名全改成 `&mut self`,为一个登记动作不值当。
+fn cancel_zones_id() -> egui::Id {
+    egui::Id::new("scrcpy-pad-cancel-zones")
+}
+
+/// egui 临时存储里"「按后延迟」总开关此刻是否打开"的键(见 `App::tail_delay_widget`)。
+///
+/// 走临时存储而不是给控件加参数的理由同上:`tail_delay_widget` 有 **7 处**调用,
+/// 其中两处(`ui_macro_virtual_bind` / `ui_macro_virtual_combo`)是**没有 `self` 的
+/// 关联函数**,把开关值一层层透传下去要改一串签名。开关值由 `PadApp::ui` 每帧开头
+/// 写一次(就在 `cancel_zones_id` 旁边),控件读同一帧的这份值决定"可改 / 灰显"。
+fn tail_delay_on_id() -> egui::Id {
+    egui::Id::new("scrcpy-pad-tail-delay-on")
+}
+
 /// 扩展宏编辑窗口的临时状态；窗口关闭/取消时直接丢弃，不触碰原宏。
+///
+/// `Clone` 只为一处:`ui_macro_virtual_window` 里"拼在下方的截图"取点期间,要临时
+/// 把这份键位表放回 `App`(见那里的注释),画完再把 profile 合并回来。
+#[derive(Clone)]
 struct MacroVirtualEditor {
     profile: Profile,
     selected_key: Option<u16>,
     source_scheme: usize,
+    /// 最近一次**新增**的虚拟项(用户 2026-10-10 第 4 条"每次新增点需标明")。
+    /// 截图浮层据此给这个点画一圈强调 + 「新」角标,让用户一眼找到刚放下的那个。
+    /// 只影响画法,不进配置、不进宏。
+    newest: Option<MacroVirtualPick>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -684,6 +867,9 @@ struct DraftBind {
     radius: f32,
     /// 点按型新键的触点时长(ms);0=按住切换
     tap_duration_ms: u32,
+    /// 「按后延迟」(ms,用户 2026-10-10 第 2 条):这条键位上一次抬起之后,
+    /// 至少再等这么久才接受下一次按下。与 [`crate::keymap::KeyBind::tail_delay_ms`] 同义。
+    tail_delay_ms: u32,
     // 滑动
     swipe_start: (i32, i32),
     swipe_end: (i32, i32),
@@ -705,6 +891,7 @@ impl Default for DraftBind {
             // 35.2px 与相对默认值(0.0326 × 1080)对应,视觉一致
             radius: crate::keymap::DEFAULT_RADIUS * 1080.0,
             tap_duration_ms: crate::keymap::DEFAULT_TAP_DURATION_MS,
+            tail_delay_ms: crate::keymap::DEFAULT_TAIL_DELAY_MS,
             swipe_start: (540, 1800),
             swipe_end: (540, 600),
             swipe_duration_ms: 300,
@@ -807,7 +994,7 @@ pub struct PadApp {
     grab_flag: Arc<std::sync::atomic::AtomicBool>,
     /// 「拦截系统默认行为」掩码(见 capture::swallow_bit):每帧按 映射开关 ×
     /// 独占键盘 × 当前绑定 预先算好,钩子回调只读一次原子量。
-    swallow_flag: Arc<std::sync::atomic::AtomicU8>,
+    swallow_flag: Arc<std::sync::atomic::AtomicU16>,
     /// 鼠标抓取开关(FPS 瞄准期间冻结/隐藏系统光标)
     mouse_grab_flag: Arc<std::sync::atomic::AtomicBool>,
     /// 独立的全局鼠标消隐开关(不依赖 FPS，可由快捷键或“其他功能”按钮切换)
@@ -826,6 +1013,10 @@ pub struct PadApp {
     /// Windows 低级钩子安装结果(bit0=键盘,bit1=鼠标;0=未知;W0-11)。
     /// 自检面板据此红字提示"按键捕获不可用" —— 在这之前装钩子失败只有
     /// 诊断日志知道,用户看到的是"按了没反应"却毫无线索。Linux 恒为 0。
+    ///
+    /// Linux 侧只写不读(读它的自检在 `#[cfg(windows)]` 里),所以那边标成"平台相关、
+    /// 允许没人读"。字段本身还要留着:启动时照样要喂给捕获层(`Capture` 收它)。
+    #[cfg_attr(not(windows), allow(dead_code))]
     hook_ok_flag: Arc<std::sync::atomic::AtomicU8>,
     /// 上一帧的映射开关状态:由关到开时重新确认当前屏幕方向(坐标空间)
     enabled_prev: bool,
@@ -893,6 +1084,21 @@ pub struct PadApp {
     stream_fps: Option<(f32, Instant)>,
 
     waiting_key: Option<KeySlot>,
+    /// 正在等待**组合键**输入的槽位(用户 2026-10-09 第 4 条:系统键那类
+    /// "原来只允许单个键"的槽位现在统一可捕获 `Ctrl+X`)。
+    ///
+    /// 与 [`Self::waiting_key`] 是两个互斥的捕获模式:后者按下即捕获(一次一个键),
+    /// 这里要等到**所有键都松开**才落定 —— 否则按住 `Ctrl` 的那一下就先把
+    /// `Ctrl` 单独记下了。捕获期间按下的键记在 `capture_down`(当前按着)与
+    /// `capture_seen`(这次捕获到的全部,最多 2 个)里。
+    waiting_keys: Option<KeySlot>,
+    /// 组合键捕获:此刻**按着**的键(按按下顺序,最多 2 个)。
+    capture_down: Vec<u16>,
+    /// 组合键捕获:这一轮**捕获到**的键(按按下顺序,最多 2 个)。
+    capture_seen: Vec<u16>,
+    /// 按下被 [`Self::swallow_cancel_click`] 吞掉、正等着配对抬起的那几个鼠标键。
+    /// 记着它们是为了把对应的**抬起**也一起吞(否则会留下"没按过就抬起"的孤儿)。
+    swallowed_buttons: Vec<u16>,
     picking: Option<CoordSlot>,
     /// 正在修改响应范围的目标(键位圈或轮盘半径);进入后目标显示为黄色
     resizing: Option<ResizeTarget>,
@@ -908,6 +1114,28 @@ pub struct PadApp {
     shot_zoom: f32,
     /// 是否仍使用按窗口尺寸计算的自动初始缩放；手动 +/- 后关闭，重置时恢复。
     shot_zoom_auto: bool,
+    /// 截图小窗(2026-10-09):true = 内容搬进独立窗口,下方面板只留按钮行。
+    shot_window_open: bool,
+    /// 截图小窗是否置顶(勾上=固定在其他窗口上方,不勾=可以被盖住)。默认置顶。
+    shot_window_pin: bool,
+    /// 上一次画截图画布时算出的"自动适应"基准倍率(按**当时那个容器**的可用宽高内接)。
+    /// 界面上显示的那个百分比就是它×`shot_zoom`(见 `ui_shot_header`)。
+    shot_last_base: f32,
+    /// 截图小窗的**绝对**基准倍率:`程序窗口内容区 ∩ 系统屏幕`下这张图最合适的大小
+    /// (用户 2026-10-10 第 3 条:"放不下时按程序窗口与系统屏幕边界调整缩放")。
+    ///
+    /// 小窗**不能**用"按小窗自己多大内接"那套:`±` 改窗口大小、窗口大小又改倍率,
+    /// 两者会互相追着放大(每按一次 + 就 ×1.44,几帧就撑爆屏幕)。所以小窗的倍率
+    /// 只由屏幕/程序窗口边界决定,窗口尺寸反过来由它算出来。
+    shot_popup_base: f32,
+    /// 截图小窗抬头上一帧的实际高度(pt):算小窗尺寸时要把它加在图高上,
+    /// 否则图会把抬头挤出去(抬头会换行,高度不是一个常数)。
+    shot_window_header_h: f32,
+    /// 这个小窗是**从哪开的**:true = 扩展宏弹窗开的(画虚拟键位层),false = 主界面开的。
+    /// 用户 2026-10-10(第 4 条):弹窗开的截图小窗也得看得见继承来的键位与新取的点。
+    shot_window_virtual: bool,
+    /// 扩展宏弹窗里截图画布区的高度(拖分界条调整;用户 2026-10-09:"文字与图像分界可拖动")。
+    macro_shot_height: f32,
     /// 音频唤醒(注入音量键)任务的回执;None = 没有进行中的唤醒
     audio_rx: Option<Receiver<String>>,
     overlay_filter: OverlayFilter,
@@ -941,6 +1169,10 @@ pub struct PadApp {
     macro_page_key: Option<u16>,
     /// 宏页：新宏是否仅 FPS 生效。
     macro_page_fps_only: bool,
+    /// 宏页：「按后延迟」(ms,用户 2026-10-10 第 2 条)—— 这个宏的触发键上一次
+    /// 抬起之后要等多久才接下一次触发。整条宏跑完再算冷却,所以连按宏键不会
+    /// 让两次执行叠在一起。
+    macro_page_tail_delay_ms: u32,
     /// 宏页：空闲自动停止时间。
     macro_idle_ms: u32,
     /// 宏页：是否展开显示原始录制事件（默认只显示结果摘要）。
@@ -952,6 +1184,16 @@ pub struct PadApp {
     macro_expanded: Option<usize>,
     /// 当前载入编辑区的是哪一条宏；可视化下列表按钮据此变成“取消编辑”。
     macro_loaded_index: Option<usize>,
+    /// 「宏草稿库」:长期保存的命名草稿(见 [`MacroDraft`]),与编辑区那份草稿无关。
+    macro_drafts: Vec<MacroDraft>,
+    /// 草稿库下拉当前选中的条目。
+    macro_draft_sel: Option<usize>,
+    /// [另存当前草稿]展开后输入的名字。
+    macro_draft_name: String,
+    /// 是否展开"给草稿起个名字"那一行。
+    macro_draft_save_open: bool,
+    /// 草稿库的一次性提示(保存/载入/删除的结果),`(是否成功, 文案)`。
+    macro_draft_msg: Option<(bool, String)>,
     /// 新增键位/组合键/轮盘后，下一帧把当前滚动区滚到新增设置处。
     scroll_to_new: bool,
     /// 退出清理是否已经执行。eframe 的 on_exit、Drop、主循环兜底可能多路调用。
@@ -1289,6 +1531,7 @@ impl PadApp {
             notices: Vec::new(),
             space_recheck: false,
             toolbar_release: false,
+            recoil_gear_req: None,
             schemes: doc.schemes.clone(),
             switch_keys: doc.switch_keys.clone(),
             fast_switch_enabled: doc.fast_switch_enabled,
@@ -1429,6 +1672,11 @@ impl PadApp {
                 Ok(list) => (list, None),
                 Err(e) => (Vec::new(), Some(e)),
             };
+        // 宏草稿库同理:读不动就按空处理并提示,不能因为一个坏文件起不来
+        let (macro_drafts, macro_drafts_err) = match load_macro_drafts(&macro_drafts_path()) {
+            Ok(list) => (list, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
 
         let mut app = Self {
             shared,
@@ -1480,6 +1728,10 @@ impl PadApp {
             reconnect_due: None,
             stream_fps: None,
             waiting_key: None,
+            waiting_keys: None,
+            capture_down: Vec::new(),
+            capture_seen: Vec::new(),
+            swallowed_buttons: Vec::new(),
             picking: None,
             resizing: None,
             easing_edit: None,
@@ -1489,6 +1741,13 @@ impl PadApp {
             shot_rx: None,
             shot_zoom: 1.0,
             shot_zoom_auto: true,
+            shot_window_open: false,
+            shot_window_pin: true,
+            shot_last_base: 1.0,
+            shot_popup_base: 1.0,
+            shot_window_header_h: 0.0,
+            shot_window_virtual: false,
+            macro_shot_height: MACRO_SHOT_DEFAULT_H,
             audio_rx: None,
             overlay_filter: OverlayFilter::default(),
             right_tab: RightTab::Keys,
@@ -1505,10 +1764,16 @@ impl PadApp {
             macro_instruction_kind: MacroInstructionKind::Key,
             macro_page_key: None,
             macro_page_fps_only: false,
+            macro_page_tail_delay_ms: crate::keymap::DEFAULT_TAIL_DELAY_MS,
             macro_idle_ms: 800,
             macro_show_events: false,
             macro_show_recording_steps: false,
             macro_expanded: None,
+            macro_drafts,
+            macro_draft_sel: None,
+            macro_draft_name: String::new(),
+            macro_draft_save_open: false,
+            macro_draft_msg: None,
             macro_loaded_index: None,
             scroll_to_new: false,
             shutdown_done: false,
@@ -1560,6 +1825,9 @@ impl PadApp {
         app.log("就绪。顺序: 连接手机 -> [连接控制] -> [启动 scrcpy] -> 按总开关键开启映射");
         if let Some(e) = adb_presets_err {
             app.log(format!("adb 预设读取失败({e}),已按空列表处理"));
+        }
+        if let Some(e) = macro_drafts_err {
+            app.log(format!("宏草稿库读取失败({e}),已按空列表处理"));
         }
         // 配置读取阶段的提示(W0-9):读不动/解析失败必须让用户看到,
         // 且要说清"原文件留了备份" —— 否则用户只会觉得"我的配置自己没了"。
@@ -1783,7 +2051,7 @@ impl PadApp {
 
     /// 当前是否有可取消的后台任务或交互操作。
     fn pending_task_label(&self) -> Option<&'static str> {
-        if self.connect_rx.is_some() {
+        let label = if self.connect_rx.is_some() {
             Some("连接")
         } else if self.shot_rx.is_some() {
             Some("截图")
@@ -1800,15 +2068,51 @@ impl PadApp {
             Some("宏录制")
         } else if self.picking.is_some() {
             Some("取点")
-        } else if self.waiting_key.is_some() {
-            Some("按键捕获")
-        } else if self.resizing.is_some() {
+        }
+        // 按键捕获**不在这里**(用户 2026-10-10 第 1 条):武装捕获时顶栏不再出现
+        // [取消按键捕获]。原因两条 ——
+        //   ① 它离捕获现场太远,用户要先在面板上找到它、再把鼠标移过去;
+        //   ② 更要命的是**点它的那一下本身就是一次鼠标按下**,而输入事件在同一帧
+        //      的界面绘制**之前**处理,于是"取消"这个动作会先把鼠标键录成要绑的键
+        //      (组合键甚至会在松开时直接落定成绑定)。用户实测:点[取消按键捕获]后
+        //      鼠标消隐被绑到左键,再删掉那个键就"左键即消隐"。
+        // 退出捕获一律用就地那一个[取消设置](`cancel_bind_button`),它按**下**即生效
+        // 且位置就在捕获控件旁边;捕获期间落在它上面的按下还会被整体丢掉
+        // (见 `note_cancel_zone` / `swallow_cancel_click`)。
+        else if self.resizing.is_some() {
             Some("范围修改")
         } else if self.easing_edit.is_some() {
             Some("曲线编辑")
         } else {
             None
-        }
+        };
+        // 顶栏那个[取消…]按钮按 `PENDING_TASK_LABELS` 里**最长**的一条预留固定宽度
+        // (见 `cancel_button_slot_width`),所以这里每出现一种新标签都要能对上号,
+        // 否则预留的槽位装不下、会被截断。debug 下每帧顺手校一次,release 里没有代价。
+        debug_assert!(
+            label.is_none_or(|l| PENDING_TASK_LABELS.contains(&l)),
+            "新的等待标签 {label:?} 没同步进 PENDING_TASK_LABELS"
+        );
+        label
+    }
+
+    /// 顶栏[取消…]按钮的固定槽宽:按 [`PENDING_TASK_LABELS`] 里最长的一条量。
+    ///
+    /// 用字体实际排版测量(不是拍一个常数),这样换字体/换字号也不会量错。
+    fn cancel_button_slot_width(ui: &egui::Ui) -> f32 {
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let painter = ui.painter();
+        let widest = PENDING_TASK_LABELS
+            .iter()
+            .map(|l| {
+                painter
+                    .layout_no_wrap(format!("取消{l}"), font.clone(), egui::Color32::WHITE)
+                    .size()
+                    .x
+            })
+            .fold(0.0_f32, f32::max);
+        // 按钮内边距 + 描边,免得最宽的那条刚好被切掉
+        widest + 2.0 * ui.spacing().button_padding.x + 4.0
     }
 
     /// 取消所有等待中的任务/交互。已经启动的外部进程不会因为取消按钮被强杀；
@@ -1824,6 +2128,9 @@ impl PadApp {
         self.macro_recording = None;
         self.picking = None;
         self.waiting_key = None;
+        self.waiting_keys = None;
+        self.capture_down.clear();
+        self.capture_seen.clear();
         self.resizing = None;
         self.easing_edit = None;
         self.draft_active = false;
@@ -1939,10 +2246,27 @@ impl PadApp {
     }
 
     fn assign_key(&mut self, slot: KeySlot, code: u16) {
+        // R4(2026-10-08):扩展宏弹窗的虚拟取键写的是宏草稿那一层 —— 既不碰实时配置,
+        // 也不该在撤销栈上留一步空操作,所以先于 `push_undo()` 处理。
+        // `waiting_key` 在这里清掉:与主界面的两处调用点(`take()` 之后才调
+        // `assign_key`)同一条规矩 —— 一次等待只接一个键。
+        if slot.is_virtual() {
+            self.waiting_key = None;
+            if let Some(msg) = self.assign_virtual_key(slot, code) {
+                self.log(msg);
+            }
+            return;
+        }
+        // 组合键槽位(用户 2026-10-09 第 4 条):单个键也走同一个落定入口 ——
+        // "一个键"就是"只含一个键的集合",两种捕获模式最后落在同一处写配置。
+        if slot.takes_chord() {
+            self.assign_keys(slot, KeySet::single(code));
+            return;
+        }
         self.push_undo();
-        // 切换键属于"组合表结构",改完自动落盘(见 sync_scheme_state);
-        // 普通键位不在此列 —— 拖动圆圈/连续改键太频繁,由 [保存配置] 决定何时写。
-        let mut switch_key_touched = false;
+        // 切换键走 `assign_keys`(它属于"组合表结构",改完自动落盘,见
+        // sync_scheme_state);这里剩下的都是普通键位/摇杆/宏草稿的单个键码槽,
+        // 不在"改完即落盘"之列 —— 拖动圆圈/连续改键太频繁,由 [保存配置] 决定何时写。
         {
             let mut g = lock_shared(&self.shared);
             match slot {
@@ -1952,62 +2276,18 @@ impl PadApp {
                         b.key = code;
                     }
                 }
-                KeySlot::WheelDir { wheel, dir } => {
-                    if let Some(w) = g.profile.wheels.get_mut(wheel) {
-                        if w.kind == WheelKind::Standard {
-                            match dir {
-                                0 => w.up = code,
-                                1 => w.down = code,
-                                2 => w.left = code,
-                                _ => w.right = code,
-                            }
-                        } else if let Some(d) = w.directions.get_mut(dir) {
-                            d.key = code;
-                        }
-                    }
-                }
-                KeySlot::WheelEnable(i) => {
-                    if let Some(w) = g.profile.wheels.get_mut(i) {
-                        let mode = w.temp.as_ref().map(|t| t.mode).unwrap_or(TempMode::Hold);
-                        w.temp = Some(TempWheel { key: code, mode });
-                    }
-                }
-                KeySlot::Toggle => g.profile.toggle_key = code,
-                KeySlot::CursorToggle => g.profile.cursor_toggle_key = code,
-                KeySlot::AimHold => g.profile.aim.hold_key = code,
-                KeySlot::AimToggle => g.profile.aim.toggle_key = code,
-                KeySlot::AimSuspend => g.profile.aim.suspend_key = code,
-                KeySlot::RecoilTrigger => g.profile.aim.recoil.trigger_key = code,
-                KeySlot::SwitchKey(i) => {
-                    if let Some(s) = g.switch_keys.get_mut(i) {
-                        s.key = code;
-                        if s.keys.len() > 1 {
-                            s.keys[0] = code;
-                        } else {
-                            s.keys = vec![code];
-                        }
-                    }
-                    // 同一个物理键挂两行没有意义(引擎只会认第一行),
-                    // 这里顺手把其余同名行清空为"未绑定",免得看着像生效了其实没有。
-                    for (j, s) in g.switch_keys.iter_mut().enumerate() {
-                        if j != i && s.key == code {
-                            s.key = 0;
-                        }
-                    }
-                    switch_key_touched = true;
-                }
-                KeySlot::SwitchKeySecond(i) => {
-                    if let Some(s) = g.switch_keys.get_mut(i) {
-                        if s.keys.is_empty() {
-                            s.keys.push(s.key);
-                        }
-                        if s.keys.len() < 2 {
-                            s.keys.push(code);
-                        } else {
-                            s.keys[1] = code;
-                        }
-                    }
-                }
+                // 组合键槽位(总开关/消隐/FPS 三键/压枪触发/切换键/轮盘方向键/
+                // 临时轮盘启用键)在上面的 `takes_chord()` 分支就返回了,不会走到这里。
+                KeySlot::Toggle
+                | KeySlot::CursorToggle
+                | KeySlot::AimHold
+                | KeySlot::AimToggle
+                | KeySlot::AimSuspend
+                | KeySlot::RecoilTrigger
+                | KeySlot::RecoilSwitch
+                | KeySlot::SwitchKey(_)
+                | KeySlot::WheelDir { .. }
+                | KeySlot::WheelEnable(_) => {}
                 KeySlot::ComboKey { combo, slot } => {
                     if let Some(combo) = g.profile.combos.get_mut(combo) {
                         if slot < combo.keys.len() {
@@ -2038,16 +2318,145 @@ impl PadApp {
                         }
                     }
                 }
+                // R4:扩展宏弹窗的虚拟取键已在函数开头单独处理(写宏草稿,不碰 Shared),
+                // 这里只为穷尽枚举。
+                KeySlot::MacroVirtualNewBind
+                | KeySlot::MacroVirtualComboKey { .. }
+                | KeySlot::MacroVirtualWheelDir { .. }
+                | KeySlot::MacroVirtualWheelEnable(_) => {}
+            }
+        }
+        self.log(format!("键位已绑定: {}", key_name(code)));
+    }
+
+    /// 组合键槽位的落定入口(用户 2026-10-09 第 4 条)。
+    ///
+    /// 单键与组合键同一条路:单个键 = 只含一个键的集合 —— 于是"只允许单键的
+    /// 键位也套用这套逻辑"(用户原话),不需要两套写法。
+    /// **不给任何时长/间隔参数**:这类键就是"这几个键一起按住",
+    /// 与用户同一条要求里的限制一致。
+    fn assign_keys(&mut self, slot: KeySlot, keys: KeySet) {
+        self.push_undo();
+        // 切换键属于"组合表结构",改完自动落盘(见 sync_scheme_state)。
+        let mut switch_key_touched = false;
+        let mut clobbered = false;
+        {
+            let mut g = lock_shared(&self.shared);
+            match slot {
+                KeySlot::Toggle => g.profile.toggle_key = keys,
+                KeySlot::CursorToggle => g.profile.cursor_toggle_key = keys,
+                KeySlot::AimHold => g.profile.aim.hold_key = keys,
+                KeySlot::AimToggle => g.profile.aim.toggle_key = keys,
+                KeySlot::AimSuspend => g.profile.aim.suspend_key = keys,
+                KeySlot::RecoilTrigger => g.profile.aim.recoil.trigger_key = keys,
+                KeySlot::RecoilSwitch => g.profile.aim.recoil.switch_key = keys,
+                KeySlot::WheelDir { wheel, dir } => {
+                    if let Some(w) = g.profile.wheels.get_mut(wheel) {
+                        if w.kind == WheelKind::Standard {
+                            match dir {
+                                0 => w.up = keys,
+                                1 => w.down = keys,
+                                2 => w.left = keys,
+                                _ => w.right = keys,
+                            }
+                        } else if let Some(d) = w.directions.get_mut(dir) {
+                            d.key = keys;
+                        }
+                    }
+                }
+                KeySlot::WheelEnable(i) => {
+                    if let Some(w) = g.profile.wheels.get_mut(i) {
+                        // 与单键时代同一条规则:设了启用键 = 变成临时摇杆,
+                        // 模式沿用原有的(默认长按)。清成空集合 = 撤销启用键,
+                        // 退回永久轮盘(「取消设置」走的就是这一路)。
+                        let mode = w.temp.as_ref().map(|t| t.mode).unwrap_or(TempMode::Hold);
+                        if keys.is_empty() {
+                            w.temp = None;
+                        } else {
+                            w.temp = Some(TempWheel { key: keys, mode });
+                        }
+                    }
+                }
+                KeySlot::SwitchKey(i) => {
+                    if let Some(s) = g.switch_keys.get_mut(i) {
+                        // 旧字段同步写一份:老版本读的是 `key`,让它至少看到单键值。
+                        s.key = keys.only().unwrap_or(0);
+                        s.keys = keys;
+                    }
+                    // 两行切换键共用任何一个键都会让归属变得说不清(引擎只认先命中的
+                    // 那行),这里顺手把其余有交叠的行清成"未绑定",免得看着像生效了
+                    // 其实没有。清空本身不清别人(未绑定不参与匹配)。
+                    for (j, s) in g.switch_keys.iter_mut().enumerate() {
+                        if j == i || keys.is_empty() {
+                            continue;
+                        }
+                        let other = s.effective_keys();
+                        if other.iter().any(|k| keys.contains(k)) {
+                            s.key = 0;
+                            s.keys = KeySet::new();
+                            clobbered = true;
+                        }
+                    }
+                    switch_key_touched = true;
+                }
+                _ => {}
             }
         }
         if switch_key_touched {
             self.scheme_dirty = true;
         }
-        self.log(format!("键位已绑定: {}", key_name(code)));
+        if clobbered {
+            self.log("同名的切换键行已清空(两行共用一个键会说不清谁生效)");
+        }
+        let label = if keys.is_empty() {
+            "未绑定".to_string()
+        } else {
+            keys.label()
+        };
+        self.log(format!("键位已绑定: {label}"));
+    }
+
+    /// 进入**组合键**捕获(见 [`Self::keys_button`])。
+    ///
+    /// 与单键捕获互斥:两处都武装的话,同一次按键会被两条路各处理一遍。
+    /// 进入时清空上一轮的按键记录 —— 否则上一次没按完的半个组合会粘进来。
+    fn begin_keys_capture(&mut self, slot: KeySlot) {
+        self.picking = None;
+        self.resizing = None;
+        self.waiting_key = None;
+        self.capture_down.clear();
+        self.capture_seen.clear();
+        self.waiting_keys = Some(slot);
+        self.log("请按下组合键:按住 Ctrl 再按另一个键(只按一个键就是单键);全部松开即生效");
+    }
+
+    /// 进入单键捕获(按下的那一个键立即落定)。
+    fn begin_key_capture(&mut self, slot: KeySlot) {
+        self.picking = None;
+        self.resizing = None;
+        self.waiting_keys = None;
+        self.capture_down.clear();
+        self.capture_seen.clear();
+        self.waiting_key = Some(slot);
+        self.log("按任意键完成改绑(或点[取消选择]退出)");
+    }
+
+    /// 退出所有按键捕获(单键与组合键一起清,不留下"举着等按键"的半状态)。
+    fn cancel_key_capture(&mut self) {
+        self.waiting_key = None;
+        self.waiting_keys = None;
+        self.capture_down.clear();
+        self.capture_seen.clear();
     }
 
     /// 截图取点后写入坐标(入参为像素,配置里存相对值)
     fn assign_coord(&mut self, slot: CoordSlot, x: i32, y: i32) {
+        // R4(2026-10-08):扩展宏弹窗的取点只写弹窗自己那份虚拟键位表(宏草稿),
+        // 与实时配置无关,也不该在撤销栈上留一步空操作 —— 先于 `push_undo()` 返回。
+        if let CoordSlot::MacroVirtual(pick) = slot {
+            self.assign_virtual_coord(pick, x, y);
+            return;
+        }
         self.push_undo();
         let m = self.mapper();
         // 宏页的落点写在页面草稿状态里(不碰 Shared):单独先处理,
@@ -2113,6 +2522,19 @@ impl PadApp {
                     if let Some(w) = g.profile.wheels.get_mut(i) {
                         w.cx = m.rel_x(x);
                         w.cy = m.rel_y(y);
+                    }
+                }
+                CoordSlot::WheelDirEnd { wheel, dir } => {
+                    // 存**相对坐标**(与圆心同一坐标系),与屏幕尺寸/方向无关。
+                    // 注意这里只写 manual:角度与影响范围都保持原样 ——
+                    // 影响范围从此只是基准,改它不会挪动这个手改点。
+                    if let Some(d) = g
+                        .profile
+                        .wheels
+                        .get_mut(wheel)
+                        .and_then(|w| w.directions.get_mut(dir))
+                    {
+                        d.manual = Some((m.rel_x(x), m.rel_y(y)));
                     }
                 }
                 CoordSlot::SwipeStart(i) => {
@@ -2192,9 +2614,231 @@ impl PadApp {
                 CoordSlot::MacroClickPoint(_)
                 | CoordSlot::MacroSwipeStart(_)
                 | CoordSlot::MacroSwipeEnd(_) => {}
+                // R4:扩展宏弹窗的取点同样已在函数开头单独处理(写宏草稿,不碰 Shared)。
+                CoordSlot::MacroVirtual(_) => {}
             }
         }
         self.log(format!("坐标已设置: ({x}, {y})"));
+    }
+
+    /// R4(2026-10-08):把一次截图取点写进**扩展宏弹窗**的虚拟键位表。
+    ///
+    /// 与 [`Self::assign_coord`] 的实时配置分支同一个换算口径(都用 `self.mapper()`,
+    /// 即按当前配置的坐标系与屏幕尺寸),区别只有一个:目标是弹窗里那份
+    /// `MacroVirtualEditor.profile`(宏草稿)。所以这里**不推送撤销**——
+    /// 宏草稿的撤销语义就是弹窗自己的[取消](丢弃整份副本),往实时撤销栈里塞一步
+    /// "什么都没改"的记录只会污染主界面的撤销历史。
+    ///
+    /// 弹窗已经关了(理论上到不了:关窗时会清掉虚拟取点,这里只是兜底)则什么都不做。
+    fn assign_virtual_coord(&mut self, pick: MacroVirtualPick, x: i32, y: i32) {
+        let m = self.mapper();
+        let (rx, ry) = (m.rel_x(x), m.rel_y(y));
+        {
+            let Some(editor) = self.macro_virtual_editor.as_mut() else {
+                return;
+            };
+            let profile = &mut editor.profile;
+            match pick {
+                MacroVirtualPick::Bind(i) => {
+                    if let Some(b) = profile.binds.get_mut(i) {
+                        if let Action::Tap { x: ax, y: ay, .. }
+                        | Action::Hold { x: ax, y: ay, .. } = &mut b.action
+                        {
+                            *ax = rx;
+                            *ay = ry;
+                        }
+                    }
+                }
+                MacroVirtualPick::Combo(i) => {
+                    if let Some(c) = profile.combos.get_mut(i) {
+                        if let Action::Tap { x: ax, y: ay, .. }
+                        | Action::Hold { x: ax, y: ay, .. } = &mut c.action
+                        {
+                            *ax = rx;
+                            *ay = ry;
+                        }
+                    }
+                }
+                MacroVirtualPick::WheelCenter(i) => {
+                    if let Some(w) = profile.wheels.get_mut(i) {
+                        w.cx = rx;
+                        w.cy = ry;
+                    }
+                }
+                MacroVirtualPick::AimAnchor => {
+                    profile.aim.anchor_x = rx;
+                    profile.aim.anchor_y = ry;
+                }
+            }
+            // 刚落下的这一个就是"最新点":截图浮层给它画一圈强调 + 「新」角标
+            // (用户 2026-10-10 第 4 条"每次新增点需标明")。
+            editor.newest = Some(pick);
+        }
+        self.log(format!("扩展宏虚拟键位坐标已设置: ({x}, {y})"));
+    }
+
+    /// R4(2026-10-08):扩展宏弹窗的"点虚拟键盘选键"。
+    ///
+    /// `slot` 必须是 [`KeySlot::is_virtual`] 的取值(调用方 [`Self::assign_key`] 已判)。
+    /// 返回 `Some(消息)` 表示这次按键已经写进宏草稿(或有意被吞掉),调用方不要再走
+    /// 实时配置的分支;返回 `None` 表示弹窗已经不在了(兜底,写进哪里都不合适)。
+    fn assign_virtual_key(&mut self, slot: KeySlot, code: u16) -> Option<String> {
+        // 一次等待只接一个键 —— 与 [`App::assign_key`] 开头的同一条规矩。
+        // 弹窗里的虚拟键盘是**直接**调本函数的(不经 `assign_key`),所以这里必须
+        // 自己清:否则"等待按键"的横幅会一直挂着,而且此后**任何**一次物理按键
+        // 都会顺着 `assign_key` 再往宏草稿里悄悄新建/改写一个虚拟键位。
+        self.waiting_key = None;
+        // 「＋ 按键」的第一步:新建一个虚拟键位(占位在屏幕中央,紧接着进入截图取点)。
+        // 与弹窗里直接点虚拟键盘的区别就在这:那条路是"先建再自己取点",
+        // 这条是主界面同款的"点键 → 取点"连贯流程。
+        if slot == KeySlot::MacroVirtualNewBind {
+            let idx = {
+                let editor = self.macro_virtual_editor.as_mut()?;
+                match editor.profile.binds.iter().position(|b| b.key == code) {
+                    Some(i) => i,
+                    None => {
+                        editor.profile.binds.push(KeyBind {
+                            key: code,
+                            action: Action::Tap {
+                                x: 0.5,
+                                y: 0.5,
+                                duration_ms: crate::keymap::DEFAULT_TAP_DURATION_MS,
+                                radius: crate::keymap::DEFAULT_RADIUS,
+                            },
+                            fps_only: false,
+                            tail_delay_ms: crate::keymap::DEFAULT_TAIL_DELAY_MS,
+                        });
+                        editor.profile.binds.len() - 1
+                    }
+                }
+            };
+            if let Some(editor) = self.macro_virtual_editor.as_mut() {
+                editor.selected_key = Some(code);
+                // 记下"刚新增的是这一个"(截图浮层给它画「新」角标)
+                editor.newest = Some(MacroVirtualPick::Bind(idx));
+            }
+            // 立刻进入取点(与主界面"取点后请按下按键"互为镜像的半步)。
+            // `begin_pick` 自己会做坐标空间对齐检查并在失败时说明原因。
+            if self.begin_pick(CoordSlot::MacroVirtual(MacroVirtualPick::Bind(idx))) {
+                return Some(format!(
+                    "虚拟键位已加入: {} —— 请点击截图选点",
+                    key_name(code)
+                ));
+            }
+            return Some(format!("虚拟键位已加入: {} (暂未进入取点)", key_name(code)));
+        }
+        let editor = self.macro_virtual_editor.as_mut()?;
+        match slot {
+            KeySlot::MacroVirtualComboKey { combo, slot } => {
+                if let Some(c) = editor.profile.combos.get_mut(combo) {
+                    if slot < c.keys.len() {
+                        c.keys[slot] = code;
+                    } else {
+                        c.keys.push(code);
+                    }
+                }
+            }
+            KeySlot::MacroVirtualWheelDir { wheel, dir } => {
+                if let Some(w) = editor.profile.wheels.get_mut(wheel) {
+                    // 弹窗的取键是"点虚拟键盘上的一个键",天然只能给单键;
+                    // 存进去的是单元素集合 —— 与主界面的组合键共用同一份存储。
+                    let keys = KeySet::single(code);
+                    if w.kind == WheelKind::Standard {
+                        match dir {
+                            0 => w.up = keys,
+                            1 => w.down = keys,
+                            2 => w.left = keys,
+                            _ => w.right = keys,
+                        }
+                    } else if let Some(d) = w.directions.get_mut(dir) {
+                        d.key = keys;
+                    }
+                }
+            }
+            KeySlot::MacroVirtualWheelEnable(i) => {
+                if let Some(w) = editor.profile.wheels.get_mut(i) {
+                    // 与主界面同一条规则:设启用键 = 变成临时摇杆,模式沿用原有(默认长按)。
+                    let mode = w.temp.as_ref().map(|t| t.mode).unwrap_or(TempMode::Hold);
+                    w.temp = Some(TempWheel {
+                        key: KeySet::single(code),
+                        mode,
+                    });
+                }
+            }
+            _ => {}
+        }
+        Some(format!("扩展宏虚拟键位已绑定: {}", key_name(code)))
+    }
+
+    /// R4(2026-10-08):落地一条 [`MacroVirtualAct`](弹窗清单里点出来的操作)。
+    ///
+    /// 只在弹窗**还开着**的那一帧调用(见 `ui_macro_virtual_window` 的收尾):
+    /// 关窗/取消时这些请求已经没有意义,直接丢掉 —— 这也是"不留键位垃圾"的一半。
+    fn apply_virtual_act(&mut self, act: MacroVirtualAct) {
+        match act {
+            MacroVirtualAct::PickBind(i) => {
+                self.wheel_info = None; // 收起旧的摇杆信息卡,免得和虚拟层混在一起
+                self.waiting_key = None;
+                self.begin_pick(CoordSlot::MacroVirtual(MacroVirtualPick::Bind(i)));
+            }
+            MacroVirtualAct::PickComboPoint(i) => {
+                self.wheel_info = None;
+                self.waiting_key = None;
+                self.begin_pick(CoordSlot::MacroVirtual(MacroVirtualPick::Combo(i)));
+            }
+            MacroVirtualAct::PickWheelCenter(i) => {
+                self.wheel_info = None;
+                self.waiting_key = None;
+                self.begin_pick(CoordSlot::MacroVirtual(MacroVirtualPick::WheelCenter(i)));
+            }
+            MacroVirtualAct::PickAimAnchor => {
+                self.wheel_info = None;
+                self.waiting_key = None;
+                self.begin_pick(CoordSlot::MacroVirtual(MacroVirtualPick::AimAnchor));
+            }
+            MacroVirtualAct::TakeKey(slot) => {
+                self.picking = None;
+                self.resizing = None;
+                self.waiting_key = Some(slot);
+            }
+            MacroVirtualAct::RemoveCombo(i) => {
+                if let Some(editor) = self.macro_virtual_editor.as_mut()
+                    && i < editor.profile.combos.len()
+                {
+                    editor.profile.combos.remove(i);
+                    // 删一项之后下标全体前移,旧的「新」角标会指错人
+                    editor.newest = None;
+                }
+                self.clear_virtual_pick();
+                self.log("已删除虚拟组合键");
+            }
+            MacroVirtualAct::RemoveWheel(i) => {
+                if let Some(editor) = self.macro_virtual_editor.as_mut()
+                    && i < editor.profile.wheels.len()
+                {
+                    editor.profile.wheels.remove(i);
+                    editor.newest = None;
+                }
+                self.wheel_info = None;
+                self.clear_virtual_pick();
+                self.log("已删除虚拟轮盘");
+            }
+        }
+    }
+
+    /// 清掉「扩展宏弹窗」的一次待完成操作(虚拟取点 / 虚拟取键)。
+    ///
+    /// 三个时必须走这里:关窗(含保存与取消)、[取消取点](或"取消选键")、
+    /// 删掉正被指向的那一项。清干净之后截图浮层下一帧就回到实时配置 ——
+    /// 这正是用户要求的"设置完毕或取消设置后,截图处标识回到操作之前的样子"。
+    /// 实时配置的 `picking`/`waiting_key` 一律不动(那是主界面的活儿)。
+    fn clear_virtual_pick(&mut self) {
+        if self.picking.map(CoordSlot::is_virtual).unwrap_or(false) {
+            self.picking = None;
+        }
+        if self.waiting_key.map(KeySlot::is_virtual).unwrap_or(false) {
+            self.waiting_key = None;
+        }
     }
 
     /// 组装完整日志文本(含环境信息)
@@ -2240,6 +2884,109 @@ impl PadApp {
         ui.add(egui::Button::new(label).min_size(egui::vec2(110.0, 0.0)))
     }
 
+    /// 组合键按钮(用户 2026-10-09 第 4 条):**一个**按钮捕获并显示一组键。
+    ///
+    /// 显示形如 `Ctrl+X`;未绑定显示"未绑定";等待输入显示"按下组合键..."。
+    /// 捕获规则:按下的键全部记下(最多两个),**全部松开**时落定 ——
+    /// 所以"按住 Ctrl 再按 X"与"按住 X 再按 Ctrl"都能得到同一个组合。
+    fn keys_button(ui: &mut egui::Ui, waiting: bool, keys: &KeySet) -> egui::Response {
+        let label = if waiting {
+            "按下按键...".to_string()
+        } else if keys.is_empty() {
+            "未绑定".to_string()
+        } else {
+            keys.label()
+        };
+        ui.add(egui::Button::new(label).min_size(egui::vec2(110.0, 0.0)))
+            .on_hover_text(
+                "点一下开始捕获:按住 Ctrl 再按另一个键就是一个组合键(最多两个键);\
+                 按顺序无关 —— Ctrl+X 与 X+Ctrl 都生效。\n\
+                 只按一个键就是单键绑定。滚轮不能绑在这里。",
+            )
+    }
+
+    /// 把一个「就地取消 / 停止」控件的位置登记下来,供**下一帧**处理输入时使用。
+    ///
+    /// 为什么需要(用户 2026-10-10 第 1 条):捕获 / 录制期间,用户点"取消"的那一下
+    /// 本身也是一次鼠标按键事件,而 `gui_rx` 里的输入是在同一帧界面绘制**之前**
+    /// 处理的 —— 等界面画到取消按钮、`clicked()` 亮起来时,这一下可能已经
+    ///   ① 记进了 `capture_down`/`capture_seen`(组合键还会在松开时直接落定成绑定);
+    ///   ② 被宏录制记成一步。
+    /// 所以把上一帧取消控件的位置存进 egui 临时存储,处理输入时看到落在这些矩形里的
+    /// **按下就整体丢掉**,连记都不记(见 [`App::swallow_cancel_click`])。
+    ///
+    /// 每帧开头会清空重填(`ui()` 里),于是输入阶段读到的一定是**上一帧**的位置
+    /// —— 也正是"用户当下看到的那一版界面"。
+    fn note_cancel_zone(ui: &egui::Ui, r: &egui::Response) {
+        ui.memory_mut(|m| {
+            let mut zones = m
+                .data
+                .get_temp::<Vec<egui::Rect>>(cancel_zones_id())
+                .unwrap_or_default();
+            zones.push(r.rect);
+            m.data.insert_temp(cancel_zones_id(), zones);
+        });
+    }
+
+    /// 这一条输入事件是不是"按在就地取消/停止控件上"的那一下,该整体丢掉。
+    ///
+    /// 按下丢掉之后,它的**抬起**也要一起丢(`swallowed_buttons`)— 半吞会留下
+    /// "没按过就抬起"的孤儿事件:组合键捕获会因为"全部松开"而落定一个空组合,
+    /// 宏录制会多记一步无效动作。
+    ///
+    /// 只看鼠标键([`crate::keymap::is_mouse_button`]):能被"按在按钮上"的只有鼠标,
+    /// 键盘键永远不该因此被吞。
+    fn swallow_cancel_click(&mut self, ctx: &egui::Context, code: u16, pressed: bool) -> bool {
+        if !crate::keymap::is_mouse_button(code) {
+            return false;
+        }
+        if !pressed {
+            // 抬起:只有当初按下被吞过的那一下才跟着丢。
+            return if let Some(i) = self.swallowed_buttons.iter().position(|k| *k == code) {
+                self.swallowed_buttons.remove(i);
+                true
+            } else {
+                false
+            };
+        }
+        let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) else {
+            return false;
+        };
+        let hit = ctx.memory(|m| {
+            m.data
+                .get_temp::<Vec<egui::Rect>>(cancel_zones_id())
+                .unwrap_or_default()
+                .iter()
+                .any(|r| r.contains(pos))
+        });
+        if hit {
+            self.swallowed_buttons.push(code);
+        }
+        hit
+    }
+
+    /// 「取消设置」按钮(用户 2026-10-10 第 3 条)。
+    ///
+    /// 风味要求"有始必有终":点了绑定按钮就开始等键,必须有同样显眼的出口。
+    /// 原来的 [清除] 只在**已绑定**时出现 —— 于是"点错了想退出捕获"这一路没有
+    /// 按钮可点,只能去点别处。现在这一个按钮在两种状态下都在,一次点击把两件事
+    /// 都收干净:等待捕获中 = 取消这次捕获(**不动已有的绑定**);已有绑定 =
+    /// 清掉这个绑定。调用方据此决定"只取消"还是"取消 + 清空"。
+    ///
+    /// 返回是否被点击。悬停提示按当前状态给,避免同一个按钮说两件事。
+    fn cancel_bind_button(ui: &mut egui::Ui, waiting: bool) -> bool {
+        let r = ui.small_button("取消设置").on_hover_text(if waiting {
+            "取消这次按键捕获;已有的绑定保持不变"
+        } else {
+            "清掉这个绑定(恢复“未绑定”)"
+        });
+        Self::note_cancel_zone(ui, &r);
+        // **按下**即生效,不等松开(用户 2026-10-10 第 1 条)。等松开的话,这一下
+        // 点击的"抬起"边沿会先把组合键落定成绑定,取消就晚了半拍 —— 正是用户
+        // 遇到的那个"取消了却把鼠标左键绑上去了"。
+        r.is_pointer_button_down_on() || r.clicked()
+    }
+
     /// "浏览器标签页"式的方形标签按钮(不立体、大小不变)。
     /// 右栏四标签页与可视化风格的操作栏按钮统一用它,观感一致。
     ///
@@ -2247,6 +2994,19 @@ impl PadApp {
     /// 强调色做低透明度底色 + 半透明描边，既与背景有区分，又不会像实心
     /// 按钮一样抢视觉。底色/边框都只改变 alpha，暗色与浅色主题共用一套做法。
     fn tab_button(ui: &mut egui::Ui, label: &str, selected: bool, accent: egui::Color32) -> bool {
+        Self::tab_button_resp(ui, label, selected, accent).clicked()
+    }
+
+    /// 方形标签按钮的 [`egui::Response`](不判点击)。
+    ///
+    /// 只在需要按钮**矩形**的场合用:那就是"就地停止 / 取消"类按钮 —— 它们的位置
+    /// 要登记进取消区,好让按下它的那一下不被录进捕获/录制(`note_cancel_zone`)。
+    fn tab_button_resp(
+        ui: &mut egui::Ui,
+        label: &str,
+        selected: bool,
+        accent: egui::Color32,
+    ) -> egui::Response {
         let (fill_alpha, border_alpha) = if selected { (72, 224) } else { (26, 128) };
         let fill = theme::with_alpha(accent, fill_alpha);
         let stroke = egui::Stroke::new(1.0, theme::with_alpha(accent, border_alpha));
@@ -2257,7 +3017,6 @@ impl PadApp {
                 .corner_radius(3.0)
                 .min_size(egui::vec2(72.0, 24.0)),
         )
-        .clicked()
     }
 
     // ===================== 撤销 / 重做 =====================
@@ -2970,7 +3729,12 @@ impl PadApp {
             )
         };
         let mouse_found = self.mouse_found_flag.load(Ordering::Relaxed);
-        // 钩子安装结果(W0-11):bit0=键盘钩子,bit1=鼠标钩子,0=未知
+        // 钩子安装结果(W0-11):bit0=键盘钩子,bit1=鼠标钩子,0=未知。
+        //
+        // 只有 Windows 装低级钩子,下面那两条自检也在 `#[cfg(windows)]` 里,所以这个
+        // 取值在 Linux 上是纯多余的(WSL 的 `cargo check` 会报 unused variable)。
+        // **不能注释掉** —— Windows 构建要用。按平台收进 Windows 分支即可。
+        #[cfg(windows)]
         let hook_ok = self.hook_ok_flag.load(Ordering::Relaxed);
         let level = crate::diag::level();
         let log_path = crate::diag::path();
@@ -2979,6 +3743,10 @@ impl PadApp {
         ui.separator();
         ui.label("状态自检:");
         let mut blocker: Option<&str> = None;
+        // 下面 `#[cfg(windows)]` 那一块会 push 两条钩子自检;Linux 上不 push,于是这个
+        // `mut` 在 Linux 构建里没有用处(WSL 的 `cargo check` 会报 unused_mut)。
+        // 同样按平台标注,而不是把 push 注释掉 —— 那样 Windows 会少两条自检。
+        #[cfg_attr(not(windows), allow(unused_mut))]
         let mut checks: Vec<(bool, &str)> = vec![
             (
                 capture_err.is_none(),
@@ -3231,6 +3999,20 @@ impl eframe::App for PadApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
+        // 清空并重填"就地取消/停止控件"的位置表(见 [`Self::note_cancel_zone`])。
+        //
+        // 必须在**绘制之前**清:下面处理 `gui_rx` 的输入事件时读到的,就是**上一帧**
+        // 画出来的那一版位置 —— 也正是用户当下看到、并且手正按着的那一版。
+        ctx.memory_mut(|m| {
+            m.data
+                .insert_temp(cancel_zones_id(), Vec::<egui::Rect>::new());
+            // 「按后延迟」总开关本帧的取值:`tail_delay_widget` 据此决定逐条数字框是
+            // 可改还是灰显(见 `tail_delay_on_id`)。同一帧写一次、读一次。
+            m.data.insert_temp(
+                tail_delay_on_id(),
+                lock_shared(&self.shared).profile.tail_delay_enabled,
+            );
+        });
         self.poll_debug_rx();
         self.poll_adb_run();
         self.maybe_refresh_debug_info();
@@ -3596,6 +4378,15 @@ impl eframe::App for PadApp {
             gui_events.push(ev);
         }
         for ev in gui_events {
+            // ---- 「按下取消的那一刻」把这一下整体丢掉(用户 2026-10-10 第 1 条)----
+            // 用户用来**退出**捕获/录制的那个按钮,自己也是一次鼠标按键;这几行就是
+            // 让"点取消"不留下任何录入痕迹。放在**所有**录入路径(宏录制 / 组合键 /
+            // 单键)之前 —— 三条路都会把这一下当成用户的输入。
+            if let CaptureEvent::Button { code, pressed, .. } = ev {
+                if self.swallow_cancel_click(ui.ctx(), code, pressed) {
+                    continue;
+                }
+            }
             if let Some(rec) = self.macro_recording.as_mut() {
                 if let CaptureEvent::Button { code, pressed, .. } = ev {
                     // W1-1:按事件的**捕获时刻**记步骤 —— 以前用收到事件的时刻,
@@ -3604,9 +4395,48 @@ impl eframe::App for PadApp {
                 }
                 continue;
             }
-            if let (Some(slot), Some(code)) = (self.waiting_key, ev.pressed_code()) {
-                self.waiting_key = None;
-                self.assign_key(slot, code);
+            if let CaptureEvent::Button { code, pressed, .. } = ev {
+                // ---- 组合键捕获(系统键那类槽位;见 `waiting_keys`) ----
+                // 与下面的单键捕获互斥:一次只会武装其中一个。
+                if let Some(slot) = self.waiting_keys {
+                    if crate::keymap::is_wheel_code(code) {
+                        // 滚轮没有"抬起"边沿,做不了组合键;与单键那条路同一句提示。
+                        self.log("滚轮不能这样绑定:鼠标键位请用[鼠标映射]下拉选择");
+                        continue;
+                    }
+                    if pressed {
+                        if self.capture_seen.len() < 2 && !self.capture_seen.contains(&code) {
+                            self.capture_seen.push(code);
+                        }
+                        if !self.capture_down.contains(&code) {
+                            self.capture_down.push(code);
+                        }
+                    } else {
+                        self.capture_down.retain(|k| *k != code);
+                        // 全部松开 = 这一轮输入结束:按**规范顺序**落定(修饰键在前),
+                        // 于是界面上显示成 `Ctrl+X` 而不是用户真实的按下顺序。
+                        if self.capture_down.is_empty() && !self.capture_seen.is_empty() {
+                            let keys = crate::keymap::canonical_chord(&self.capture_seen);
+                            self.waiting_keys = None;
+                            self.capture_down.clear();
+                            self.capture_seen.clear();
+                            self.assign_keys(slot, keys);
+                        }
+                    }
+                    continue;
+                }
+                if let (Some(slot), true) = (self.waiting_key, pressed) {
+                    // 用户 2026-10-09(第 3 条"滚动"):滚轮不从这条路写进任何等待槽。
+                    // 否则在清单上滚一下鼠标,当时等着接收的那个键位就被改成"滚轮上滚/下滚"了
+                    // —— 鼠标滚轮只认[鼠标映射]那份下拉(`mouse_key_choices`),那个入口不走这里。
+                    // **保持武装**:提示一句,用户接着按真正的键仍然有效,不必重新点一次。
+                    if crate::keymap::is_wheel_code(code) {
+                        self.log("滚轮不能这样绑定:鼠标键位请用[鼠标映射]下拉选择;若要绑键盘键请直接按键");
+                    } else {
+                        self.waiting_key = None;
+                        self.assign_key(slot, code);
+                    }
+                }
             }
         }
         if self
@@ -3669,7 +4499,7 @@ impl eframe::App for PadApp {
                 // 含 anchor_set:未取锚点时引擎不会缩滚轮,捕获层也不能吞)
                 let fps_active =
                     aim.enabled && live.mode_active && !live.suspended && aim.anchor_set();
-                let mut bits = 0u8;
+                let mut bits = 0u16;
                 for b in &g.profile.binds {
                     // 仅 FPS 的绑定在非 FPS 模式里并不生效,不能占着吞掉位 ——
                     // 否则用户平时按 Esc 也会被吞(映射里那条 fps_only 还没生效)。
@@ -3827,7 +4657,11 @@ impl eframe::App for PadApp {
 
                         ui.separator();
                         let tk = lock_shared(&self.shared).profile.toggle_key;
-                        let tkn = key_name(tk).replace("KEY_", "");
+                        let tkn = if tk.is_empty() {
+                            "未绑定".to_string()
+                        } else {
+                            tk.label().replace("KEY_", "")
+                        };
                         let txt = if enabled {
                             format!("映射: 开 ({tkn})")
                         } else {
@@ -3847,20 +4681,33 @@ impl eframe::App for PadApp {
                         }
 
                         ui.separator();
+                        // 这个按钮随任务出现/消失,标签还长短不一。按内容排布的话,
+                        // 它每弹一次都会把右边的[关于]和这一排挤得左右横跳、甚至换行。
+                        // 所以按**最长**的那个标签预留固定宽度的槽位:没任务时槽位留空,
+                        // 位置一点不动(用户 2026-10-09)。
+                        let slot = egui::vec2(
+                            Self::cancel_button_slot_width(ui),
+                            ui.spacing().interact_size.y,
+                        );
+                        let (rect, _) = ui.allocate_exact_size(slot, egui::Sense::hover());
+                        // 有任务时这一个按钮也是"就地取消"控件:按下它的那一下同样
+                        // 不该被记进任何捕获/录制(见 `note_cancel_zone`)。
+                        let mut cancel_resp: Option<egui::Response> = None;
                         if let Some(label) = self.pending_task_label() {
-                            if ui
-                                .add(
-                                    egui::Button::new(format!("取消{label}"))
-                                        .fill(th.danger.gamma_multiply(0.35))
-                                        .stroke(egui::Stroke::new(
-                                            1.0,
-                                            theme::with_alpha(th.danger, 190),
-                                        )),
-                                )
-                                .clicked()
-                            {
-                                self.cancel_pending_tasks();
-                            }
+                            let r = ui.put(
+                                rect,
+                                egui::Button::new(format!("取消{label}"))
+                                    .fill(th.danger.gamma_multiply(0.35))
+                                    .stroke(egui::Stroke::new(
+                                        1.0,
+                                        theme::with_alpha(th.danger, 190),
+                                    )),
+                            );
+                            Self::note_cancel_zone(ui, &r);
+                            cancel_resp = Some(r);
+                        }
+                        if cancel_resp.is_some_and(|r| r.clicked()) {
+                            self.cancel_pending_tasks();
                         }
                         if ui.button("关于").clicked() {
                             self.about_open = true;
@@ -3896,8 +4743,28 @@ impl eframe::App for PadApp {
                         .id_salt("left_cfg")
                         .max_height(cfg_max_h)
                         .show(ui, |ui| {
+                            // 用户 2026-10-10(小改动 2):"使用说明"按钮长宽各 ×1.5 ——
+                            // 它是"不会用的时候第一个要找的按钮"。按按钮自己的排版量出
+                            // 常规尺寸再乘 1.5,字号、内边距跟主题走,不写死像素。
+                            let help_size = {
+                                let font = egui::TextStyle::Button.resolve(ui.style());
+                                let text_w = ui
+                                    .painter()
+                                    .layout_no_wrap(
+                                        "使用说明".to_owned(),
+                                        font,
+                                        egui::Color32::WHITE,
+                                    )
+                                    .size()
+                                    .x;
+                                let sp = ui.spacing();
+                                [
+                                    (text_w + 2.0 * sp.button_padding.x) * 1.5,
+                                    sp.interact_size.y * 1.5,
+                                ]
+                            };
                             if ui
-                                .button("使用说明")
+                                .add_sized(help_size, egui::Button::new("使用说明"))
                                 .on_hover_text("打开使用说明(独立窗口:左侧章节索引,右侧图文与示例)")
                                 .clicked()
                             {
@@ -4098,6 +4965,9 @@ impl eframe::App for PadApp {
         self.ui_debug_overlay(ctx);
         self.ui_log_window(ctx);
         self.ui_macro_virtual_window(ctx);
+        // 截图小窗放在扩展宏弹窗**之后**:两者都在时,小窗要压在上面(它本来就是
+        // "浮在最上面看"的用途)。
+        self.ui_shot_window(ctx);
 
         // ================= 参数助手窗口 =================
         self.ui_args_helper(ctx);
@@ -4524,6 +5394,24 @@ impl PadApp {
                 }
             }
 
+            // 「按后延迟」(用户 2026-10-10 第 2 条):这条键位自己的冷却,所有
+            // 动作类型(含宏触发)通吃,所以放在行尾、与动作细节无关的位置。
+            if let Some(old) = {
+                let g = lock_shared(&self.shared);
+                g.profile.binds.get(i).map(|b| b.tail_delay_ms)
+            } && let Some(new) = Self::tail_delay_widget(ui, old)
+            {
+                // 快照必须是"改动之前":先取整份配置,再把这一条换回旧值。
+                let mut snapshot = lock_shared(&self.shared).profile.clone();
+                if let Some(b) = snapshot.binds.get_mut(i) {
+                    b.tail_delay_ms = old;
+                }
+                self.push_undo_snapshot(snapshot);
+                if let Some(b) = lock_shared(&self.shared).profile.binds.get_mut(i) {
+                    b.tail_delay_ms = new;
+                }
+            }
+
             if ui.button("删除").clicked() {
                 to_delete = Some(i);
             }
@@ -4664,6 +5552,10 @@ impl PadApp {
                     });
                 }
             }
+            // 「按后延迟」(用户 2026-10-10 第 2 条):与可视化页的草稿编辑器同一份控件。
+            if let Some(v) = Self::tail_delay_widget(ui, self.draft.tail_delay_ms) {
+                self.draft.tail_delay_ms = v;
+            }
             if ui.button("新增").clicked() {
                 self.commit_draft();
             }
@@ -4720,6 +5612,7 @@ impl PadApp {
             action,
             // FPS 页建的草稿只入"仅 FPS"键位;键位页建的为普通键位
             fps_only: self.draft.fps_only,
+            tail_delay_ms: self.draft.tail_delay_ms,
         });
         self.draft.key = None;
         // 添加完成即彻底收尾:草稿预览、取点、改范围等交互全部结束,
@@ -4755,17 +5648,40 @@ impl PadApp {
             self.ui_binds_list(ui);
             ui.separator();
             if !self.vk_bottom_add_active {
-                if Self::tab_button(ui, "＋ 新增按键映射", false, self.theme().ok) {
-                    self.cancel_draft();
-                    self.reset_draft_to_screen();
-                    self.draft.key = None;
-                    self.draft.fps_only = false;
-                    self.draft_active = true;
-                    self.vk_sel = None;
-                    self.waiting_key = Some(KeySlot::NewBind);
-                    self.vk_bottom_add_active = true;
-                    self.scroll_to_new = true;
-                }
+                ui.horizontal(|ui| {
+                    if Self::tab_button(ui, "＋ 新增按键映射", false, self.theme().ok) {
+                        self.cancel_draft();
+                        self.reset_draft_to_screen();
+                        self.draft.key = None;
+                        self.draft.fps_only = false;
+                        self.draft_active = true;
+                        self.vk_sel = None;
+                        self.waiting_key = Some(KeySlot::NewBind);
+                        self.vk_bottom_add_active = true;
+                        self.scroll_to_new = true;
+                    }
+                    // 鼠标键位**不走**"按任意键"那条 UI:按下鼠标就等于在截图上点了
+                    // 一下,会和取点打架。这里下拉直接选是哪个键(用户 2026-10-09)。
+                    // 选完与键盘那条路完全一致 —— 草稿照样从这里开始,后面照常取点/设动作。
+                    ui.menu_button("＋ 新增鼠标按键映射", |ui| {
+                        for (code, name) in mouse_key_choices() {
+                            if ui.button(name).clicked() {
+                                self.cancel_draft();
+                                self.reset_draft_to_screen();
+                                self.draft.key = Some(code);
+                                self.draft.fps_only = false;
+                                self.draft_active = true;
+                                self.vk_sel = None;
+                                self.waiting_key = None;
+                                self.vk_bottom_add_active = true;
+                                self.scroll_to_new = true;
+                                ui.close();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("触发键用鼠标某个键位(其余与[新增按键映射]完全一样)");
+                });
             } else {
                 self.ui_vk_draft(ui);
             }
@@ -4885,6 +5801,17 @@ impl PadApp {
                 m.entry(code).or_insert((c, tip));
             }
         }
+        /// 组合键槽位:集合里的每个键都亮起,悬停显示同一条说明(2026-10-09 第 4 条)。
+        fn put_set(
+            m: &mut std::collections::HashMap<u16, (egui::Color32, String)>,
+            keys: &KeySet,
+            c: egui::Color32,
+            tip: String,
+        ) {
+            for k in keys.iter() {
+                put(m, *k, c, tip.clone());
+            }
+        }
         let mut m = std::collections::HashMap::new();
         let th = self.theme();
         let g = lock_shared(&self.shared);
@@ -4898,7 +5825,7 @@ impl PadApp {
                     "宏",
                 )
             } else if b.fps_only {
-                (filters.fps, th.warn, "仅FPS")
+                (filters.fps, th.warn, "仅 FPS")
             } else {
                 (filters.binds, th.ok, "键位")
             };
@@ -4915,16 +5842,20 @@ impl PadApp {
             if !on {
                 continue;
             }
-            for (_, code) in w.active_dirs() {
-                put(&mut m, code, c, format!("摇杆#{}({tag}) 方向键", wi + 1));
+            for (_, keys) in w.active_dirs() {
+                for code in keys {
+                    put(&mut m, code, c, format!("摇杆#{}({tag}) 方向键", wi + 1));
+                }
             }
             if let Some(t) = w.temp.as_ref() {
-                put(
-                    &mut m,
-                    t.key,
-                    th.wheel_enable,
-                    format!("摇杆#{} {tag}启用键", wi + 1),
-                );
+                for code in t.key {
+                    put(
+                        &mut m,
+                        code,
+                        th.wheel_enable,
+                        format!("摇杆#{} {tag}启用键", wi + 1),
+                    );
+                }
             }
         }
         if filters.combos {
@@ -4939,9 +5870,9 @@ impl PadApp {
                 }
             }
             for (si, s) in g.switch_keys.iter().enumerate() {
-                put(
+                put_set(
                     &mut m,
-                    s.key,
+                    &s.effective_keys(),
                     th.accent,
                     format!("切换键位#{}(按下切到它指向的组合)", si + 1),
                 );
@@ -4949,33 +5880,33 @@ impl PadApp {
         }
         // 瞄准三键:属于 FPS 语义,受"显示FPS"勾选控制(FPS 页默认为真)
         if filters.fps {
-            put(
+            put_set(
                 &mut m,
-                p.aim.hold_key,
+                &p.aim.hold_key,
                 th.danger,
                 "FPS 瞄准门控键(按住开镜)".into(),
             );
-            put(
+            put_set(
                 &mut m,
-                p.aim.toggle_key,
+                &p.aim.toggle_key,
                 th.danger,
                 "FPS 模式独立开关".into(),
             );
-            put(
+            put_set(
                 &mut m,
-                p.aim.suspend_key,
+                &p.aim.suspend_key,
                 th.danger,
                 "按住暂时退出 FPS 并显示鼠标".into(),
             );
         }
-        put(
+        put_set(
             &mut m,
-            p.cursor_toggle_key,
+            &p.cursor_toggle_key,
             th.accent,
             "全局鼠标消隐切换键".into(),
         );
         // 总开关键两页都亮(全局键)
-        put(&mut m, p.toggle_key, th.danger, "映射总开关键".into());
+        put_set(&mut m, &p.toggle_key, th.danger, "映射总开关键".into());
         m
     }
 
@@ -4992,7 +5923,8 @@ impl PadApp {
                 .profile
                 .wheels
                 .get(i)
-                .and_then(|w| w.temp.as_ref().map(|t| t.key)),
+                .and_then(|w| w.temp.as_ref())
+                .and_then(|t| t.key.first().copied()),
             _ => None,
         }
     }
@@ -5004,23 +5936,29 @@ impl PadApp {
             VkSel::New => self.draft.key,
             VkSel::Bind(i) => g.profile.binds.get(i).map(|b| b.key),
             VkSel::Macro(i) => g.profile.binds.get(i).map(|b| b.key),
-            VkSel::Toggle => Some(g.profile.toggle_key),
-            VkSel::CursorToggle => Some(g.profile.cursor_toggle_key),
-            VkSel::AimHold => Some(g.profile.aim.hold_key),
-            VkSel::AimToggle => Some(g.profile.aim.toggle_key),
-            VkSel::AimSuspend => Some(g.profile.aim.suspend_key),
-            VkSel::WheelDir { wheel, dir } => g
-                .profile
-                .wheels
-                .get(wheel)
-                .and_then(|w| w.active_dirs().get(dir).map(|(_, key)| *key)),
+            // 组合键槽位:虚拟键盘只能加亮**一个**键,所以只取"正好单键"的那种
+            // (老配置与绝大多数槽位都是单键);组合键不在虚拟键盘上加亮。
+            VkSel::Toggle => g.profile.toggle_key.only(),
+            VkSel::CursorToggle => g.profile.cursor_toggle_key.only(),
+            VkSel::AimHold => g.profile.aim.hold_key.only(),
+            VkSel::AimToggle => g.profile.aim.toggle_key.only(),
+            VkSel::AimSuspend => g.profile.aim.suspend_key.only(),
+            VkSel::WheelDir { wheel, dir } => g.profile.wheels.get(wheel).and_then(|w| {
+                w.active_dirs()
+                    .get(dir)
+                    .and_then(|(_, key)| key.first().copied())
+            }),
             VkSel::WheelEnable(i) => g
                 .profile
                 .wheels
                 .get(i)
-                .and_then(|w| w.temp.as_ref().map(|t| t.key)),
-            VkSel::SwitchKey(i) => g.switch_keys.get(i).map(|s| s.key),
-            VkSel::SwitchKeySecond(i) => g.switch_keys.get(i).and_then(|s| s.keys.get(1)).copied(),
+                .and_then(|w| w.temp.as_ref())
+                .and_then(|t| t.key.first().copied()),
+            VkSel::SwitchKey(i) => g
+                .switch_keys
+                .get(i)
+                .map(|s| s.effective_keys())
+                .and_then(|k| k.only()),
             VkSel::ComboKey { combo, slot } => g
                 .profile
                 .combos
@@ -5044,40 +5982,40 @@ impl PadApp {
                 VkSel::Bind(i)
             });
         }
-        if p.toggle_key == code {
+        // 组合键槽位按"成员"命中(点组合里的任一键都能落到这一槽)。
+        if p.toggle_key.contains(&code) {
             return Some(VkSel::Toggle);
         }
-        if p.cursor_toggle_key == code {
+        if p.cursor_toggle_key.contains(&code) {
             return Some(VkSel::CursorToggle);
         }
-        if p.aim.hold_key == code {
+        if p.aim.hold_key.contains(&code) {
             return Some(VkSel::AimHold);
         }
-        if p.aim.toggle_key == code {
+        if p.aim.toggle_key.contains(&code) {
             return Some(VkSel::AimToggle);
         }
-        if p.aim.suspend_key == code {
+        if p.aim.suspend_key.contains(&code) {
             return Some(VkSel::AimSuspend);
         }
         for (wi, w) in p.wheels.iter().enumerate() {
+            // 组合键方向键按**成员**命中(点组合里的任一键都能落到这一槽),
+            // 与上面几个 `KeySet` 槽位同口径。
             for (dir, (_, kc)) in w.active_dirs().iter().enumerate() {
-                if *kc == code {
+                if kc.contains(&code) {
                     return Some(VkSel::WheelDir { wheel: wi, dir });
                 }
             }
-            if w.temp.as_ref().map(|t| t.key) == Some(code) {
+            if w.temp.as_ref().is_some_and(|t| t.key.contains(&code)) {
                 return Some(VkSel::WheelEnable(wi));
             }
-        }
-        if let Some(i) = g.switch_keys.iter().position(|s| s.key == code) {
-            return Some(VkSel::SwitchKey(i));
         }
         if let Some(i) = g
             .switch_keys
             .iter()
-            .position(|s| s.keys.get(1).copied() == Some(code))
+            .position(|s| s.effective_keys().contains(&code))
         {
-            return Some(VkSel::SwitchKeySecond(i));
+            return Some(VkSel::SwitchKey(i));
         }
         for (ci, c) in p.combos.iter().enumerate() {
             if let Some(si) = c.keys.iter().position(|&k| k == code) {
@@ -5206,6 +6144,7 @@ impl PadApp {
                     radius: crate::keymap::DEFAULT_RADIUS,
                 },
                 fps_only: fps_tab,
+                tail_delay_ms: crate::keymap::DEFAULT_TAIL_DELAY_MS,
             });
             g.profile.combos.len() - 1
         };
@@ -5269,6 +6208,7 @@ impl PadApp {
                                 radius: crate::keymap::DEFAULT_RADIUS,
                             },
                             fps_only: fps_tab,
+                            tail_delay_ms: crate::keymap::DEFAULT_TAIL_DELAY_MS,
                         });
                         self.vk_combo_pending.clear();
                         self.scroll_to_new = true;
@@ -5347,7 +6287,9 @@ impl PadApp {
                     self.theme().warn,
                     format!("取点中: {name} —— 点击截图选点,或"),
                 );
-                if Self::tab_button(ui, "取消取点", false, self.theme().danger) {
+                let cancel = Self::tab_button_resp(ui, "取消取点", false, self.theme().danger);
+                Self::note_cancel_zone(ui, &cancel);
+                if cancel.clicked() {
                     self.cancel_draft();
                     self.vk_sel = None;
                     self.log("已取消取点");
@@ -5450,7 +6392,7 @@ impl PadApp {
             VkSel::Toggle => self.ui_vk_special(ui, KeySlot::Toggle, "总开关键"),
             VkSel::CursorToggle => self.ui_vk_special(ui, KeySlot::CursorToggle, "鼠标消隐切换键"),
             VkSel::AimHold => self.ui_vk_special(ui, KeySlot::AimHold, "FPS 瞄准门控键"),
-            VkSel::AimToggle => self.ui_vk_special(ui, KeySlot::AimToggle, "FPS 独立开关"),
+            VkSel::AimToggle => self.ui_vk_special(ui, KeySlot::AimToggle, "FPS 模式开关键"),
             VkSel::AimSuspend => self.ui_vk_special(ui, KeySlot::AimSuspend, "FPS 暂时退出键"),
             VkSel::WheelDir { wheel, dir } => {
                 self.ui_vk_special(ui, KeySlot::WheelDir { wheel, dir }, "摇杆方向键")
@@ -5459,9 +6401,6 @@ impl PadApp {
                 self.ui_vk_special(ui, KeySlot::WheelEnable(i), "摇杆临时启用键")
             }
             VkSel::SwitchKey(i) => self.ui_vk_special(ui, KeySlot::SwitchKey(i), "组合切换键"),
-            VkSel::SwitchKeySecond(i) => {
-                self.ui_vk_special(ui, KeySlot::SwitchKeySecond(i), "组合切换键第二位")
-            }
             VkSel::ComboKey { combo, slot } => {
                 self.ui_vk_special(ui, KeySlot::ComboKey { combo, slot }, "组合键成员")
             }
@@ -5487,7 +6426,13 @@ impl PadApp {
             ui.checkbox(&mut self.macro_show_events, "显示录制事件")
                 .on_hover_text("默认只显示结果摘要；录制长按时不会把自动重复显示成连续点击");
             if self.macro_recording.is_some() {
-                if Self::tab_button(ui, "停止录制", false, th.danger) {
+                // 登记取消区:录制期间点[停止录制]的那一下鼠标按键**本身也会被录成
+                // 一步** —— 输入事件在同一帧的绘制之前处理,等按钮亮起时它已经进
+                // `record_macro_button` 了。登记之后 `swallow_cancel_click` 会把这一下
+                // (连同它的抬起)整体丢掉(与顶栏[取消按键捕获]是同一个坑)。
+                let stop = Self::tab_button_resp(ui, "停止录制", false, th.danger);
+                Self::note_cancel_zone(ui, &stop);
+                if stop.clicked() {
                     self.finish_macro_recording();
                 }
                 // 录制中也能看步骤:先看步骤、再决定要不要保存(用户 2026-10-07)
@@ -5523,7 +6468,7 @@ impl PadApp {
             if Self::tab_button(ui, "清空", false, th.accent) {
                 self.reset_macro_draft();
             }
-            if visual && Self::tab_button(ui, "扩展宏...", false, th.accent) {
+            if Self::tab_button(ui, "扩展宏...", false, th.accent) {
                 self.open_macro_virtual_editor();
             }
         });
@@ -5536,10 +6481,28 @@ impl PadApp {
                 self.log("请按任意键作为宏触发键");
             }
             ui.checkbox(&mut self.macro_page_fps_only, "仅 FPS");
+            // 「按后延迟」(用户 2026-10-10 第 2 条):宏触发键自己的一份。
+            // 整条宏跑完才开始算冷却 —— 连按宏键不会让两次执行叠在一起。
+            if let Some(v) = Self::tail_delay_widget(ui, self.macro_page_tail_delay_ms) {
+                self.macro_page_tail_delay_ms = v;
+            }
             let ready = self.macro_page_key.is_some()
                 && (!self.macro_page_steps.is_empty() || !self.macro_page_instructions.is_empty());
+            // 用户 2026-10-10(第 1 条):载入编辑后,这一格就是"改这一条宏"。
+            // 于是按钮按状态改名 —— 编辑中叫[保存宏](覆盖载入的那条),
+            // 同时多出[另存为宏](行为 = 从前的[新建宏]:另 push 一条新的)。
+            // 没载入时仍是[新建宏]一条路,不出现多余按钮。
+            let editing = self.macro_loaded_index.is_some();
             ui.add_enabled_ui(ready, |ui| {
-                if Self::tab_button(ui, "新建宏", false, th.ok) {
+                if Self::tab_button(ui, if editing { "保存宏" } else { "新建宏" }, false, th.ok)
+                {
+                    if editing {
+                        self.macro_save_over_loaded();
+                    } else {
+                        self.macro_add_from_page();
+                    }
+                }
+                if editing && Self::tab_button(ui, "另存为宏", false, th.accent) {
                     self.macro_add_from_page();
                 }
             });
@@ -5548,6 +6511,68 @@ impl PadApp {
                 self.log("已取消宏编辑");
             }
         });
+
+        // ---------- 2026-10-09:宏草稿库(草稿长期保存 / 之后自如取用) ----------
+        // 编辑区这一份(步骤 + 设置项 + 虚拟键位层 + 触发键)就是"草稿"。想留着下次接着改,
+        // 就在这里起个名字存起来;下拉选中后[载入]取回。操作与「手动 adb 命令」的用户预设
+        // 一模一样,学一个会一个。
+        ui.horizontal(|ui| {
+            ui.label("草稿库:").on_hover_text(
+                "把编辑区现在这份内容(步骤 + 设置项 + 触发键 + 扩展宏虚拟键位)\
+                 起个名字长期留着,以后选中它点[载入]就能接着改",
+            );
+            let sel_text = self
+                .macro_draft_sel
+                .and_then(|i| self.macro_drafts.get(i))
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| "（未选择）".into());
+            egui::ComboBox::from_id_salt("macro_draft_pick")
+                .selected_text(sel_text)
+                .show_ui(ui, |ui| {
+                    if self.macro_drafts.is_empty() {
+                        ui.weak("（还没有存过草稿）");
+                    }
+                    for (i, d) in self.macro_drafts.iter().enumerate() {
+                        ui.selectable_value(&mut self.macro_draft_sel, Some(i), &d.name);
+                    }
+                });
+            let picked = self
+                .macro_draft_sel
+                .is_some_and(|i| i < self.macro_drafts.len());
+            ui.add_enabled_ui(picked, |ui| {
+                if Self::tab_button(ui, "载入", false, th.accent) {
+                    self.macro_draft_load();
+                }
+            });
+            if Self::tab_button(ui, "另存当前草稿…", false, th.ok) {
+                self.macro_draft_save_open = !self.macro_draft_save_open;
+            }
+            ui.add_enabled_ui(picked, |ui| {
+                if Self::tab_button(ui, "删除", false, th.danger) {
+                    self.macro_draft_delete();
+                }
+            });
+        });
+        if self.macro_draft_save_open {
+            ui.horizontal(|ui| {
+                ui.label("草稿名:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.macro_draft_name)
+                        .desired_width(160.0)
+                        .hint_text("给这份草稿起个名字"),
+                );
+                if Self::tab_button(ui, "保存", false, th.ok) {
+                    self.macro_draft_save();
+                }
+                if Self::tab_button(ui, "取消", false, th.accent) {
+                    self.macro_draft_save_open = false;
+                }
+                ui.small("同名草稿要先删除,再存一次");
+            });
+        }
+        if let Some((ok, msg)) = self.macro_draft_msg.clone() {
+            ui.colored_label(if ok { th.ok } else { th.danger }, msg);
+        }
 
         let mut open_extended_editor = false;
         let virtual_profile_snapshot = self.macro_page_virtual_profile.clone();
@@ -5562,7 +6587,7 @@ impl PadApp {
                 if Self::tab_button(ui, "清除扩展", false, th.danger) {
                     self.macro_page_virtual_profile = None;
                 }
-                if visual && Self::tab_button(ui, "编辑扩展宏...", false, th.accent) {
+                if Self::tab_button(ui, "编辑扩展宏...", false, th.accent) {
                     open_extended_editor = true;
                 }
             });
@@ -5612,7 +6637,7 @@ impl PadApp {
         ui.horizontal(|ui| {
             ui.strong("设置宏");
             ui.small("把按键、组合键、轮盘、FPS、点击、滑动、间隔和嵌套宏编排成一次操作");
-            if visual && Self::tab_button(ui, "扩展宏...", false, th.accent) {
+            if Self::tab_button(ui, "扩展宏...", false, th.accent) {
                 self.open_macro_virtual_editor();
             }
         });
@@ -5777,11 +6802,11 @@ impl PadApp {
             let loaded = {
                 let g = lock_shared(&self.shared);
                 g.profile.binds.get(i).and_then(|b| match &b.action {
-                    Action::Macro(m) => Some((b.key, m.clone(), b.fps_only)),
+                    Action::Macro(m) => Some((b.key, m.clone(), b.fps_only, b.tail_delay_ms)),
                     _ => None,
                 })
             };
-            if let Some((key, action, fps)) = loaded {
+            if let Some((key, action, fps, tail)) = loaded {
                 self.macro_page_key = Some(key);
                 self.macro_page_steps = action.steps;
                 // 旧文件/手工编辑来的宏可能第一步带延迟(甚至是在"录制起点"
@@ -5790,9 +6815,10 @@ impl PadApp {
                 self.macro_page_instructions = action.instructions;
                 self.macro_page_virtual_profile = action.virtual_profile.as_deref().cloned();
                 self.macro_page_fps_only = fps;
+                self.macro_page_tail_delay_ms = tail;
                 self.macro_loaded_index = Some(i);
                 self.waiting_key = None;
-                self.log("已载入宏步骤到编辑区；修改后点[新建宏]会保存为新宏");
+                self.log("已载入宏步骤到编辑区；改完点[保存宏]覆盖这一条，或[另存为宏]存成新宏");
             }
         }
         if let Some(i) = delete {
@@ -5820,12 +6846,121 @@ impl PadApp {
         self.macro_page_virtual_profile = None;
         self.macro_page_key = None;
         self.macro_page_fps_only = false;
+        self.macro_page_tail_delay_ms = crate::keymap::DEFAULT_TAIL_DELAY_MS;
         self.macro_loaded_index = None;
         self.picking = None;
         self.waiting_key = None;
     }
 
+    /// 「宏草稿库」:把编辑区当前这一份草稿按名字存起来(落 `macro_drafts.json`)。
+    ///
+    /// 与「手动 adb 命令」的[另存为预设]同一套规矩:名字不能空、同名不让覆盖
+    /// (要改就先删掉再存),写盘失败就**回滚内存**,不让界面和文件不一致。
+    fn macro_draft_save(&mut self) {
+        let name = self.macro_draft_name.trim().to_string();
+        if name.is_empty() {
+            self.macro_draft_msg = Some((false, "草稿名不能为空".into()));
+            return;
+        }
+        if self.macro_recording.is_some() {
+            self.macro_draft_msg = Some((false, "正在录制中,先停止录制再保存草稿".into()));
+            return;
+        }
+        if self.macro_page_key.is_none()
+            && self.macro_page_steps.is_empty()
+            && self.macro_page_instructions.is_empty()
+            && self.macro_page_virtual_profile.is_none()
+        {
+            self.macro_draft_msg = Some((false, "当前草稿是空的,没有可保存的内容".into()));
+            return;
+        }
+        if self.macro_drafts.iter().any(|d| d.name == name) {
+            self.macro_draft_msg =
+                Some((false, format!("已存在同名草稿 {name}(先删除它或换个名字)")));
+            return;
+        }
+        self.macro_drafts.push(MacroDraft {
+            name: name.clone(),
+            key: self.macro_page_key,
+            fps_only: self.macro_page_fps_only,
+            tail_delay_ms: self.macro_page_tail_delay_ms,
+            steps: self.macro_page_steps.clone(),
+            instructions: self.macro_page_instructions.clone(),
+            virtual_profile: self.macro_page_virtual_profile.clone(),
+        });
+        match save_macro_drafts(&macro_drafts_path(), &self.macro_drafts) {
+            Ok(()) => {
+                self.macro_draft_sel = Some(self.macro_drafts.len() - 1);
+                self.macro_draft_save_open = false;
+                self.macro_draft_name.clear();
+                self.macro_draft_msg = Some((true, format!("已保存草稿: {name}")));
+                self.log(format!("宏草稿已保存: {name}"));
+            }
+            Err(e) => {
+                self.macro_drafts.pop();
+                self.macro_draft_msg = Some((false, format!("草稿保存失败: {e}")));
+            }
+        }
+    }
+
+    /// 「宏草稿库」:把下拉选中的草稿取回编辑区(整份替换当前草稿)。
+    fn macro_draft_load(&mut self) {
+        let Some(i) = self
+            .macro_draft_sel
+            .filter(|i| *i < self.macro_drafts.len())
+        else {
+            return;
+        };
+        if self.macro_recording.is_some() {
+            self.macro_draft_msg = Some((false, "正在录制中,先停止录制再载入草稿".into()));
+            return;
+        }
+        let d = self.macro_drafts[i].clone();
+        self.macro_page_key = d.key;
+        self.macro_page_fps_only = d.fps_only;
+        self.macro_page_tail_delay_ms = d.tail_delay_ms;
+        self.macro_page_steps = d.steps;
+        self.macro_page_instructions = d.instructions;
+        self.macro_page_virtual_profile = d.virtual_profile;
+        // 取回来的是**草稿**,不是列表里已有的那条宏 —— "载入编辑/取消编辑"要复位,
+        // 否则按钮会显示成"取消编辑"却取消了一条跟当前草稿无关的宏。
+        self.macro_loaded_index = None;
+        self.macro_draft_msg = Some((true, format!("已载入草稿: {}", d.name)));
+        self.log(format!("宏草稿已载入: {}", d.name));
+    }
+
+    /// 「宏草稿库」:删除下拉选中的草稿(写盘失败就放回去)。
+    fn macro_draft_delete(&mut self) {
+        let Some(i) = self
+            .macro_draft_sel
+            .filter(|i| *i < self.macro_drafts.len())
+        else {
+            return;
+        };
+        let removed = self.macro_drafts.remove(i);
+        self.macro_draft_sel = None;
+        match save_macro_drafts(&macro_drafts_path(), &self.macro_drafts) {
+            Ok(()) => {
+                self.macro_draft_msg = Some((true, format!("已删除草稿: {}", removed.name)));
+                self.log(format!("宏草稿已删除: {}", removed.name));
+            }
+            Err(e) => {
+                // 写盘失败:放回去,别让界面和文件不一致
+                self.macro_drafts.insert(i, removed);
+                self.macro_draft_msg = Some((false, format!("删除失败(文件没写成功): {e}")));
+            }
+        }
+    }
+
     fn open_macro_virtual_editor(&mut self) {
+        // 已经开着就**不要**重建:重建会把用户没保存的虚拟键位悄悄丢掉,
+        // 还会把正进行中的取点/选键留在一个指向旧 profile 的下标上
+        // (用户要求:取消必须无残留、可逆、可预期 —— 静默丢内容不合这条)。
+        // 想重来请用弹窗自己的「取消」/「保存」,那两条路都是清干净的。
+        if self.macro_virtual_editor.is_some() {
+            self.log("扩展宏设置窗口已经打开(要重来请先在窗口里保存或取消)");
+            return;
+        }
         let (source_scheme, profile) = {
             let g = lock_shared(&self.shared);
             let source = g.active_scheme.min(g.schemes.len().saturating_sub(1));
@@ -5842,6 +6977,7 @@ impl PadApp {
             profile,
             selected_key: None,
             source_scheme,
+            newest: None,
         });
     }
 
@@ -5856,11 +6992,32 @@ impl PadApp {
         let mut open = true;
         let mut save = false;
         let mut cancel = false;
+        // R4(2026-10-08):本帧在弹窗里点出来的操作,统一攒到这里、等窗口收尾时落地
+        // (见 `apply_virtual_act`)。攒下来的另一个好处:关窗/取消时**不用逐个回滚** ——
+        // 直接丢掉这个列表,什么都没发生。
+        let mut acts: Vec<MacroVirtualAct> = Vec::new();
+        let mut add_combo = false;
+        let mut add_wheel = false;
+        let mut arm_new_key = false;
+        // 「鼠标映射」下拉里选中的键码(鼠标键按下=在图上点了一下,不能靠"按任意键")
+        let mut mouse_new_key: Option<u16> = None;
+        let mut shot = false;
+        // 本帧点了虚拟键盘上的键(虚拟取键的第二步);`(槽位, 键码)`
+        let mut virtual_key_hit: Option<(KeySlot, u16)> = None;
+        // 点了[取消取点]/[取消选键]:取消必须无残留 —— 只清虚拟槽位,不碰主界面的取点
+        let mut cancel_pending = false;
+        // 主题与换算器都在加锁之前取好(它们内部要读配置)。
+        let th = self.theme();
+        let am = self.mapper();
         egui::Window::new("扩展宏：虚拟键位")
             .open(&mut open)
             .default_size([760.0, 600.0])
             .min_size([520.0, 360.0])
             .resizable(true)
+            // 2026-10-09:窗口里多了"拼在下方的截图",内容高度会超过屏幕(竖屏截图尤其)。
+            // 允许整窗纵向滚动,保证最下面的[保存到宏草稿]/[取消]永远够得着 ——
+            // 否则窗口自己长到屏幕外,用户就"只能保存不了也取消不了"了。
+            .vscroll(true)
             .show(ctx, |ui| {
                 ui.label("先在这里模拟一套虚拟键位；宏执行时按这套位置和动作解析。关闭窗口或点取消会完全丢弃本次设置。");
                 ui.horizontal(|ui| {
@@ -5883,6 +7040,8 @@ impl PadApp {
                         editor.profile = inherited;
                         editor.source_scheme = source;
                         editor.selected_key = None;
+                        // 换了基底,旧的下标没有意义了(用户 2026-10-10 第 4 条)
+                        editor.newest = None;
                     }
                 });
                 ui.separator();
@@ -5918,7 +7077,11 @@ impl PadApp {
                     })
                     .inner;
                 if let Some(code) = clicked {
-                    if editor.profile.binds.iter().any(|b| b.key == code) {
+                    if let Some(slot) = self.waiting_key.filter(|s| s.is_virtual()) {
+                        // R4:举着"等一次键"的虚拟槽位时,这次点击交给它
+                        // (新建虚拟键位 / 组合键的某个键 / 轮盘的方向键或启用键)。
+                        virtual_key_hit = Some((slot, code));
+                    } else if editor.profile.binds.iter().any(|b| b.key == code) {
                         editor.selected_key = Some(code);
                     } else {
                         editor.profile.binds.push(KeyBind {
@@ -5930,14 +7093,88 @@ impl PadApp {
                                 radius: crate::keymap::DEFAULT_RADIUS,
                             },
                             fps_only: false,
+                            tail_delay_ms: crate::keymap::DEFAULT_TAIL_DELAY_MS,
                         });
                         editor.selected_key = Some(code);
                     }
                 }
                 ui.separator();
+                // ---------- R4(2026-10-08):新增项目 ----------
+                // 与主界面的"新增项目"栏同一套四类(按键/组合键/轮盘/锚点),也同一套
+                // 后续流程(点键 → 截图取点);区别只有一个:这里建出来的东西落在
+                // **虚拟层**(宏草稿)里,不碰实时配置。四类都能在截图上取点摆放。
+                // (2026-10-09 起截屏按钮不在这里了:截图整块挪到下方与本栏并列,
+                //  见下面"截图模块"那一段。)
+                ui.horizontal(|ui| {
+                    ui.label("新增项目:");
+                    if ui.button("＋ 按键").clicked() {
+                        arm_new_key = true;
+                    }
+                    if ui.button("＋ 组合键").clicked() {
+                        add_combo = true;
+                    }
+                    if ui.button("＋ 轮盘").clicked() {
+                        add_wheel = true;
+                    }
+                    if ui
+                        .button("＋ 锚点")
+                        .on_hover_text("锚点 = 鼠标瞄准时虚拟手指落下的起点(与主界面「取锚点」同一个东西)")
+                        .clicked()
+                    {
+                        acts.push(MacroVirtualAct::PickAimAnchor);
+                    }
+                    // 鼠标键位不走"按任意键":按下它本身就是在图上点了一下,会和取点打架。
+                    // 下拉里直接选,选完接**同一条**「＋按键」流程(建虚拟键位 → 取点)。
+                    ui.menu_button("鼠标映射", |ui| {
+                        for (code, name) in mouse_key_choices() {
+                            if ui.button(name).clicked() {
+                                mouse_new_key = Some(code);
+                                ui.close();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("把鼠标某个键位当作虚拟触发键(与「＋按键」同一条流程)");
+                });
+                // 待完成操作的状态条:每条等待都配一个[取消](有始必有终)。
+                let waiting_virtual = self.waiting_key.filter(|s| s.is_virtual());
+                if let Some(slot) = waiting_virtual {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            th.warn,
+                            format!("等待按键: {}。", Self::virtual_wait_hint(slot)),
+                        );
+                        if ui.button("取消选键").clicked() {
+                            cancel_pending = true;
+                        }
+                    });
+                }
+                if let Some(CoordSlot::MacroVirtual(pick)) = self.picking {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            th.warn,
+                            format!(
+                                "取点中: {}。请在下方截图(或小窗)上点击选点,或",
+                                Self::virtual_pick_hint(&editor.profile, pick)
+                            ),
+                        );
+                        let cancel = ui.button("取消取点");
+                        Self::note_cancel_zone(ui, &cancel);
+                        if cancel.clicked() {
+                            cancel_pending = true;
+                        }
+                    });
+                }
+                ui.separator();
                 if let Some(key) = editor.selected_key {
                     ui.horizontal(|ui| {
                         ui.strong(format!("虚拟键位: {}", key_name(key)));
+                        if let Some(index) = editor.profile.binds.iter().position(|b| b.key == key)
+                        {
+                            if ui.button("取点").clicked() {
+                                acts.push(MacroVirtualAct::PickBind(index));
+                            }
+                        }
                         if ui.small_button("删除键位").clicked() {
                             editor.profile.binds.retain(|b| b.key != key);
                             editor.selected_key = None;
@@ -5948,6 +7185,114 @@ impl PadApp {
                     }
                 } else {
                     ui.small("点击虚拟键盘上的键，可新增或编辑虚拟键位。");
+                }
+                ui.separator();
+                // ---------- R4(2026-10-08):虚拟层清单(组合键/轮盘/锚点) ----------
+                // 按键在上面那一段单独编辑(它有自己的选中态);这里把另外三类列出来,
+                // 每一项都能取点/取键/删除。清单行都是纯函数,动作回抛到 `acts`。
+                ui.label(format!(
+                    "虚拟层清单: {} 个按键 / {} 个组合键 / {} 个轮盘 / 锚点{}",
+                    editor.profile.binds.len(),
+                    editor.profile.combos.len(),
+                    editor.profile.wheels.len(),
+                    if editor.profile.aim.anchor_set() {
+                        "已设置"
+                    } else {
+                        "未设置"
+                    },
+                ));
+                egui::ScrollArea::vertical()
+                    .id_salt("macro_virtual_list")
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        for (i, combo) in editor.profile.combos.iter_mut().enumerate() {
+                            if let Some(act) =
+                                Self::ui_macro_virtual_combo(ui, i, combo, self.waiting_key)
+                            {
+                                acts.push(act);
+                            }
+                        }
+                        for (i, wheel) in editor.profile.wheels.iter_mut().enumerate() {
+                            if let Some(act) =
+                                Self::ui_macro_virtual_wheel(ui, i, wheel, &am, self.waiting_key)
+                            {
+                                acts.push(act);
+                            }
+                        }
+                        if let Some(act) = Self::ui_macro_virtual_aim(
+                            ui,
+                            &mut editor.profile.aim,
+                            &am,
+                            self.picking,
+                        ) {
+                            acts.push(act);
+                        }
+                    });
+                ui.separator();
+                // ---------- 2026-10-09:截图模块(拼在虚拟键位/虚拟层下方) ----------
+                // 用户反馈:取点跑到"外面的窗口"上去点太拧巴。这里把截图画布直接拼进弹窗,
+                // 「取点」之后鼠标不用离开窗口。摘出共用:`ui_shot_canvas` 与下方面板、
+                // 截图小窗是同一份(见它的文档注释),这里不复制第二套画布逻辑。
+                ui.horizontal(|ui| {
+                    let taking = self.shot_rx.is_some();
+                    if ui
+                        .button(if taking {
+                            "截图中..."
+                        } else {
+                            "截取手机屏幕"
+                        })
+                        .on_hover_text("重新抓一张手机截图;取点会落在新截图上")
+                        .clicked()
+                        && !taking
+                    {
+                        shot = true;
+                    }
+                    self.ui_shot_zoom_buttons(ui);
+                    // 同一个位置、两个名字的按钮来回切 —— 与下方面板里那个一模一样。
+                    let (win_label, win_hint) = if self.shot_window_open {
+                        ("关闭小窗", "把截图放回弹窗下方")
+                    } else {
+                        ("小窗悬浮", "把截图独立成一个可移动的小窗")
+                    };
+                    if ui.button(win_label).on_hover_text(win_hint).clicked() {
+                        self.shot_window_open = !self.shot_window_open;
+                        // 从扩展宏弹窗开的:小窗也画虚拟键位层(用户 2026-10-10 第 4 条)
+                        self.shot_window_virtual = self.shot_window_open;
+                        // 窗口尺寸由小窗自己按当前倍率算(见 `ui_shot_window`),这里不传。
+                    }
+                    if self.shot_window_open {
+                        ui.checkbox(&mut self.shot_window_pin, "置顶")
+                            .on_hover_text("勾上:小窗固定在其他窗口上方;不勾:可以被其他窗口盖住");
+                    }
+                });
+                if !self.shot_window_open {
+                    // 画布与取点都要"看见"这份虚拟键位表:`draw_overlay` 靠
+                    // `self.macro_virtual_editor` 决定画哪一层,`assign_virtual_coord` 也写在
+                    // 它上面。而这个函数开头把编辑器取成了局部变量,所以这里**整段弹窗期间**
+                    // 都把这份表放回 `App`,画完再把 profile 合并回来(只有 profile 会被画布改写)。
+                    //
+                    // 用户 2026-10-10(第 4 条):旧写法只在"正在虚拟取点"那一帧才注入,于是
+                    // ①换成继承键位后截图上看不到继承来的键位 ②新加的点取完就闪没了 ——
+                    // 两个现象同一个根因:不取点的那些帧画的是实时配置。现在无条件注入,
+                    // 画布始终画这份虚拟层(不取点时它不会被改写,合并回来是等价的)。
+                    self.macro_virtual_editor = Some(editor.clone());
+                    // 分界条 + 定高的画布区:高度由用户拖出来(`macro_shot_height`),
+                    // 画布按这块地方等比内接(见 `ui_shot_canvas` / `screenshot_fit_scale`),
+                    // 所以图不会被上面的文字压住,也不会缩在一个固定高度的滚动区里出不来。
+                    self.ui_shot_divider(ui);
+                    let h = self
+                        .macro_shot_height
+                        .clamp(MACRO_SHOT_MIN_H, MACRO_SHOT_MAX_H);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), h),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            self.ui_shot_canvas(ui, ShotCanvasKind::Macro, true);
+                        },
+                    );
+                    if let Some(drawn) = self.macro_virtual_editor.take() {
+                        editor.profile = drawn.profile;
+                    }
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -5962,15 +7307,435 @@ impl PadApp {
         if save {
             self.macro_page_virtual_profile = Some(editor.profile.clone());
             self.log("扩展宏虚拟键位已保存到当前宏草稿");
+            // 保存 = 这一步结束:待完成的取点/取键一并作废,截图浮层随即复原。
+            self.clear_virtual_pick();
         } else if !cancel && open {
+            // ① 本帧清单里点出来的"新增"先落到这份副本上(只改宏草稿,不碰实时配置)
+            if add_combo {
+                // 与主界面 [＋ 新增组合键] 同款默认值,只是写进虚拟层
+                let (x, y) = (am.rel_x(540), am.rel_y(960));
+                editor.profile.combos_enabled = true;
+                editor.profile.combos.push(KeyCombo {
+                    keys: vec![0, 0],
+                    action: Action::Tap {
+                        x,
+                        y,
+                        duration_ms: crate::keymap::DEFAULT_TAP_DURATION_MS,
+                        radius: crate::keymap::DEFAULT_RADIUS,
+                    },
+                    fps_only: false,
+                    tail_delay_ms: crate::keymap::DEFAULT_TAIL_DELAY_MS,
+                });
+                editor.newest = Some(MacroVirtualPick::Combo(editor.profile.combos.len() - 1));
+            }
+            if add_wheel {
+                // 与主界面 [＋ 新增轮盘] 同一套:自动找一个空位,按默认几何建
+                let (cx, cy) = crate::keymap::next_wheel_spot(&editor.profile.wheels);
+                editor.profile.wheels.push(Wheel::new_default(&am, cx, cy));
+                editor.newest = Some(MacroVirtualPick::WheelCenter(
+                    editor.profile.wheels.len() - 1,
+                ));
+            }
+            // ② 把这份副本放回 App —— 后面几步(取点/取键)都写在它上面
             self.macro_virtual_editor = Some(editor);
+            // ③ 清单行回抛的动作
+            for act in acts {
+                self.apply_virtual_act(act);
+            }
+            // ④ 虚拟键盘上刚按下的那个键
+            if let Some((slot, code)) = virtual_key_hit {
+                if let Some(msg) = self.assign_virtual_key(slot, code) {
+                    self.log(msg);
+                }
+            }
+            // ④b [鼠标映射]:下拉里选好的鼠标键位,直接走「＋按键」那条路的第一步
+            //     (键已经定了,不再等按键,直接进截图取点)。
+            if let Some(code) = mouse_new_key
+                && let Some(msg) = self.assign_virtual_key(KeySlot::MacroVirtualNewBind, code)
+            {
+                self.log(msg);
+            }
+            // ⑤ [＋ 按键] = 主界面同款的第一步:等一次键盘点击,再进入截图取点
+            if arm_new_key {
+                self.picking = None;
+                self.waiting_key = Some(KeySlot::MacroVirtualNewBind);
+                self.log("请在弹窗里的虚拟键盘上点一个键,新建虚拟键位");
+            }
+            if shot {
+                self.take_screenshot();
+            }
+            // ⑥ 取消必须无残留:只清虚拟槽位(主界面自己的取点不动)
+            if cancel_pending {
+                self.clear_virtual_pick();
+                self.log("已取消扩展宏取点/选键");
+            }
         } else {
+            self.clear_virtual_pick();
             self.log("已取消扩展宏设置，未保留任何修改");
         }
     }
 
+    /// R4(2026-10-08):虚拟取键等待中的提示文案(点哪一类的哪个键)。
+    fn virtual_wait_hint(slot: KeySlot) -> String {
+        match slot {
+            KeySlot::MacroVirtualNewBind => "点虚拟键盘上的任意一个键,新建虚拟键位".to_string(),
+            KeySlot::MacroVirtualComboKey { combo, slot } => {
+                format!("虚拟组合键#{} 的第 {} 个键", combo + 1, slot + 1)
+            }
+            KeySlot::MacroVirtualWheelDir { wheel, dir } => {
+                format!("虚拟轮盘#{} 的第 {} 个方向键", wheel + 1, dir + 1)
+            }
+            KeySlot::MacroVirtualWheelEnable(i) => format!("虚拟轮盘#{} 的启用键", i + 1),
+            _ => "点虚拟键盘上的键".to_string(),
+        }
+    }
+
+    /// R4(2026-10-08):虚拟取点等待中的提示文案(标出点的是哪一项)。
+    fn virtual_pick_hint(profile: &Profile, pick: MacroVirtualPick) -> String {
+        match pick {
+            MacroVirtualPick::Bind(i) => match profile.binds.get(i) {
+                Some(b) => format!("虚拟按键 {} 的落点", key_name(b.key)),
+                None => "虚拟按键的落点(该项已删除)".to_string(),
+            },
+            MacroVirtualPick::Combo(i) => format!("虚拟组合键#{} 的落点", i + 1),
+            MacroVirtualPick::WheelCenter(i) => format!("虚拟轮盘#{} 的圆心", i + 1),
+            MacroVirtualPick::AimAnchor => "虚拟瞄准锚点".to_string(),
+        }
+    }
+
+    /// R4(2026-10-08):弹窗里一行「虚拟组合键」。
+    ///
+    /// 纯函数:只读写这一个 `KeyCombo` 自己;"取键/取点/删除"这类要动 `App` 的
+    /// 请求回抛成 [`MacroVirtualAct`]。动作编辑器与虚拟按键共用
+    /// [`Self::ui_action_editor`],不复制第二份。
+    fn ui_macro_virtual_combo(
+        ui: &mut egui::Ui,
+        i: usize,
+        combo: &mut KeyCombo,
+        waiting: Option<KeySlot>,
+    ) -> Option<MacroVirtualAct> {
+        let mut act = None;
+        ui.horizontal(|ui| {
+            ui.label(format!("组合键#{}", i + 1));
+            ui.label("按键:");
+            // 至少两个键(与主界面同款:0 显示成"未绑定",不是键码 0 的名字)
+            for slot in 0..combo.keys.len().max(2) {
+                let key = combo.keys.get(slot).copied().unwrap_or(0);
+                let want = KeySlot::MacroVirtualComboKey { combo: i, slot };
+                let shown = (key != 0).then_some(key);
+                if Self::key_button(ui, waiting == Some(want), shown).clicked() {
+                    act = Some(MacroVirtualAct::TakeKey(want));
+                }
+            }
+            if combo.keys.len() < 4
+                && ui
+                    .small_button("＋")
+                    .on_hover_text("再加一个成员键(最多 4 个)")
+                    .clicked()
+            {
+                combo.keys.push(0);
+            }
+            if combo.keys.len() > 2
+                && ui
+                    .small_button("－")
+                    .on_hover_text("去掉最后一个成员键")
+                    .clicked()
+            {
+                combo.keys.pop();
+            }
+            if ui
+                .button("落点")
+                .on_hover_text("在截图上点出这个组合键的落点")
+                .clicked()
+            {
+                act = Some(MacroVirtualAct::PickComboPoint(i));
+            }
+            if ui.small_button("删除").clicked() {
+                act = Some(MacroVirtualAct::RemoveCombo(i));
+            }
+        });
+        ui.indent(("macro_virtual_combo_body", i), |ui| {
+            Self::ui_action_editor(ui, ("macro_virtual_combo_action", i), &mut combo.action);
+            ui.checkbox(&mut combo.fps_only, "仅 FPS");
+            if let Some(v) = Self::tail_delay_widget(ui, combo.tail_delay_ms) {
+                combo.tail_delay_ms = v;
+            }
+        });
+        act
+    }
+
+    /// R4(2026-10-08):弹窗里一行「虚拟轮盘」。
+    ///
+    /// 纯函数(只读写这一个 `Wheel`);取点/取键/删除回抛成 [`MacroVirtualAct`]。
+    /// 是主界面轮盘编辑器的**紧凑版**:同一套字段与同一套标签(`kind.label()`、
+    /// `mode.label()`、`wheel_dir_label`),但省掉只在主界面才有意义的部分
+    /// (手改终点、点信息卡)。半径/影响范围与主界面同一个口径:半径按**像素**
+    /// 编辑(经 `Mapper` 换算回相对值),影响范围是"推多远 = 半径 × 系数"的系数。
+    fn ui_macro_virtual_wheel(
+        ui: &mut egui::Ui,
+        i: usize,
+        w: &mut Wheel,
+        am: &Mapper,
+        waiting: Option<KeySlot>,
+    ) -> Option<MacroVirtualAct> {
+        let mut act = None;
+        ui.horizontal(|ui| {
+            ui.label(format!("轮盘#{}", i + 1));
+            let mut kind = w.kind;
+            egui::ComboBox::from_id_salt(("macro_virtual_wheel_kind", i))
+                .selected_text(kind.label())
+                .show_ui(ui, |ui| {
+                    for k in [WheelKind::Standard, WheelKind::Custom, WheelKind::Execute] {
+                        ui.selectable_value(&mut kind, k, k.label());
+                    }
+                });
+            if kind != w.kind {
+                w.kind = kind;
+                // 与主界面同一条规则:切到多向/执行轮盘时补齐自定义方向
+                w.ensure_custom_directions();
+            }
+            if w.kind == WheelKind::Standard {
+                let mut mode = w.mode;
+                egui::ComboBox::from_id_salt(("macro_virtual_wheel_mode", i))
+                    .selected_text(mode.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut mode,
+                            WheelMode::Classic,
+                            WheelMode::Classic.label(),
+                        );
+                        ui.selectable_value(
+                            &mut mode,
+                            WheelMode::Sensitive,
+                            WheelMode::Sensitive.label(),
+                        );
+                    });
+                w.mode = mode;
+            }
+            ui.label(format!("圆心 ({:.0}%,{:.0}%)", w.cx * 100.0, w.cy * 100.0));
+            if ui
+                .button("取圆心")
+                .on_hover_text("在截图上点出这个轮盘的圆心")
+                .clicked()
+            {
+                act = Some(MacroVirtualAct::PickWheelCenter(i));
+            }
+            if ui.small_button("删除").clicked() {
+                act = Some(MacroVirtualAct::RemoveWheel(i));
+            }
+        });
+        ui.indent(("macro_virtual_wheel_body", i), |ui| {
+            ui.horizontal(|ui| {
+                ui.label("启用键:");
+                let want = KeySlot::MacroVirtualWheelEnable(i);
+                let ek = w.temp.as_ref().map(|t| t.key).unwrap_or_default();
+                if Self::keys_button(ui, waiting == Some(want), &ek).clicked() {
+                    act = Some(MacroVirtualAct::TakeKey(want));
+                }
+                if let Some(t) = w.temp.as_ref() {
+                    ui.label(if t.mode == TempMode::Hold {
+                        "长按启用(临时摇杆)"
+                    } else {
+                        "再按切换(临时摇杆)"
+                    });
+                } else {
+                    ui.label("(永久摇杆)");
+                }
+                if w.temp.is_some() {
+                    if ui
+                        .button(if w.temp.as_ref().map(|t| t.mode) == Some(TempMode::Hold) {
+                            "模式:长按"
+                        } else {
+                            "模式:切换"
+                        })
+                        .on_hover_text("在「按住才启用」与「按一下锁定/再按解除」之间切换")
+                        .clicked()
+                    {
+                        if let Some(t) = w.temp.as_mut() {
+                            t.mode = match t.mode {
+                                TempMode::Hold => TempMode::Toggle,
+                                TempMode::Toggle => TempMode::Hold,
+                            };
+                        }
+                    }
+                    if ui
+                        .small_button("清除启用键")
+                        .on_hover_text("清掉后变回永久摇杆")
+                        .clicked()
+                    {
+                        w.temp = None;
+                    }
+                }
+            });
+            if w.kind != WheelKind::Standard {
+                ui.horizontal(|ui| {
+                    ui.label("方向数量:");
+                    let mut count = w.active_dirs().len().clamp(2, 8);
+                    if ui
+                        .add(egui::DragValue::new(&mut count).range(2..=8))
+                        .changed()
+                    {
+                        w.set_direction_count(count);
+                    }
+                });
+            }
+            // 方向键:一行两个,免得 8 个方向横向顶出窗口
+            let dirs: Vec<(usize, f32, KeySet)> = w
+                .active_dirs()
+                .into_iter()
+                .enumerate()
+                .map(|(pos, (angle, key))| (pos, angle, key))
+                .collect();
+            for chunk in dirs.chunks(2) {
+                ui.horizontal(|ui| {
+                    for &(pos, angle, key) in chunk {
+                        ui.label(wheel_dir_label(angle, pos));
+                        let want = KeySlot::MacroVirtualWheelDir { wheel: i, dir: pos };
+                        if Self::keys_button(ui, waiting == Some(want), &key).clicked() {
+                            act = Some(MacroVirtualAct::TakeKey(want));
+                        }
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.label("半径:");
+                let mut pr = am.len(w.radius);
+                if ui
+                    .add(egui::DragValue::new(&mut pr).range(10..=1000))
+                    .changed()
+                {
+                    w.radius = am.rel_len(pr);
+                }
+                ui.label("影响范围:");
+                let mut scope = w.scope();
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut scope)
+                            .speed(0.02)
+                            .range(crate::keymap::SCOPE_MIN..=crate::keymap::SCOPE_MAX),
+                    )
+                    .on_hover_text("触点实际推出的距离 = 半径 × 系数")
+                    .changed()
+                {
+                    w.scope = crate::keymap::clamp_scope(scope);
+                }
+            });
+        });
+        act
+    }
+
+    /// R4(2026-10-08):弹窗里一行「虚拟锚点」(= 鼠标视角的瞄准锚点)。
+    ///
+    /// 与主界面"瞄准锚点"那一段同一套三个动作:取点 / 恢复默认(屏幕正中央)/
+    /// 清除(未设置)。注意:宏回放目前**不消费**虚拟层的锚点(引擎只按虚拟层解析
+    /// 按键/组合键/轮盘),这里保留设置入口与数据,是"整套体系都能在弹窗里调用"
+    /// 这一条要求的落点,也是给后续接入留的接口。
+    fn ui_macro_virtual_aim(
+        ui: &mut egui::Ui,
+        aim: &mut Aim,
+        am: &Mapper,
+        picking: Option<CoordSlot>,
+    ) -> Option<MacroVirtualAct> {
+        let mut act = None;
+        ui.horizontal(|ui| {
+            ui.label("锚点:");
+            if aim.anchor_set() {
+                let (ax, ay) = am.point(aim.anchor_x, aim.anchor_y);
+                ui.label(format!("({ax}, {ay})"));
+            } else {
+                ui.label("未设置");
+            }
+            let want = CoordSlot::MacroVirtual(MacroVirtualPick::AimAnchor);
+            if ui
+                .button(if picking == Some(want) {
+                    "点击截图..."
+                } else {
+                    "取点"
+                })
+                .on_hover_text("锚点是虚拟手指落下的起点,请取在游戏 UI 之外的干净区域")
+                .clicked()
+            {
+                act = Some(MacroVirtualAct::PickAimAnchor);
+            }
+            if ui
+                .small_button("恢复默认")
+                .on_hover_text("放回手机屏幕正中央")
+                .clicked()
+            {
+                // 与主界面同款:默认值 = 屏幕正中央,仍按配置的坐标单位换算
+                aim.anchor_x = am.rel_x((am.w / 2.0) as i32);
+                aim.anchor_y = am.rel_y((am.h / 2.0) as i32);
+            }
+            if ui
+                .small_button("清除")
+                .on_hover_text("清成「未设置」(0,0)")
+                .clicked()
+            {
+                aim.anchor_x = 0.0;
+                aim.anchor_y = 0.0;
+            }
+        });
+        act
+    }
+
     fn ui_macro_virtual_bind(ui: &mut egui::Ui, bind: &mut KeyBind) {
-        let kind = match bind.action {
+        Self::ui_action_editor(ui, ("macro_virtual_action", bind.key), &mut bind.action);
+        ui.checkbox(&mut bind.fps_only, "仅 FPS");
+        if let Some(v) = Self::tail_delay_widget(ui, bind.tail_delay_ms) {
+            bind.tail_delay_ms = v;
+        }
+    }
+
+    /// 「按后延迟」数字框(用户 2026-10-10 第 2 条)。
+    ///
+    /// 语义:这一条上一次**抬起之后**至少再等这么久才准下一次按下 —— 快速连点 /
+    /// 连续划动时,防止上一动作还没抬起、下一动作已经按下。冷却没过就按下来的
+    /// 那一次**不丢**,引擎会把它推迟到冷却结束再执行。`0` = 不等(默认)。
+    ///
+    /// 按键 / 组合键 / 宏触发三类设置共用这一份控件(用户要求"所有出现这三类设置
+    /// 的位置都要加" —— 共用一份才不会三处各写一遍、改了语义只改一处)。
+    ///
+    /// **2026-10-10 晚:整项改成可选功能**,于是这里还要看**总开关**
+    /// ([`Profile::tail_delay_enabled`],默认关闭):关着时数字框灰显不可改
+    /// (数值照留,打开开关就恢复),悬停提示也换成"去左栏打开总开关"。
+    /// 返回用户改出来的新值;没改(或没开着)就是 `None`。
+    fn tail_delay_widget(ui: &mut egui::Ui, current: u32) -> Option<u32> {
+        let on = ui
+            .memory(|m| m.data.get_temp::<bool>(tail_delay_on_id()))
+            .unwrap_or(false);
+        let mut v = current;
+        let r = ui
+            .add_enabled_ui(on, |ui| {
+                ui.label("按后延迟ms:");
+                ui.add(
+                    egui::DragValue::new(&mut v)
+                        .range(0..=crate::keymap::MAX_TAIL_DELAY_MS)
+                        .speed(1),
+                )
+                .on_hover_text(if on {
+                    "这一条上一次抬起之后再等这么久才准下一次按下。\n\
+                     冷却没过就按下的那一次会被推迟到冷却结束执行,不会丢。\n\
+                     0 = 不等。数值原样保存在配置里。"
+                } else {
+                    "「按后延迟」当前未启用(默认关闭)。\n\
+                     到左栏「按后延迟」勾上总开关后,这一条才会按这个数值生效。"
+                })
+            })
+            .inner;
+        (on && r.changed()).then_some(v)
+    }
+
+    /// 动作编辑器(点按/长按/滑动/系统键 + 各自的几何参数;不含"仅 FPS")。
+    ///
+    /// R4(2026-10-08):原先是 `ui_macro_virtual_bind` 的正文,虚拟组合键也要用
+    /// 同一套控件,于是摊出来共用一份 —— 以后加动作类型只改这里,不必改两处。
+    /// `salt` 必须是各调用点互不相同的 id(同一帧里两个 ComboBox 撞 id 会互相干扰)。
+    fn ui_action_editor<H: std::hash::Hash + std::fmt::Debug>(
+        ui: &mut egui::Ui,
+        salt: H,
+        action: &mut Action,
+    ) {
+        let kind = match action {
             Action::Tap { .. } => 0,
             Action::Hold { .. } => 1,
             Action::Swipe(_) => 2,
@@ -5980,7 +7745,7 @@ impl PadApp {
         let mut kind = kind;
         ui.horizontal(|ui| {
             ui.label("动作:");
-            egui::ComboBox::from_id_salt(("macro_virtual_action", bind.key))
+            egui::ComboBox::from_id_salt(salt)
                 .selected_text(match kind {
                     0 => "点按",
                     1 => "长按",
@@ -5994,7 +7759,7 @@ impl PadApp {
                     ui.selectable_value(&mut kind, 3, "系统键");
                 });
         });
-        let old_kind = match bind.action {
+        let old_kind = match action {
             Action::Tap { .. } => 0,
             Action::Hold { .. } => 1,
             Action::Swipe(_) => 2,
@@ -6002,10 +7767,19 @@ impl PadApp {
             Action::Macro(_) => 0,
         };
         if kind != old_kind {
-            bind.action = match kind {
+            // 换动作类型时**保留已经取好的落点**(用户 2026-10-09 反馈:选完动作,
+            // 之前取的点会被抛弃、退回屏幕中央)。点按与长按共用同一个 (x, y),
+            // 所以两者互换时把旧坐标带过去;从滑动切过来时用它的起点。
+            // 滑动本身是"起点+终点"两个点,不属于"一个落点",仍按默认几何新建。
+            let (px, py) = match action {
+                Action::Tap { x, y, .. } | Action::Hold { x, y, .. } => (*x, *y),
+                Action::Swipe(s) => s.start,
+                _ => (0.5, 0.5),
+            };
+            *action = match kind {
                 1 => Action::Hold {
-                    x: 0.5,
-                    y: 0.5,
+                    x: px,
+                    y: py,
                     radius: crate::keymap::DEFAULT_RADIUS,
                 },
                 2 => Action::Swipe(Swipe {
@@ -6017,14 +7791,14 @@ impl PadApp {
                 }),
                 3 => Action::AndroidKey { keycode: 4 },
                 _ => Action::Tap {
-                    x: 0.5,
-                    y: 0.5,
+                    x: px,
+                    y: py,
                     duration_ms: crate::keymap::DEFAULT_TAP_DURATION_MS,
                     radius: crate::keymap::DEFAULT_RADIUS,
                 },
             };
         }
-        match &mut bind.action {
+        match action {
             Action::Tap {
                 x,
                 y,
@@ -6096,7 +7870,6 @@ impl PadApp {
             }
             Action::Macro(_) => {}
         }
-        ui.checkbox(&mut bind.fps_only, "仅 FPS");
     }
 
     fn ui_macro_recorded_steps(ui: &mut egui::Ui, steps: &[MacroStep]) {
@@ -6137,7 +7910,13 @@ impl PadApp {
             let dirs = wheel
                 .active_dirs()
                 .iter()
-                .map(|(_, key)| key_name(*key))
+                .map(|(_, key)| {
+                    if key.is_empty() {
+                        "未绑定".to_string()
+                    } else {
+                        key.label()
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("/");
             ui.monospace(format!("虚拟轮盘#{} → {}", i + 1, dirs));
@@ -6613,9 +8392,73 @@ impl PadApp {
                 virtual_profile: self.macro_page_virtual_profile.clone().map(Box::new),
             }),
             fps_only: self.macro_page_fps_only,
+            // 「按后延迟」(用户 2026-10-10 第 2 条):宏页上配的那一份跟着宏走
+            tail_delay_ms: self.macro_page_tail_delay_ms,
         });
+        let was_editing = self.macro_loaded_index.is_some();
         self.reset_macro_draft();
-        self.log("已新建宏");
+        self.log(if was_editing {
+            "已另存为新宏"
+        } else {
+            "已新建宏"
+        });
+    }
+
+    /// 把编辑区当前这一份**覆盖**到[载入编辑]载入的那条宏上(用户 2026-10-10 第 1 条)。
+    ///
+    /// 与 [`Self::macro_add_from_page`] 的区别只有一个:不 push 新键位,而是原地改写
+    /// `binds[i].action`(与可视化键位页的[保存宏修改]同一条路)。
+    /// 载入的那条要是已经被删/被组合切换挤掉了(下标失效或不再是宏),就退回"另存为新宏"
+    /// 并说明一句 —— 绝不静默丢改动。
+    fn macro_save_over_loaded(&mut self) {
+        let Some(index) = self.macro_loaded_index else {
+            self.macro_add_from_page();
+            return;
+        };
+        let Some(key) = self.macro_page_key else {
+            self.log("请先选择宏触发键");
+            return;
+        };
+        if self.macro_page_steps.is_empty() && self.macro_page_instructions.is_empty() {
+            self.log("宏没有录制步骤或设置动作");
+            return;
+        }
+        // 先确认那一格还在、且仍是宏 —— 免得白记一次撤销
+        let still_there = {
+            let g = lock_shared(&self.shared);
+            g.profile
+                .binds
+                .get(index)
+                .is_some_and(|b| matches!(b.action, Action::Macro(_)))
+        };
+        if !still_there {
+            self.macro_loaded_index = None;
+            self.log("原宏已不在当前组合里，已改为另存为新宏");
+            self.macro_add_from_page();
+            return;
+        }
+        self.push_undo();
+        Self::normalize_macro_start(&mut self.macro_page_steps);
+        let action = Action::Macro(MacroAction {
+            steps: self.macro_page_steps.clone(),
+            instructions: self.macro_page_instructions.clone(),
+            virtual_profile: self.macro_page_virtual_profile.clone().map(Box::new),
+        });
+        let fps_only = self.macro_page_fps_only;
+        let tail_delay_ms = self.macro_page_tail_delay_ms;
+        {
+            let mut g = lock_shared(&self.shared);
+            if let Some(b) = g.profile.binds.get_mut(index) {
+                b.key = key;
+                b.action = action;
+                b.fps_only = fps_only;
+                // 「按后延迟」(用户 2026-10-10 第 2 条):覆盖保存时一并写回,
+                // 否则"载入编辑 → 改了延迟 → 保存宏"会静默丢掉这次改动。
+                b.tail_delay_ms = tail_delay_ms;
+            }
+        }
+        self.reset_macro_draft();
+        self.log("宏已保存(覆盖刚才[载入编辑]的那一条)");
     }
     fn finish_macro_recording(&mut self) {
         if let Some(rec) = self.macro_recording.take() {
@@ -6653,6 +8496,10 @@ impl PadApp {
             }
             ui.checkbox(&mut self.draft.fps_only, "仅 FPS")
                 .on_hover_text("开启后该键只在 FPS 模式生效(FPS 页点空闲键会自动勾上)");
+            // 「按后延迟」(用户 2026-10-10 第 2 条):草稿阶段就定,入配置时照抄。
+            if let Some(v) = Self::tail_delay_widget(ui, self.draft.tail_delay_ms) {
+                self.draft.tail_delay_ms = v;
+            }
             for (ki, n) in KIND_NAMES.iter().enumerate() {
                 if Self::tab_button(ui, n, self.draft.kind == ki, th.accent) {
                     self.draft.kind = ki;
@@ -6759,26 +8606,42 @@ impl PadApp {
     fn ui_vk_special(&mut self, ui: &mut egui::Ui, slot: KeySlot, title: &str) {
         ui.horizontal(|ui| {
             ui.strong(title);
-            let waiting = self.waiting_key == Some(slot);
-            let code = self.vk_slot_code(&slot);
-            if Self::key_button(ui, waiting, Some(code)).clicked() {
-                self.picking = None;
-                self.resizing = None;
-                self.waiting_key = Some(slot);
-                self.log("按任意键完成改绑(或点[取消选择]退出)");
+            if slot.takes_chord() {
+                // 系统键那类槽位(用户 2026-10-09 第 4 条):整组键一个按钮,
+                // 捕获 `Ctrl+X`、显示 `Ctrl+X`,没有额外的时长/间隔参数。
+                let keys = self.vk_slot_keys(&slot);
+                let waiting = self.waiting_keys == Some(slot);
+                if Self::keys_button(ui, waiting, &keys).clicked() {
+                    self.begin_keys_capture(slot);
+                }
+                if !keys.is_empty() && ui.small_button("清除").clicked() {
+                    self.assign_keys(slot, KeySet::new());
+                }
+            } else {
+                let waiting = self.waiting_key == Some(slot);
+                let code = self.vk_slot_keys(&slot).only().unwrap_or(0);
+                if Self::key_button(ui, waiting, Some(code)).clicked() {
+                    self.begin_key_capture(slot);
+                }
             }
-            if Self::tab_button(ui, "取消选择", false, self.theme().accent) {
+            let cancel = Self::tab_button_resp(ui, "取消选择", false, self.theme().accent);
+            Self::note_cancel_zone(ui, &cancel);
+            // 与[取消设置]同一条纪律:**按下**即退出捕获,不等松开 —— 否则这一下
+            // 点击的"抬起"边沿会先把组合键落定成绑定(见 `cancel_bind_button`)。
+            if cancel.is_pointer_button_down_on() || cancel.clicked() {
                 self.vk_sel = None;
-                self.waiting_key = None;
+                self.cancel_key_capture();
             }
         });
-        if self.waiting_key == Some(slot) {
+        if self.waiting_keys == Some(slot) {
+            ui.small("等待组合键中... 按住 Ctrl 再按另一个键,全部松开即生效(最多两个键)");
+        } else if self.waiting_key == Some(slot) {
             ui.small("等待按键中... 按任意键完成改绑");
         }
     }
 
-    /// 读取一个 KeySlot 当前持有的键码(0 = 未绑定)
-    fn vk_slot_code(&self, slot: &KeySlot) -> u16 {
+    /// 读取一个 KeySlot 当前持有的键(组合键槽位返回整个集合)。
+    fn vk_slot_keys(&self, slot: &KeySlot) -> KeySet {
         let g = lock_shared(&self.shared);
         match slot {
             KeySlot::Toggle => g.profile.toggle_key,
@@ -6787,50 +8650,58 @@ impl PadApp {
             KeySlot::AimToggle => g.profile.aim.toggle_key,
             KeySlot::AimSuspend => g.profile.aim.suspend_key,
             KeySlot::RecoilTrigger => g.profile.aim.recoil.trigger_key,
+            KeySlot::RecoilSwitch => g.profile.aim.recoil.switch_key,
             KeySlot::WheelDir { wheel, dir } => g
                 .profile
                 .wheels
                 .get(*wheel)
                 .and_then(|w| w.active_dirs().get(*dir).map(|(_, key)| *key))
-                .unwrap_or(0),
+                .unwrap_or_default(),
             KeySlot::WheelEnable(i) => g
                 .profile
                 .wheels
                 .get(*i)
                 .and_then(|w| w.temp.as_ref().map(|t| t.key))
-                .unwrap_or(0),
-            KeySlot::SwitchKey(i) => g.switch_keys.get(*i).map(|s| s.key).unwrap_or(0),
-            KeySlot::SwitchKeySecond(i) => g
+                .unwrap_or_default(),
+            KeySlot::SwitchKey(i) => g
                 .switch_keys
                 .get(*i)
-                .and_then(|s| s.keys.get(1))
-                .copied()
-                .unwrap_or(0),
-            KeySlot::ComboKey { combo, slot } => g
-                .profile
-                .combos
-                .get(*combo)
-                .and_then(|c| c.keys.get(*slot))
-                .copied()
-                .unwrap_or(0),
-            KeySlot::MacroTrigger => self.macro_page_key.unwrap_or(0),
-            KeySlot::MacroInstructionKey(index) => self
-                .macro_page_instructions
-                .get(*index)
-                .and_then(|instruction| match instruction {
-                    MacroInstruction::Key { code, .. } => Some(*code),
-                    _ => None,
-                })
-                .unwrap_or(0),
-            KeySlot::MacroInstructionComboKey { instruction, slot } => self
-                .macro_page_instructions
-                .get(*instruction)
-                .and_then(|item| match item {
-                    MacroInstruction::Combo { keys, .. } => keys.get(*slot).copied(),
-                    _ => None,
-                })
-                .unwrap_or(0),
-            KeySlot::NewBind | KeySlot::Bind(_) => 0,
+                .map(|s| s.effective_keys())
+                .unwrap_or_default(),
+            KeySlot::ComboKey { combo, slot } => KeySet::single(
+                g.profile
+                    .combos
+                    .get(*combo)
+                    .and_then(|c| c.keys.get(*slot))
+                    .copied()
+                    .unwrap_or(0),
+            ),
+            KeySlot::MacroTrigger => KeySet::single(self.macro_page_key.unwrap_or(0)),
+            KeySlot::MacroInstructionKey(index) => KeySet::single(
+                self.macro_page_instructions
+                    .get(*index)
+                    .and_then(|instruction| match instruction {
+                        MacroInstruction::Key { code, .. } => Some(*code),
+                        _ => None,
+                    })
+                    .unwrap_or(0),
+            ),
+            KeySlot::MacroInstructionComboKey { instruction, slot } => KeySet::single(
+                self.macro_page_instructions
+                    .get(*instruction)
+                    .and_then(|item| match item {
+                        MacroInstruction::Combo { keys, .. } => keys.get(*slot).copied(),
+                        _ => None,
+                    })
+                    .unwrap_or(0),
+            ),
+            KeySlot::NewBind | KeySlot::Bind(_) => KeySet::new(),
+            // R4:虚拟槽位的值在宏草稿里(不是实时配置),这里读不到也不该读
+            // —— 见 `assign_virtual_key` / `assign_virtual_coord`。
+            KeySlot::MacroVirtualNewBind
+            | KeySlot::MacroVirtualComboKey { .. }
+            | KeySlot::MacroVirtualWheelDir { .. }
+            | KeySlot::MacroVirtualWheelEnable(_) => KeySet::new(),
         }
     }
 
@@ -6912,8 +8783,12 @@ impl PadApp {
                             &mut combo_pick,
                             &mut combo_easing,
                         );
-                        let fps_changed = ui.checkbox(&mut combo.fps_only, "仅视角模式").changed();
-                        if action_changed || fps_changed {
+                        let fps_changed = ui.checkbox(&mut combo.fps_only, "仅 FPS").changed();
+                        // 「按后延迟」(用户 2026-10-10 第 2 条):组合键自己的一份。
+                        let tail_changed = Self::tail_delay_widget(ui, combo.tail_delay_ms)
+                            .map(|v| combo.tail_delay_ms = v)
+                            .is_some();
+                        if action_changed || fps_changed || tail_changed {
                             snapshots.push((index, combo.clone()));
                         }
                     });
@@ -6965,6 +8840,7 @@ impl PadApp {
                     radius: crate::keymap::DEFAULT_RADIUS,
                 },
                 fps_only: false,
+                tail_delay_ms: crate::keymap::DEFAULT_TAIL_DELAY_MS,
             });
             self.scroll_to_new = true;
         }
@@ -6972,6 +8848,7 @@ impl PadApp {
     }
 
     fn ui_wheels(&mut self, ui: &mut egui::Ui) {
+        let th = self.theme();
         ui.heading("轮盘(虚拟摇杆)");
         ui.label("设置[启用键]后变为临时轮盘:仅在启用期间生效,期间方向键的其它绑定让位");
         let mut to_delete: Option<usize> = None;
@@ -7047,15 +8924,16 @@ impl PadApp {
                         self.log(format!("轮盘模式已切换为: {}", mode.label()));
                     }
                 } else {
-                    ui.label("双键方向取平均");
+                    ui.label("双键取中点方向")
+                        .on_hover_text("两个方向键同时按下时，最终响应目标 = 两键方向的中点（仍落在影响范围圆上）。");
                 }
 
                 // 启用键(设置后变为临时轮盘)
                 ui.label("启用键:");
-                let ek = temp.map(|(k, _)| k);
-                let waiting_e = self.waiting_key == Some(KeySlot::WheelEnable(i));
-                if Self::key_button(ui, waiting_e, ek).clicked() {
-                    self.waiting_key = Some(KeySlot::WheelEnable(i));
+                let ek = temp.map(|(k, _)| k).unwrap_or_default();
+                let waiting_e = self.waiting_keys == Some(KeySlot::WheelEnable(i));
+                if Self::keys_button(ui, waiting_e, &ek).clicked() {
+                    self.begin_keys_capture(KeySlot::WheelEnable(i));
                 }
                 if let Some((_, mode)) = temp {
                     if ui
@@ -7094,13 +8972,17 @@ impl PadApp {
                     ui.label("(永久)");
                 }
             });
-            let (dirs, kind) = {
+            let (dirs, kind, manuals) = {
                 let g = lock_shared(&self.shared);
                 // 索引失效(引擎刚换组合)则跳过这一行,继续渲染后面的
                 let Some(w) = g.profile.wheels.get(i) else {
                     continue;
                 };
-                (w.active_dirs(), w.kind)
+                // 手动终点按下标取(自定义/执行轮盘的 active_dirs 与 directions 一一对应)
+                let manuals: Vec<Option<(f32, f32)>> = (0..8)
+                    .map(|d| w.directions.get(d).and_then(|x| x.manual))
+                    .collect();
+                (w.active_dirs(), w.kind, manuals)
             };
             if kind != WheelKind::Standard {
                 ui.horizontal(|ui| {
@@ -7116,19 +8998,12 @@ impl PadApp {
                             w.set_direction_count(count);
                         }
                     }
-                    ui.label("最多 8 个；同时只接受最早按下的 2 个方向并取平均");
+                    ui.label("最多 8 个；同时只接受最早按下的 2 个方向，取两键方向的中点");
                 });
             }
             for (d, (angle, code)) in dirs.into_iter().enumerate() {
                 ui.horizontal(|ui| {
-                    let label = match angle.round() as i32 {
-                        -90 => "上".to_string(),
-                        0 => "右".to_string(),
-                        90 => "下".to_string(),
-                        a if a.abs() == 180 => "左".to_string(),
-                        a => format!("{a}°"),
-                    };
-                    ui.label(format!("{}{}", label, d + 1));
+                    ui.label(wheel_dir_label(angle, d));
                     if kind != WheelKind::Standard {
                         ui.label("角度:");
                         let mut a = angle;
@@ -7153,9 +9028,59 @@ impl PadApp {
                         }
                     }
                     ui.label("按键:");
-                    let waiting = self.waiting_key == Some(KeySlot::WheelDir { wheel: i, dir: d });
-                    if Self::key_button(ui, waiting, Some(code)).clicked() {
-                        self.waiting_key = Some(KeySlot::WheelDir { wheel: i, dir: d });
+                    let waiting = self.waiting_keys == Some(KeySlot::WheelDir { wheel: i, dir: d });
+                    if Self::keys_button(ui, waiting, &code).clicked() {
+                        self.begin_keys_capture(KeySlot::WheelDir { wheel: i, dir: d });
+                    }
+                    // 「设置位置」:在截图上直接点一个终点,替代"角度 × 影响范围"。
+                    // 手改点可以超出/不足影响范围圆 —— 影响范围只是基准,
+                    // 之后改它不会挪动手改点;只有「重置」才会把点贴回基准圆。
+                    if kind != WheelKind::Standard {
+                        let slot = CoordSlot::WheelDirEnd { wheel: i, dir: d };
+                        let waiting_pos = self.picking == Some(slot);
+                        match manuals.get(d).copied().flatten() {
+                            Some((mx, my)) => {
+                                let (px, py) = self.mapper().point(mx, my);
+                                ui.colored_label(th.ok, format!("位置:自定义({px},{py})"))
+                                    .on_hover_text(
+                                        "这个方向已手改终点：触点就推到这里，不再受角度/影响范围影响。",
+                                    );
+                                if ui
+                                    .button("重置")
+                                    .on_hover_text("清除手改终点，重新贴回影响范围圆（之后改影响范围才会再次生效）")
+                                    .clicked()
+                                {
+                                    self.push_undo();
+                                    {
+                                        let mut g = lock_shared(&self.shared);
+                                        if let Some(dir) = g
+                                            .profile
+                                            .wheels
+                                            .get_mut(i)
+                                            .and_then(|w| w.directions.get_mut(d))
+                                        {
+                                            dir.manual = None;
+                                        }
+                                    }
+                                    self.log("已重置该方向的手改终点(回到影响范围圆)");
+                                }
+                            }
+                            None => {
+                                if ui
+                                    .button(if waiting_pos {
+                                        "点击截图..."
+                                    } else {
+                                        "设置位置"
+                                    })
+                                    .on_hover_text(
+                                        "在截图上点一个点作为这个方向的终点：可以超出或不足影响范围圆。",
+                                    )
+                                    .clicked()
+                                {
+                                    self.begin_pick(slot);
+                                }
+                            }
+                        }
                     }
                 });
             }
@@ -7352,7 +9277,12 @@ impl PadApp {
         n - 1
     }
     /// 在手机截图上叠加显示所有键位/轮盘的位置示意
-    fn draw_overlay(&self, ui: &egui::Ui, rect: egui::Rect, scale: f32) {
+    /// `virtual_src` = 这张画布该画**扩展宏弹窗那份虚拟键位表**还是实时配置。
+    ///
+    /// 由调用方决定(见 [`Self::ui_shot_canvas`] 的 `virtual_layer` 参数):
+    /// 弹窗自己的那块画布恒为 true,主界面下方面板恒为 false,
+    /// 截图小窗看它是"从弹窗开的小窗"还是"从主界面开的小窗"。
+    fn draw_overlay(&self, ui: &egui::Ui, rect: egui::Rect, scale: f32, virtual_src: bool) {
         use egui::{Align2, FontId, Stroke, vec2};
         use theme::size;
         let painter = ui.painter();
@@ -7363,6 +9293,30 @@ impl PadApp {
         // 若先拿到配置锁再调 self.mapper() 会自锁,界面会直接卡死。
         let m = self.mapper();
         let g = lock_shared(&self.shared);
+        // R4(2026-10-08):浮层的"内容来源"。
+        //
+        // 平时画的是实时配置;当**扩展宏弹窗**正在取点(`picking` 是虚拟取点、
+        // 而且弹窗还开着)时,改画弹窗里那份虚拟键位表 —— 用户要"在截图上给
+        // 虚拟按键/组合键/轮盘/锚点取点",就得先看见它们。
+        //
+        // 这条切换是**临时**的:取点一结束(放到点上 / 取消取点 / 关窗 / 保存)
+        // `picking` 立刻不再是虚拟取点,下一帧这里就回落到实时配置 ——
+        // 截图上的标识于是完全复原,不留"键位垃圾"(用户 2026-10-08 明确要求)。
+        // 于是弹窗没开、或没在取点时,这里的观感与加这段代码之前一模一样。
+        //
+        // 说明:`resizing` 与 `picking` 互斥(`begin_pick`/`begin_resize*` 各自清掉
+        // 对方),所以切到虚拟层时不会出现"按实时下标高亮的黄色圈"这种错位。
+        let virtual_editor = if virtual_src {
+            self.macro_virtual_editor.as_ref()
+        } else {
+            None
+        };
+        let src: &Profile = match virtual_editor {
+            Some(e) => &e.profile,
+            None => &g.profile,
+        };
+        // 最近一次新增的虚拟项(只画一圈强调 + 「新」角标,不改数据)
+        let newest = virtual_editor.and_then(|e| e.newest);
         let th = g.profile.look.theme();
         // 键位浮层的显示亮度档位(0=默认;负=加深,正=变浅)。
         // 手动微调档位;每个标注的实际档位还要叠上"按截图采样的自动对比"
@@ -7374,10 +9328,26 @@ impl PadApp {
             _ => theme::clamp_tone(tone_manual),
         };
 
+        // 「新」角标(用户 2026-10-10 第 4 条"每次新增点需标明"):给最近一次新增
+        // 或刚取点的那个虚拟项套一圈强调 + 一个「新」字,用户一眼就能找到它。
+        // 纯画法,不改任何数据;`newest` 为 None(非虚拟层/刚换过基底)时从不触发。
+        let mark_new = |p: egui::Pos2, r: f32| {
+            painter.circle_stroke(p, r + 5.0, Stroke::new(3.0, theme::casing(th.accent)));
+            painter.circle_stroke(p, r + 5.0, Stroke::new(1.5, th.accent));
+            theme::paint_label(
+                painter,
+                p + vec2(0.0, -(r + 18.0)),
+                Align2::CENTER_CENTER,
+                "新",
+                FontId::proportional(size::LABEL_FONT),
+                th.accent,
+            );
+        };
+
         // 键位(含草稿标记)仅在"全部/仅键位"时显示
         if self.overlay_filter.keys {
             let fps_overlay_active = g.aim_live.mode_active && !g.aim_live.suspended;
-            for (i, b) in g.profile.binds.iter().enumerate() {
+            for (i, b) in src.binds.iter().enumerate() {
                 if matches!(b.action, Action::Macro(_)) {
                     continue;
                 }
@@ -7427,6 +9397,9 @@ impl PadApp {
                             FontId::proportional(size::KEY_FONT),
                             theme::tone_text(tone),
                         );
+                        if newest == Some(MacroVirtualPick::Bind(i)) {
+                            mark_new(p, r);
+                        }
                     }
                     Action::Swipe(s) => {
                         let sp = m.point(s.start.0, s.start.1);
@@ -7449,7 +9422,11 @@ impl PadApp {
             }
             // 草稿(新增绑定)高亮:0 不显示,1 显示点/圈,2 显示滑动轨迹。
             // 仅在新增草稿进行中或等待设置按键时显示,取消后即消失。
-            let draft_kind = if self.draft_active || self.waiting_key == Some(KeySlot::NewBind) {
+            // R4:浮层正在画扩展宏的虚拟层时不画实时草稿 —— 两套标记混在一张截图上
+            // 谁都认不出是谁的(实时草稿本身没被改动,取点结束照旧显示)。
+            let draft_kind = if !virtual_src
+                && (self.draft_active || self.waiting_key == Some(KeySlot::NewBind))
+            {
                 if self.draft.kind == 2 { 2 } else { 1 }
             } else {
                 0
@@ -7495,7 +9472,7 @@ impl PadApp {
 
         // 组合键没有单独的“触发坐标”，在动作落点绘制蓝色组合标记；滑动沿用轨迹。
         if self.overlay_filter.combos {
-            for (ci, combo) in g.profile.combos.iter().enumerate() {
+            for (ci, combo) in src.combos.iter().enumerate() {
                 let keys = combo
                     .keys
                     .iter()
@@ -7535,6 +9512,9 @@ impl PadApp {
                                 ink,
                             );
                         }
+                        if newest == Some(MacroVirtualPick::Combo(ci)) {
+                            mark_new(p, r);
+                        }
                     }
                     Action::Swipe(s) => {
                         let sp = m.point(s.start.0, s.start.1);
@@ -7558,6 +9538,9 @@ impl PadApp {
 
         // 宏没有固定落点，用截图左下角的标签列出触发键，确保浮层和虚拟键盘
         // 都能直接看到宏；原始动作不会挤占截图。
+        // 宏清单(R4):永远读**实时配置**,不受上面的虚拟层切换影响 ——
+        // 虚拟层按设计不继承宏(`sanitize_virtual_profile` 会把宏步骤剔掉),
+        // 而这一块说的是"本机绑了哪些宏",属于实时配置的说明。
         if self.overlay_filter.macros {
             let macros: Vec<(u16, u32)> = g
                 .profile
@@ -7613,8 +9596,8 @@ impl PadApp {
         }
 
         // FPS 瞄准锚点:与键位一样画在截图上,标出鼠标拖动时的落点起点
-        if self.overlay_filter.aim && g.profile.aim.anchor_set() {
-            let aim = &g.profile.aim;
+        if self.overlay_filter.aim && src.aim.anchor_set() {
+            let aim = &src.aim;
             let (ax, ay) = (m.x(aim.anchor_x), m.y(aim.anchor_y));
             let p = to_screen(ax, ay);
             let tone = tone_at(ax, ay);
@@ -7652,10 +9635,10 @@ impl PadApp {
             painter.line_segment([p - vec2(arm, 0.0), p + vec2(arm, 0.0)], thin);
             painter.line_segment([p - vec2(0.0, arm), p + vec2(0.0, arm)], thin);
             // 标签与键位一致:显示名称,门控键存在时一并显示
-            let label = if aim.hold_key == 0 {
+            let label = if aim.hold_key.is_empty() {
                 "瞄准锚点".to_string()
             } else {
-                format!("瞄准锚点 [{}]", key_name(aim.hold_key))
+                format!("瞄准锚点 [{}]", aim.hold_key.label())
             };
             theme::paint_label(
                 painter,
@@ -7665,11 +9648,14 @@ impl PadApp {
                 FontId::proportional(size::LABEL_FONT),
                 theme::tone_text(tone),
             );
+            if newest == Some(MacroVirtualPick::AimAnchor) {
+                mark_new(p, ring);
+            }
         }
 
         // 轮盘按过滤条件显示;临时轮盘用虚线圆环区分
         if self.overlay_filter.wheels_perm || self.overlay_filter.wheels_temp {
-            for (wi, w) in g.profile.wheels.iter().enumerate() {
+            for (wi, w) in src.wheels.iter().enumerate() {
                 let show = if w.temp.is_none() {
                     self.overlay_filter.wheels_perm
                 } else {
@@ -7779,6 +9765,9 @@ impl PadApp {
                         theme::tone_text(tone),
                     );
                 }
+                if newest == Some(MacroVirtualPick::WheelCenter(wi)) {
+                    mark_new(c, r);
+                }
                 // 影响范围外环(橙色虚线):只在与半径明显不同时绘制,
                 // 它表示"方向键按下后手指实际被推到多远",用来对照游戏里真实摇杆的判定圈。
                 if (push_r - r).abs() > 1.0 {
@@ -7808,6 +9797,47 @@ impl PadApp {
                         c + vec2(0.0, push_r + 12.0),
                         Align2::CENTER_CENTER,
                         &format!("影响范围 {push_r:.0}px(×{scope:.2})"),
+                        FontId::proportional(size::SMALL_FONT),
+                        theme::tone_text(tone),
+                    );
+                }
+                // 手改终点(在方向行点过「设置位置」的那个点):从圆心拉一条虚线到终点,
+                // 终点画**一个圆圈**(不是圆点),并标出是哪个方向。它**不是**
+                // "角度 × 影响范围"的结果,所以用与影响范围环不同的颜色,
+                // 一眼能看出哪些方向被手改过。
+                //
+                // 圆圈的半径 = min(影响范围, 按键大小),见 [`wheel_dir_end_radius_px`]
+                // —— 那个函数就是"落点圆圈大小"的**预留接口**(现固定、未来可调)。
+                for (d, dir) in w.directions.iter().enumerate() {
+                    let Some((mx, my)) = dir.manual else { continue };
+                    let (px, py) = m.point(mx, my);
+                    let ep = to_screen(px, py);
+                    let ink = theme::tone_color(th.key_hold, tone);
+                    for shape in egui::Shape::dashed_line(
+                        &[c, ep],
+                        Stroke::new(3.5, theme::casing(ink)),
+                        5.0,
+                        4.0,
+                    ) {
+                        painter.add(shape);
+                    }
+                    for shape in egui::Shape::dashed_line(&[c, ep], Stroke::new(1.5, ink), 5.0, 4.0)
+                    {
+                        painter.add(shape);
+                    }
+                    let end_r = wheel_dir_end_radius_px(&m, w, scale);
+                    painter.circle_filled(ep, end_r, theme::with_alpha(ink, 45));
+                    painter.circle_stroke(
+                        ep,
+                        end_r,
+                        Stroke::new(size::KEY_STROKE + 2.5, theme::casing(ink)),
+                    );
+                    painter.circle_stroke(ep, end_r, Stroke::new(size::KEY_STROKE, ink));
+                    theme::paint_label(
+                        painter,
+                        ep + vec2(0.0, -end_r - 10.0),
+                        Align2::CENTER_CENTER,
+                        &wheel_dir_label(dir.angle_deg, d),
                         FontId::proportional(size::SMALL_FONT),
                         theme::tone_text(tone),
                     );
@@ -8427,12 +10457,43 @@ impl PadApp {
     fn ui_toggle_key_row(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("总开关键:");
+            // 用户 2026-10-09(第 4 条):总开关键与其它系统键统一成一个按钮,
+            // 支持 `Ctrl+X` 这样的组合(顺序无关),没有额外参数。
             let tk = { lock_shared(&self.shared).profile.toggle_key };
-            let waiting = self.waiting_key == Some(KeySlot::Toggle);
-            if Self::key_button(ui, waiting, Some(tk)).clicked() {
-                self.waiting_key = Some(KeySlot::Toggle);
+            let waiting = self.waiting_keys == Some(KeySlot::Toggle);
+            if Self::keys_button(ui, waiting, &tk).clicked() {
+                self.begin_keys_capture(KeySlot::Toggle);
+            }
+            if !tk.is_empty() && ui.small_button("清除").clicked() {
+                self.assign_keys(KeySlot::Toggle, KeySet::new());
             }
         });
+        // 「按后延迟」总开关(用户 2026-10-10 晚追加要求:整项**改成可选功能**)。
+        // 摆在这里与总开关键同一段:它俩都是**全局行为开关**,不是某一条键位的参数;
+        // 逐条的数字框仍在各自那条键位/组合键/宏自己的行上(见 `tail_delay_widget`)。
+        {
+            let mut on = lock_shared(&self.shared).profile.tail_delay_enabled;
+            if ui
+                .checkbox(&mut on, "按后延迟")
+                .on_hover_text(
+                    "默认关闭。关闭时整项不生效 —— 每条键位/组合键/宏自己的毫秒值\
+                     原样保留,但一律按 0(不等)处理,行为与没有这个功能时完全一致。\n\
+                     打开后还要那条自己填了 >0 的数才真等:两层都愿意才生效。\n\
+                     语义:那一条上一次**抬起**之后再等这么久才准下一次按下;\
+                     冷却里按下的那一次不丢,会被推迟到冷却结束再执行。\n\
+                     这个开关随当前键位组合(方案)一起保存 —— 每个方案各自一份。",
+                )
+                .changed()
+            {
+                self.push_undo();
+                lock_shared(&self.shared).profile.tail_delay_enabled = on;
+                self.log(if on {
+                    "已启用「按后延迟」:逐条数值开始生效(各条自己填 >0 才真等)"
+                } else {
+                    "已关闭「按后延迟」:全部按“不等”处理,各条数值原样保留"
+                });
+            }
+        }
         #[cfg(not(windows))]
         ui.checkbox(
             &mut self.grab_enabled,
@@ -8996,11 +11057,11 @@ impl PadApp {
         };
         if gamepad_mode {
             ui.label("把鼠标的相对位移映射成虚拟 Xbox 手柄右摇杆。游戏必须支持手柄右摇杆视角；该模式不需要锚点。");
-            ui.label("用法:先开启总映射,连接控制通道,按视角模式开关键进入。");
+            ui.label("用法:先开启总映射,连接控制通道,按 FPS 模式开关键进入。");
         } else {
             ui.label("把鼠标的相对位移映射成手机上的手指拖动。FPS 模式用于开镜/射击；开放世界模式用于无需射击的无限水平转向。");
             ui.label("锚点默认不设置。锚点不是游戏准星，而是虚拟手指落下的起点；应放在游戏 UI 之外的干净区域。");
-            ui.label("用法:先开启总映射，再到“瞄准锚点”取点，按视角模式开关键进入。");
+            ui.label("用法:先开启总映射，再到“瞄准锚点”取点，按 FPS 模式开关键进入。");
         }
 
         // —— 生效条件自检:直接告诉用户"现在为什么没反应" ——
@@ -9037,7 +11098,7 @@ impl PadApp {
         let mut checks = vec![
             (
                 mapping_enabled,
-                "映射总开关已开启（视角模式只在映射开启后生效）".to_string(),
+                "映射总开关已开启（FPS 模式只在映射开启后生效）".to_string(),
             ),
             (aim_on, "已勾选 [启用鼠标视角]".to_string()),
             (mouse_found, "检测到鼠标设备".to_string()),
@@ -9107,12 +11168,12 @@ impl PadApp {
                 th.warn,
                 "→ 已就绪,但当前不满足瞄准条件(绑了[按住才瞄准]时需按住该键)",
             );
-        } else if hold_key != 0 {
+        } else if !hold_key.is_empty() {
             ui.colored_label(
                 th.warn,
                 format!(
                     "→ 已就绪,但绑定了[按住才瞄准]:需按住 {} 时才会转动视角",
-                    key_name(hold_key)
+                    hold_key.label()
                 ),
             );
         } else {
@@ -9125,6 +11186,13 @@ impl PadApp {
         let mut pick_toggle_key = false;
         let mut pick_suspend_key = false;
         let mut pick_recoil_key = false;
+        let mut pick_recoil_switch = false;
+        // 本帧被点[取消设置]且当时**正在等待捕获**的槽位(用户 2026-10-10 第 3 条):
+        // 只取消这次捕获,不碰已有绑定。清空型(已绑定)不用它 —— 直接在上面写配置。
+        let mut cancel_bind: Option<KeySlot> = None;
+        // 本帧被点[上一档/下一档/第 N 档]要切到的挡位:挡位是引擎侧运行状态,
+        // 界面只能提一个请求(见 engine::Shared::recoil_gear_req 的注释)。
+        let mut recoil_gear_req: Option<usize> = None;
         let mut toggled = false;
         // 本帧修改前的快照:面板里任何一处改动都记一次撤销。
         // 连续拖动的数值控件只在"开始编辑"那一帧记录,避免每帧都产生一个撤销步。
@@ -9133,6 +11201,9 @@ impl PadApp {
         let mut undo_needed = false;
         // 锚点以像素显示(存储是相对值)
         let am = self.mapper();
+        // 「恢复默认」的目标:手机屏幕正中央(仍按配置的坐标单位换算)。
+        // 在加锁之前算好 —— `mapper()` 要读配置,持锁时再取会自锁。
+        let default_anchor = (am.rel_x((am.w / 2.0) as i32), am.rel_y((am.h / 2.0) as i32));
 
         {
             let mut g = lock_shared(&self.shared);
@@ -9156,7 +11227,7 @@ impl PadApp {
                 .changed()
             {
                 if aim.open_world {
-                    aim.hold_key = 0;
+                    aim.hold_key = KeySet::new();
                 }
                 undo_needed = true;
             }
@@ -9180,6 +11251,8 @@ impl PadApp {
             ui.horizontal(|ui| {
                 ui.label("视角输入:");
                 let previous = aim.input_mode;
+                // [已废弃 2026-10-08] 后两个选项(虚拟手柄右摇杆 连续/分段回中)不再维护:
+                // 仍然可选、行为不变,但不会再被修复或扩展(见 keymap.rs `ViewInputMode`)。
                 egui::ComboBox::from_id_salt("aim_input_mode")
                     .selected_text(aim.input_mode.label())
                     .show_ui(ui, |ui| {
@@ -9234,6 +11307,15 @@ impl PadApp {
                     {
                         to_pick = Some(CoordSlot::AimAnchor);
                     }
+                    if ui
+                        .button("恢复默认")
+                        .on_hover_text("把锚点放回手机屏幕正中央（新建配置仍不自动设置锚点）")
+                        .clicked()
+                    {
+                        aim.anchor_x = default_anchor.0;
+                        aim.anchor_y = default_anchor.1;
+                        undo_needed = true;
+                    }
                 });
                 ui.horizontal(|ui| {
                     ui.label("拖动死区:");
@@ -9247,7 +11329,7 @@ impl PadApp {
                     }
                     if ui
                         .checkbox(&mut aim.boundary, "限制在屏幕边界内")
-                        .on_hover_text("关闭后，累计偏移到达回转半径会无缝抬指/重按并保留余量；适合配合指针消隐做无限转向。")
+                        .on_hover_text("关闭后为「无边界」：触点推不动时会无缝抬指/重按并接着推，上下左右都能无限自由旋转。触点始终留在屏幕内，不会推到屏幕外被系统丢弃。")
                         .changed()
                     {
                         undo_needed = true;
@@ -9264,7 +11346,9 @@ impl PadApp {
                         if r.drag_started() || r.gained_focus() {
                             undo_needed = true;
                         }
-                        ui.label("（无边界模式下到达此半径就抬指重按）");
+                        ui.label(
+                            "（无边界模式下推到此半径就抬指重按；贴边时改按到屏幕边缘的距离）",
+                        );
                     });
                 }
             }
@@ -9383,21 +11467,24 @@ impl PadApp {
                 ui.horizontal(|ui| {
                     ui.label("按住才瞄准:");
                     let hk = aim.hold_key;
-                    let waiting = self.waiting_key == Some(KeySlot::AimHold);
-                    let shown = if hk == 0 { None } else { Some(hk) };
-                    if Self::key_button(ui, waiting, shown).clicked() {
+                    let waiting = self.waiting_keys == Some(KeySlot::AimHold);
+                    if Self::keys_button(ui, waiting, &hk).clicked() {
                         pick_hold_key = true;
                     }
-                    if hk != 0 && ui.small_button("清除").clicked() {
-                        aim.hold_key = 0;
-                        undo_needed = true;
+                    if (waiting || !hk.is_empty()) && Self::cancel_bind_button(ui, waiting) {
+                        if waiting {
+                            cancel_bind = Some(KeySlot::AimHold);
+                        } else {
+                            aim.hold_key = KeySet::new();
+                            undo_needed = true;
+                        }
                     }
                     if ui
                         .small_button("用右键")
                         .on_hover_text("开镜时才转动视角(按住右键瞄准)")
                         .clicked()
                     {
-                        aim.hold_key = crate::keymap::BTN_RIGHT;
+                        aim.hold_key = KeySet::single(crate::keymap::BTN_RIGHT);
                         undo_needed = true;
                     }
                     ui.label("(可绑鼠标右键,开镜时才动视角)");
@@ -9405,30 +11492,36 @@ impl PadApp {
             }
 
             ui.horizontal(|ui| {
-                ui.label("视角模式开关键:");
+                ui.label("FPS 模式开关键:");
                 let tk = aim.toggle_key;
-                let waiting = self.waiting_key == Some(KeySlot::AimToggle);
-                let shown = if tk == 0 { None } else { Some(tk) };
-                if Self::key_button(ui, waiting, shown).clicked() {
+                let waiting = self.waiting_keys == Some(KeySlot::AimToggle);
+                if Self::keys_button(ui, waiting, &tk).clicked() {
                     pick_toggle_key = true;
                 }
-                if tk != 0 && ui.small_button("清除").clicked() {
-                    aim.toggle_key = 0;
-                    undo_needed = true;
+                if (waiting || !tk.is_empty()) && Self::cancel_bind_button(ui, waiting) {
+                    if waiting {
+                        cancel_bind = Some(KeySlot::AimToggle);
+                    } else {
+                        aim.toggle_key = KeySet::new();
+                        undo_needed = true;
+                    }
                 }
                 ui.label("(只在总映射开启后可进入/退出)");
             });
             ui.horizontal(|ui| {
                 ui.label("按住才退出:");
                 let sk = aim.suspend_key;
-                let waiting = self.waiting_key == Some(KeySlot::AimSuspend);
-                let shown = if sk == 0 { None } else { Some(sk) };
-                if Self::key_button(ui, waiting, shown).clicked() {
+                let waiting = self.waiting_keys == Some(KeySlot::AimSuspend);
+                if Self::keys_button(ui, waiting, &sk).clicked() {
                     pick_suspend_key = true;
                 }
-                if sk != 0 && ui.small_button("清除").clicked() {
-                    aim.suspend_key = 0;
-                    undo_needed = true;
+                if (waiting || !sk.is_empty()) && Self::cancel_bind_button(ui, waiting) {
+                    if waiting {
+                        cancel_bind = Some(KeySlot::AimSuspend);
+                    } else {
+                        aim.suspend_key = KeySet::new();
+                        undo_needed = true;
+                    }
                 }
                 ui.label("(按住暂时退出 FPS,恢复普通映射并显示鼠标;松开回到 FPS)");
             });
@@ -9460,27 +11553,46 @@ impl PadApp {
                 };
                 ui.horizontal(|ui| {
                     ui.label("触发键:");
-                    let waiting = self.waiting_key == Some(KeySlot::RecoilTrigger);
-                    let shown = if aim.recoil.trigger_key == 0 {
-                        None
-                    } else {
-                        Some(aim.recoil.trigger_key)
-                    };
-                    if Self::key_button(ui, waiting, shown).clicked() {
+                    let rk = aim.recoil.trigger_key;
+                    let waiting = self.waiting_keys == Some(KeySlot::RecoilTrigger);
+                    if Self::keys_button(ui, waiting, &rk).clicked() {
                         pick_recoil_key = true;
                     }
-                    if aim.recoil.trigger_key != 0 && ui.small_button("清除").clicked() {
-                        aim.recoil.trigger_key = 0;
-                        undo_needed = true;
+                    if (waiting || !rk.is_empty()) && Self::cancel_bind_button(ui, waiting) {
+                        if waiting {
+                            cancel_bind = Some(KeySlot::RecoilTrigger);
+                        } else {
+                            aim.recoil.trigger_key = KeySet::new();
+                            undo_needed = true;
+                        }
                     }
                     if ui
                         .small_button("用左键")
                         .on_hover_text("射击键一般是鼠标左键(K2er 原文:一般是鼠标左键)")
                         .clicked()
                     {
-                        aim.recoil.trigger_key = crate::keymap::BTN_LEFT;
+                        aim.recoil.trigger_key = KeySet::single(crate::keymap::BTN_LEFT);
                         undo_needed = true;
                     }
+                });
+                // 挡位切换键(用户 2026-10-10 第 3 条):与上面几个系统键同一个控件
+                // ([`Self::keys_button`])—— 单键或最多两键的组合都收得下,按一下换一档。
+                ui.horizontal(|ui| {
+                    ui.label("挡位切换键:");
+                    let sk = aim.recoil.switch_key;
+                    let waiting = self.waiting_keys == Some(KeySlot::RecoilSwitch);
+                    if Self::keys_button(ui, waiting, &sk).clicked() {
+                        pick_recoil_switch = true;
+                    }
+                    if (waiting || !sk.is_empty()) && Self::cancel_bind_button(ui, waiting) {
+                        if waiting {
+                            cancel_bind = Some(KeySlot::RecoilSwitch);
+                        } else {
+                            aim.recoil.switch_key = KeySet::new();
+                            undo_needed = true;
+                        }
+                    }
+                    ui.label("(按一下换一档,循环;按住它时滚轮也能换档)");
                 });
                 ui.horizontal(|ui| {
                     ui.label("控制频率:");
@@ -9495,51 +11607,105 @@ impl PadApp {
                     if rr.drag_started() || rr.gained_focus() {
                         undo_needed = true;
                     }
-                    ui.label(format!("当前强度:第 {} 档", cur_idx + 1));
+                    ui.label(format!(
+                        "当前强度:第 {} 档(共 {} 档)",
+                        cur_idx + 1,
+                        n_strengths.max(1)
+                    ));
                 });
-                // 控制强度档位表:每档一个像素值;删除后自动收敛当前档
-                let mut remove_idx = None;
-                for (i, s) in aim.recoil.strengths.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("  第 {} 档:", i + 1));
-                        let d = ui
-                            .add(
-                                egui::DragValue::new(s)
-                                    .range(0.0..=200.0)
-                                    .speed(0.5)
-                                    .suffix(" px/次"),
-                            )
-                            .on_hover_text(
-                                "每次控制的向下位移(设备像素);20ms 一拍 60 次/秒时,6px ≈ 360px/s。",
-                            );
-                        if d.drag_started() || d.gained_focus() {
-                            undo_needed = true;
-                        }
-                        if n_strengths > 1 && ui.small_button("删除").clicked() {
-                            remove_idx = Some(i);
-                        }
-                    });
-                }
-                if let Some(i) = remove_idx {
-                    aim.recoil.strengths.remove(i);
-                    undo_needed = true;
-                }
+                // 界面手动换档(用户 2026-10-10 第 3 条:"支持界面手动切换挡位")。
+                // 与换档键、滚轮换档是**同一档位**:都落引擎侧那一个 `recoil_index`。
+                // 它是运行状态而不是配置 —— 所以不记撤销;配置里存的只有下面的档位表。
+                ui.horizontal(|ui| {
+                    ui.label("手动换档:");
+                    if ui
+                        .add_enabled(n_strengths >= 2, egui::Button::new("◀ 上一档"))
+                        .clicked()
+                    {
+                        recoil_gear_req = Some((cur_idx + n_strengths - 1) % n_strengths);
+                    }
+                    if ui
+                        .add_enabled(n_strengths >= 2, egui::Button::new("下一档 ▶"))
+                        .clicked()
+                    {
+                        recoil_gear_req = Some((cur_idx + 1) % n_strengths);
+                    }
+                    ui.label("(点下面某档的[第 n 档]也能直接切过去)");
+                });
+                // [＋ 添加一档]与[滚轮换档]放在档位表**外面**:档位多时表是收起的,
+                // 添加按钮跟着被藏起来就等于"越用越加不了档"。
+                let mut add_gear = false;
                 ui.horizontal(|ui| {
                     if ui
                         .button("＋ 添加一档")
                         .on_hover_text("K2er:控制强度可以增加多个强度")
                         .clicked()
                     {
-                        let last = aim.recoil.strengths.last().copied().unwrap_or(6.0);
-                        aim.recoil.strengths.push(last);
-                        undo_needed = true;
+                        add_gear = true;
                     }
                     ui.checkbox(&mut aim.recoil.wheel_switch, "滚轮换档")
                         .on_hover_text(
-                            "触发键按住期间,滚轮从\"缩放\"改为切换控制强度档\n\
-                             (K2er:鼠标滚轮改变强度);没按住触发键时滚轮仍是缩放。",
+                            "触发键(或挡位切换键)按住期间,滚轮从\"缩放\"改为切换控制强度档\n\
+                             (K2er:鼠标滚轮改变强度);这个键没按住时滚轮仍是缩放。\n\
+                             两者都想用滚轮时,补偿换档优先。",
                         );
                 });
+                if add_gear {
+                    let last = aim.recoil.strengths.last().copied().unwrap_or(6.0);
+                    aim.recoil.strengths.push(last);
+                    undo_needed = true;
+                }
+                // 控制强度档位表:每档一个像素值;删除后自动收敛当前档。
+                // 档位过多时默认收起(非添加模式),见 RECOIL_TIER_COLLAPSE_AT;
+                // 点[＋ 添加一档]的这一帧强制展开 —— 正在添加就不该藏。
+                let n_now = aim.recoil.strengths.len();
+                let mut remove_idx = None;
+                egui::CollapsingHeader::new("控制强度档位表")
+                    .default_open(n_now <= RECOIL_TIER_COLLAPSE_AT)
+                    .open(add_gear.then_some(true))
+                    .show(ui, |ui| {
+                        for (i, s) in aim.recoil.strengths.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                let current = i == cur_idx;
+                                let label = if current {
+                                    format!("▶ 第 {} 档", i + 1)
+                                } else {
+                                    format!("第 {} 档", i + 1)
+                                };
+                                if ui
+                                    .selectable_label(current, label)
+                                    .on_hover_text(
+                                        "点一下把当前档切到这一档(与换档键、滚轮换档同一档位)",
+                                    )
+                                    .clicked()
+                                    && !current
+                                {
+                                    recoil_gear_req = Some(i);
+                                }
+                                let d = ui
+                                    .add(
+                                        egui::DragValue::new(s)
+                                            .range(0.0..=200.0)
+                                            .speed(0.5)
+                                            .suffix(" px/次"),
+                                    )
+                                    .on_hover_text(
+                                        "每次控制的向下位移(设备像素);20ms 一拍 60 次/秒时,\
+                                         6px ≈ 360px/s。",
+                                    );
+                                if d.drag_started() || d.gained_focus() {
+                                    undo_needed = true;
+                                }
+                                if n_now > 1 && ui.small_button("删除").clicked() {
+                                    remove_idx = Some(i);
+                                }
+                            });
+                        }
+                    });
+                if let Some(i) = remove_idx {
+                    aim.recoil.strengths.remove(i);
+                    undo_needed = true;
+                }
                 ui.horizontal(|ui| {
                     ui.label("摇晃:");
                     let s = ui
@@ -9572,7 +11738,7 @@ impl PadApp {
             }
 
             if ui
-                .checkbox(&mut aim.capture_mouse, "指针消隐(视角模式下隐藏系统光标)")
+                .checkbox(&mut aim.capture_mouse, "指针消隐(FPS 模式下隐藏系统光标)")
                 .changed()
             {
                 undo_needed = true;
@@ -9597,17 +11763,49 @@ impl PadApp {
         if let Some(slot) = to_pick {
             self.begin_pick(slot);
         }
+        // 三个 FPS 系统键 + 压枪触发键/挡位切换键:统一按**组合键**捕获(2026-10-09 第 4 条)。
         if pick_hold_key {
-            self.waiting_key = Some(KeySlot::AimHold);
+            self.begin_keys_capture(KeySlot::AimHold);
         }
         if pick_toggle_key {
-            self.waiting_key = Some(KeySlot::AimToggle);
+            self.begin_keys_capture(KeySlot::AimToggle);
         }
         if pick_suspend_key {
-            self.waiting_key = Some(KeySlot::AimSuspend);
+            self.begin_keys_capture(KeySlot::AimSuspend);
         }
         if pick_recoil_key {
-            self.waiting_key = Some(KeySlot::RecoilTrigger);
+            self.begin_keys_capture(KeySlot::RecoilTrigger);
+        }
+        if pick_recoil_switch {
+            self.begin_keys_capture(KeySlot::RecoilSwitch);
+        }
+        // 本帧的[取消设置](用户 2026-10-10 第 3 条):等待捕获中 = 只退出捕获;
+        // 已绑定 = 退出捕获并清空(已绑定那种在面板里直接写了 `aim`,不用来这里)。
+        if cancel_bind.is_some() {
+            self.cancel_key_capture();
+            self.log("已取消设置:已退出按键捕获,原绑定保持不变");
+        }
+        // 界面手动换档:挡位是引擎侧运行状态,界面只能提一个请求(见
+        // `engine::Shared::recoil_gear_req` 的注释);引擎下一轮取走并镜像回来。
+        if let Some(req) = recoil_gear_req {
+            let applied = {
+                let mut g = lock_shared(&self.shared);
+                let n = g.profile.aim.recoil.strengths.len();
+                if n == 0 {
+                    None
+                } else {
+                    let idx = req.min(n - 1);
+                    g.recoil_gear_req = Some(idx);
+                    Some((idx, n))
+                }
+            };
+            if let Some((idx, n)) = applied {
+                self.log(format!(
+                    "后坐力补偿:控制强度切换到第 {} 档(共 {} 档)",
+                    idx + 1,
+                    n
+                ));
+            }
         }
         if toggled {
             // 用户明确要求锚点默认不设置。这里只提示，不再替用户放置。
@@ -9629,33 +11827,25 @@ impl PadApp {
         };
         let rows = lock_shared(&self.shared).switch_keys.clone();
         ui.heading("切换键位");
-        ui.small("支持单键或最多两个键的组合；按键顺序无关。可在[按键组合]里启用快速切换。");
+        ui.small(
+            "一个按钮搞定:点击后按住 Ctrl 再按另一个键即为组合键(最多两个键),\
+             顺序无关。可在[按键组合]里启用快速切换。",
+        );
         let mut delete = None;
         for (i, original) in rows.iter().enumerate() {
             let keys = original.effective_keys();
             let mut changed = false;
             ui.horizontal(|ui| {
                 ui.label(format!("切换{}:", i + 1));
-                let waiting = self.waiting_key == Some(KeySlot::SwitchKey(i));
-                let shown = keys.first().copied().filter(|k| *k != 0);
-                if Self::key_button(ui, waiting, shown).clicked() {
-                    self.waiting_key = Some(KeySlot::SwitchKey(i));
+                // 用户 2026-10-09(第 4 条):不再有"第一个键/第二个键"两个按钮,
+                // 也不再有[新增组合键]/[删除组合键] —— 整行就是一个组合键槽,
+                // 与总开关键那类系统键完全同一套交互(见 `keys_button`)。
+                let waiting = self.waiting_keys == Some(KeySlot::SwitchKey(i));
+                if Self::keys_button(ui, waiting, &keys).clicked() {
+                    self.begin_keys_capture(KeySlot::SwitchKey(i));
                 }
-                if keys.len() >= 2 {
-                    let waiting2 = self.waiting_key == Some(KeySlot::SwitchKeySecond(i));
-                    if Self::key_button(ui, waiting2, keys.get(1).copied()).clicked() {
-                        self.waiting_key = Some(KeySlot::SwitchKeySecond(i));
-                    }
-                    if ui.button("删除组合键").clicked() {
-                        if let Some(s) = lock_shared(&self.shared).switch_keys.get_mut(i) {
-                            s.keys.truncate(1);
-                        }
-                        changed = true;
-                    }
-                } else if ui.button("新增组合键").clicked() {
-                    if let Some(s) = lock_shared(&self.shared).switch_keys.get_mut(i) {
-                        s.keys = vec![s.key, 0];
-                    }
+                if !keys.is_empty() && ui.small_button("清除").clicked() {
+                    self.assign_keys(KeySlot::SwitchKey(i), KeySet::new());
                     changed = true;
                 }
                 ui.label("方式:");
@@ -9707,7 +11897,7 @@ impl PadApp {
         if ui.button("新增切换键位").clicked() {
             lock_shared(&self.shared).switch_keys.push(SwitchKey {
                 key: 0,
-                keys: Vec::new(),
+                keys: KeySet::new(),
                 target: next,
                 direction: SwitchDirection::Target,
             });
@@ -9721,10 +11911,10 @@ impl PadApp {
             };
             if removed {
                 self.scheme_dirty = true;
-                if self.waiting_key == Some(KeySlot::SwitchKey(i))
-                    || self.waiting_key == Some(KeySlot::SwitchKeySecond(i))
-                {
-                    self.waiting_key = None;
+                if self.waiting_keys == Some(KeySlot::SwitchKey(i)) {
+                    self.waiting_keys = None;
+                    self.capture_down.clear();
+                    self.capture_seen.clear();
                 }
             } else {
                 self.log("该切换键已不存在,未删除");
@@ -9850,19 +12040,23 @@ impl PadApp {
         ui.separator();
         ui.heading("鼠标消隐");
         ui.label("设置后不管普通模式还是 FPS 模式，按一下隐藏系统鼠标，再按一下显示。");
-        let mut cursor_key = 0u16;
+        let mut cursor_key = KeySet::new();
         ui.horizontal(|ui| {
             ui.label("切换键:");
             cursor_key = lock_shared(&self.shared).profile.cursor_toggle_key;
-            let waiting = self.waiting_key == Some(KeySlot::CursorToggle);
-            if Self::key_button(ui, waiting, (cursor_key != 0).then_some(cursor_key)).clicked() {
-                self.waiting_key = Some(KeySlot::CursorToggle);
-                self.log("请按一个键作为鼠标消隐切换键");
+            // 与其余系统键同一套:一个按钮捕获,支持 Ctrl+X(顺序无关)。
+            let waiting = self.waiting_keys == Some(KeySlot::CursorToggle);
+            if Self::keys_button(ui, waiting, &cursor_key).clicked() {
+                self.begin_keys_capture(KeySlot::CursorToggle);
             }
-            if cursor_key != 0 && ui.small_button("清除").clicked() {
-                self.push_undo();
-                lock_shared(&self.shared).profile.cursor_toggle_key = 0;
-                self.waiting_key = None;
+            if waiting {
+                // 等待捕获中:这一个按钮只退出捕获,不动已有的绑定(见 [`Self::cancel_bind_button`])
+                if Self::cancel_bind_button(ui, true) {
+                    self.cancel_key_capture();
+                    self.log("已取消设置:已退出按键捕获,原绑定保持不变");
+                }
+            } else if !cursor_key.is_empty() && Self::cancel_bind_button(ui, false) {
+                self.assign_keys(KeySlot::CursorToggle, KeySet::new());
             }
             let hidden = self.cursor_hide_flag.load(Ordering::Relaxed);
             if ui
@@ -9933,11 +12127,31 @@ impl PadApp {
         if let Some(updated) = info.updated_at {
             ui.small(format!("最后刷新: {}", fmt_timestamp(updated)));
         }
-        if self.debug_rx.is_some() {
-            ui.colored_label(th.warn, "正在刷新...");
-        }
-        if let Some(error) = info.error {
-            ui.colored_label(th.danger, error);
+        // 「正在刷新...」与"读取失败:..."是**条件出现**的,而且刷新是每 2 秒一轮
+        // (见 `DEBUG_POLL_INTERVAL`)。按内容排布的话,这一行每 2 秒出现一次,把下面整块
+        // (手动 adb 命令)连人带按钮推下去又弹回来 —— 用户 2026-10-09 要求这种抖动必须消失。
+        // 做法:给它们一个**固定高度的单行槽位**,有内容没内容、内容换不换,位置都不动;
+        // 超宽就单行截断,完整文字挂在 hover 提示里。
+        let status = match self.debug_rx.is_some() {
+            true => Some((
+                th.warn,
+                "正在刷新...".to_string(),
+                "正在向设备读取调试信息".to_string(),
+            )),
+            false => info.error.map(|e| (th.danger, e.clone(), e)),
+        };
+        let (status_rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+            egui::Sense::hover(),
+        );
+        if let Some((color, text, full)) = status {
+            ui.put(
+                status_rect,
+                egui::Label::new(egui::RichText::new(text).color(color))
+                    .wrap_mode(egui::TextWrapMode::Truncate)
+                    .sense(egui::Sense::hover()),
+            )
+            .on_hover_text(full);
         }
         self.ui_manual_adb(ui);
     }
@@ -10537,22 +12751,24 @@ impl PadApp {
         self.ui_picker_body(ui);
     }
 
-    /// 截图取点的按钮行 + 预览画布(不含标题)。
-    /// 放在"截图取点"标题下(默认/可视化风格共用这一份)。
-    fn ui_picker_body(&mut self, ui: &mut egui::Ui) {
-        let preview_scale_base = self
-            .shot
-            .as_ref()
-            .map(|(_, w, h)| {
-                screenshot_fit_scale(
-                    ui.available_width(),
-                    ui.ctx().viewport_rect().height(),
-                    *w,
-                    *h,
-                )
-            })
-            .unwrap_or(1.0);
-        ui.horizontal(|ui| {
+    /// 截图**抬头**:按钮行(截图 / 缩放 / 小窗 / 显示项目…)+ 状态提示(取点中 /
+    /// 取消取点 / 修改范围中)+ 坐标空间一致性提示 —— 下方面板与截图小窗**共用同一份**。
+    ///
+    /// 用户 2026-10-10(第 3 条):"截图框要带上原有整套抬头('显示项目''取消取点'等)"。
+    /// 所以这段从 `ui_picker_body` 里摊出来,谁画截图画布谁就带上它 —— 各写一份必然
+    /// 越走越远(加了新按钮只在一个地方生效)。用 `horizontal_wrapped` 是因为小窗可能
+    /// 比这行按钮还窄,硬排会直接把右边的控件切掉。
+    fn ui_shot_header(&mut self, ui: &mut egui::Ui) {
+        // 百分比直接取画布上一帧实际用的基准(见 `ui_shot_canvas`),不再另算一份
+        // —— 两处各算一份时容易悄悄跑偏(容器宽高不同,显示的百分比就不等于真实倍率)。
+        // 小窗开着时画布在小窗里,倍率走的是小窗自己那份绝对基准,这里也跟着切过去,
+        // 否则抬头会显示下方面板的倍率、跟眼前这张图对不上。
+        let preview_scale_base = if self.shot_window_open {
+            self.shot_popup_base
+        } else {
+            self.shot_last_base
+        };
+        ui.horizontal_wrapped(|ui| {
             let taking = self.shot_rx.is_some();
             if ui
                 .button(if taking {
@@ -10565,21 +12781,24 @@ impl PadApp {
             {
                 self.take_screenshot();
             }
-            if ui.button("+").on_hover_text("放大截图预览").clicked() {
-                self.shot_zoom_auto = false;
-                self.shot_zoom = (self.shot_zoom * 1.2).clamp(0.25, 3.0);
+            self.ui_shot_zoom_buttons(ui);
+            // 截图小窗(用户 2026-10-09):同一个位置、两个名字的按钮来回切 ——
+            // 悬浮时内容搬进独立窗口,再点一次就拼回下方面板(布局与之前一字不差)。
+            let (win_label, win_hint) = if self.shot_window_open {
+                ("关闭小窗", "把截图放回下方面板(恢复原来的布局)")
+            } else {
+                ("小窗悬浮", "把截图独立成一个可移动的小窗")
+            };
+            if ui.button(win_label).on_hover_text(win_hint).clicked() {
+                self.shot_window_open = !self.shot_window_open;
+                // 从主界面/小窗自己这儿开的:小窗画实时配置(扩展宏弹窗开的走它自己那条路)
+                self.shot_window_virtual = false;
+                // 窗口尺寸不在这里定:小窗每帧按当前倍率自己算(见 `ui_shot_window`),
+                // 于是 `±` 一改倍率窗口就跟着变,不必再记"开窗那一刻该多大"。
             }
-            if ui.button("-").on_hover_text("缩小截图预览").clicked() {
-                self.shot_zoom_auto = false;
-                self.shot_zoom = (self.shot_zoom / 1.2).clamp(0.25, 3.0);
-            }
-            if ui
-                .button("重置")
-                .on_hover_text("恢复默认截图大小")
-                .clicked()
-            {
-                self.shot_zoom_auto = true;
-                self.shot_zoom = 1.0;
+            if self.shot_window_open {
+                ui.checkbox(&mut self.shot_window_pin, "置顶")
+                    .on_hover_text("勾上:小窗固定在其他窗口上方;不勾:可以被其他窗口盖住");
             }
             ui.label(format!(
                 "{:.0}%{}",
@@ -10603,7 +12822,9 @@ impl PadApp {
                         "取点中: 请点击截图上的目标位置"
                     },
                 );
-                if ui.button("取消取点").clicked() {
+                let cancel = ui.button("取消取点");
+                Self::note_cancel_zone(ui, &cancel);
+                if cancel.clicked() {
                     if draft_pick {
                         // 新增草稿尚未添加,取消时连同圆圈一起清除
                         self.cancel_draft();
@@ -10618,7 +12839,9 @@ impl PadApp {
                 } else {
                     ui.label("新增未完成(尚未[添加])");
                 }
-                if ui.button("取消取点").clicked() {
+                let cancel = ui.button("取消取点");
+                Self::note_cancel_zone(ui, &cancel);
+                if cancel.clicked() {
                     self.cancel_draft();
                     self.log("已取消新增");
                 }
@@ -10698,13 +12921,173 @@ impl PadApp {
                 }
             }
         }
+    }
 
+    /// 截图取点的按钮行 + 预览画布(不含标题)。
+    /// 放在"截图取点"标题下(默认/可视化风格共用这一份)。
+    fn ui_picker_body(&mut self, ui: &mut egui::Ui) {
+        self.ui_shot_header(ui);
+        // 小窗模式:画布整个搬进独立窗口(见 `ui_shot_window`),面板里不再重复画。
+        // 按钮行仍留在原处 —— 所以"再点一次同一个位置、另一个名字的按钮"就能拼回来。
+        if !self.shot_window_open {
+            // 下方面板恒画实时配置(虚拟层只属于扩展宏弹窗,见 `ui_shot_canvas`)
+            self.ui_shot_canvas(ui, ShotCanvasKind::Panel, false);
+        }
+    }
+
+    /// 放大/缩小/重置预览缩放(截图面板与截图小窗共用一份,不复制第二份逻辑)。
+    ///
+    /// 只改 `shot_zoom` 这一个数:图的大小由它算,**小窗的窗口大小**也由它算
+    /// (见 [`Self::shot_window_size`],每帧按倍率给一次 `with_inner_size`)——
+    /// 于是"`±` 同时缩放截图大小与弹窗大小"是自然结果,不需要在这里额外去动窗口。
+    fn ui_shot_zoom_buttons(&mut self, ui: &mut egui::Ui) {
+        if ui.button("+").on_hover_text("放大截图预览").clicked() {
+            self.shot_zoom_auto = false;
+            self.shot_zoom = (self.shot_zoom * 1.2).clamp(0.25, 3.0);
+        }
+        if ui.button("-").on_hover_text("缩小截图预览").clicked() {
+            self.shot_zoom_auto = false;
+            self.shot_zoom = (self.shot_zoom / 1.2).clamp(0.25, 3.0);
+        }
+        if ui
+            .button("重置")
+            .on_hover_text("恢复默认截图大小")
+            .clicked()
+        {
+            self.shot_zoom_auto = true;
+            self.shot_zoom = 1.0;
+        }
+    }
+
+    /// 小窗里这张图现在的**绝对**倍率:小窗专用基准 × 用户倍率。
+    ///
+    /// 与下方面板/扩展宏弹窗那条路([`Self::shot_last_base`],按容器内接)刻意分开:
+    /// 小窗的窗口尺寸是由这个倍率**算出来**的,若倍率又反过来由窗口尺寸决定,两者
+    /// 就会互相追着放大(见 `shot_popup_base` 的注释)。
+    fn shot_popup_scale(&self) -> f32 {
+        (self.shot_popup_base * self.shot_zoom).clamp(0.05, 4.0)
+    }
+
+    /// 小窗此刻应有的**内容尺寸**(pt):图按 [`Self::shot_popup_scale`] 占多大 + 抬头一行。
+    ///
+    /// 每帧都给 `with_inner_size` 同一个值不会把用户手动拉伸的尺寸顶回去(框架只在
+    /// 值**变了**的时候下发 `ViewportCommand::InnerSize`),所以这里可以放心地按状态算 ——
+    /// 于是"`±` 同时缩放截图大小与弹窗大小"就是自然结果:`shot_zoom` 一变,窗口跟着变。
+    ///
+    /// 尺寸**封顶**在 [`shot_popup_area`](程序窗口 ∩ 系统屏幕):手动放大到放不下时,
+    /// 让图比窗口大、靠滚轮翻着看,而不是把窗口撑出屏幕外面去。
+    fn shot_window_size(&self, ctx: &egui::Context) -> egui::Vec2 {
+        let area = shot_popup_area(ctx);
+        let scale = self.shot_popup_scale();
+        // 没截图时给一个能用的默认尺寸(与旧写死的 460x820 相近,但按行高算)
+        let (iw, ih) = self
+            .shot
+            .as_ref()
+            .map(|(_, w, h)| (*w as f32 * scale, *h as f32 * scale))
+            .unwrap_or((440.0, 760.0));
+        // 抬头高度取上一帧的实测值(它会换行,不是一个常数);还没量过时按两行估。
+        let header = if self.shot_window_header_h > 0.0 {
+            self.shot_window_header_h
+        } else {
+            SHOT_POPUP_HEADER_EST
+        };
+        // 取整到 1pt:否则浮点尾数每帧抖一点就够触发一次多余的窗口尺寸下发。
+        egui::vec2(
+            (iw + SHOT_POPUP_PAD).ceil().min(area.x),
+            (ih + header + SHOT_POPUP_PAD).ceil().min(area.y),
+        )
+    }
+
+    /// 截图区上方的**可拖动分界条**(扩展宏弹窗专用):上下拖动改下方画布区的高度。
+    ///
+    /// 用户 2026-10-09 第三轮:"宏截图…文字与图像分界可拖动调整,布局/尺寸正确,不被文字压住"。
+    /// 所以它自己占一条细缝、自己接拖拽,画布区按拖出来的高度铺开 ——
+    /// 文字在上、图在下,各占各的地方,谁也不压谁。
+    fn ui_shot_divider(&mut self, ui: &mut egui::Ui) {
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), MACRO_SHOT_DIVIDER_H),
+            egui::Sense::drag(),
+        );
+        let active = resp.hovered() || resp.dragged();
+        if active {
+            // 光标换成"上下可调",不用提示文字也知道这里能拖
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        }
+        if resp.dragged() {
+            // 向下拖 = 分界下移 = 画布区变小(与手感一致:抓住的是分界线本身)
+            self.macro_shot_height = (self.macro_shot_height + resp.drag_delta().y)
+                .clamp(MACRO_SHOT_MIN_H, MACRO_SHOT_MAX_H);
+        }
+        let th = self.theme();
+        let color = if active { th.accent } else { th.muted };
+        let y = rect.center().y;
+        let painter = ui.painter();
+        painter.line_segment(
+            [
+                egui::pos2(rect.left(), y),
+                egui::pos2(rect.center().x - 18.0, y),
+            ],
+            egui::Stroke::new(1.0, color),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(rect.center().x + 18.0, y),
+                egui::pos2(rect.right(), y),
+            ],
+            egui::Stroke::new(1.0, color),
+        );
+        // 中间三段小横线当握把(比单线更"看得出是能抓的东西")
+        for i in -1..=1 {
+            let cx = rect.center().x + i as f32 * 6.0;
+            painter.line_segment(
+                [egui::pos2(cx, y - 3.0), egui::pos2(cx, y + 3.0)],
+                egui::Stroke::new(1.5, color),
+            );
+        }
+        if resp.hovered() {
+            resp.on_hover_text("拖动这条分界可以改截图区的高矮");
+        }
+    }
+
+    /// 截图画布本体:图片 + 浮层 + 取点 / 拖拽改范围的命中处理(不含按钮行与状态提示)。
+    ///
+    /// 2026-10-09 从 `ui_picker_body` 摊出来,好让三处共用同一份:
+    /// ①下方面板 ②截图小窗 ③扩展宏弹窗里"拼在虚拟键位下方"的那块。
+    ///
+    /// **尺寸与滚动的分工(用户 2026-10-10 第 3 条)**:画布只按 `kind` 决定"图多大",
+    /// 与"这块地方多高"彻底解耦 ——
+    /// - 图比可视区小:图居中,没有滚动条(旧实现把图缩到与容器一样大,于是放大
+    ///   这件事根本看不出来,还被误当成"上下滚动被禁用");
+    /// - 图比可视区大:**滚轮上下(左右)翻动**去取点,`±` 调大小,两者互不牵制;
+    /// - 可视区多高由**外层**决定(下方面板靠拖分隔条、扩展宏弹窗靠拖分界条),
+    ///   图再大也撑不动它 —— "截图大小不得决定控件高度,控件高度只由鼠标拖拽决定"。
+    ///
+    /// `kind`:这块画布画在哪 —— 决定"自动倍率"怎么算(见 [`ShotCanvasKind`]),
+    /// 也决定滚动位置各自独立(一份 salt 一份记忆,互不串)。
+    ///
+    /// `virtual_layer`:这块画布要不要画**扩展宏弹窗**那份虚拟键位表。
+    /// 用户 2026-10-10(第 4 条)报的两个现象(换成继承键位后截图不同步、新加的取点
+    /// 闪一帧就没了)是同一个根因:旧实现只在"正在虚拟取点"那一帧才切到虚拟层,
+    /// 于是弹窗开着的时候画布画的仍是实时配置。现在由调用方按**画的这块地方属于谁**
+    /// 来定,弹窗那块恒为 true。
+    fn ui_shot_canvas(&mut self, ui: &mut egui::Ui, kind: ShotCanvasKind, virtual_layer: bool) {
         let shot = self.shot.as_ref().map(|(t, w, h)| (t.id(), *w, *h));
         if let Some((tex_id, w, h)) = shot {
-            let avail = ui.available_width();
-            // 自动适应同时参考可用宽度、窗口高度和截图长宽比；窗口改变时重算，
-            // 竖屏不再只按宽度硬撑，横屏也不会顶出可视区域。
-            let base_scale = screenshot_fit_scale(avail, ui.ctx().viewport_rect().height(), w, h);
+            // 这块地方能给出多少地方:小窗/弹窗/下方面板各按自己的容器算。
+            let view = ui.available_size();
+            let base_scale = match kind {
+                ShotCanvasKind::Popup => {
+                    // 小窗:基准由**屏幕与程序窗口边界**定(见 [`Self::shot_popup_scale`]),
+                    // 刻意不看小窗自己多大 —— 否则 `±` 改窗口、窗口又改倍率会互相追着放大。
+                    self.shot_popup_base
+                }
+                ShotCanvasKind::Panel | ShotCanvasKind::Macro => {
+                    let b = shot_auto_base(view.x, view.y, w, h);
+                    // 抬头那个百分比显示的就是它 × `shot_zoom`(见 `ui_shot_zoom_buttons`)。
+                    self.shot_last_base = b;
+                    b
+                }
+            };
             let scale = (base_scale * self.shot_zoom).clamp(0.05, 4.0);
             let size = egui::vec2(w as f32 * scale, h as f32 * scale);
             // 取点或修改响应范围时需要拖拽响应
@@ -10713,112 +13096,192 @@ impl PadApp {
             } else {
                 egui::Sense::click()
             };
-            let (rect, resp) = ui.allocate_exact_size(size, sense);
-            ui.painter().image(
-                tex_id,
-                rect,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
-            self.draw_overlay(ui, rect, scale);
+            // 内容尺寸 = 图与可视区里的**大者**:图小就撑满可视区再把图居中
+            // (等比内接留在某一维的余量均匀落两侧,不堆在右/下),图大就出滚动条。
+            let content = size.max(view);
+            let scroll = egui::ScrollArea::both()
+                .id_salt(kind.scroll_salt())
+                .auto_shrink([false, false]);
+            scroll.show(ui, |ui| {
+                let (area, resp) = ui.allocate_exact_size(content, sense);
+                let rect = egui::Rect::from_center_size(area.center(), size);
+                ui.painter().image(
+                    tex_id,
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+                // 虚拟层画布 = 调用方点名的那块 + "正举着一次虚拟取点"这条老口子
+                // (取点可能在主界面下方面板上继续,那种帧也得看得见虚拟层)。
+                let virtual_src = virtual_layer || self.picking.is_some_and(CoordSlot::is_virtual);
+                self.draw_overlay(ui, rect, scale, virtual_src);
 
-            // 拖动圆圈缩放响应范围。
-            // 这里直接看原始指针状态,而不是 resp.dragged():截图位于双向滚动区内,
-            // 拖拽仲裁可能被滚动区吃掉,表现为"拖不动"。只要按下时落在截图上,
-            // 按住期间半径就一直跟着指针走(直接点一下也能把半径设到该距离)。
-            if let Some(target) = self.resizing {
-                let (down, pos, origin) = ui.input(|inp| {
-                    (
-                        inp.pointer.primary_down(),
-                        inp.pointer.interact_pos(),
-                        inp.pointer.press_origin(),
-                    )
-                });
-                // 纵向截图很窄,图片左右会留大片空白:把命中区按可用宽度横向摊开,
-                // 免得必须"精确点中那张小图"才能拖动。
-                let hit = rect.expand2(egui::vec2(((avail - rect.width()) / 2.0).max(0.0), 0.0));
-                if down && origin.map(|o| hit.contains(o)).unwrap_or(false) {
-                    if let Some(pos) = pos {
-                        // 目标圆心(像素):键位取自己的坐标,轮盘取圆心
-                        let (cx, cy) = {
-                            let g = lock_shared(&self.shared);
+                // 拖动圆圈缩放响应范围。
+                // 这里直接看原始指针状态,而不是 resp.dragged():截图位于双向滚动区内,
+                // 拖拽仲裁可能被滚动区吃掉,表现为"拖不动"。只要按下时落在截图上,
+                // 按住期间半径就一直跟着指针走(直接点一下也能把半径设到该距离)。
+                if let Some(target) = self.resizing {
+                    let (down, pos, origin) = ui.input(|inp| {
+                        (
+                            inp.pointer.primary_down(),
+                            inp.pointer.interact_pos(),
+                            inp.pointer.press_origin(),
+                        )
+                    });
+                    // 命中区就是整块内容区(含图小的时候内接留下的余量):不必"精确点中
+                    // 那张小图"才能拖动,点在旁边的空白里同样算数。
+                    let hit = area;
+                    if down && origin.map(|o| hit.contains(o)).unwrap_or(false) {
+                        if let Some(pos) = pos {
+                            // 目标圆心(像素):键位取自己的坐标,轮盘取圆心
+                            let (cx, cy) = {
+                                let g = lock_shared(&self.shared);
+                                let m = g.profile.mapper((w, h));
+                                match target {
+                                    ResizeTarget::Bind(i) => {
+                                        match g.profile.binds.get(i).map(|b| &b.action) {
+                                            Some(Action::Tap { x, y, .. })
+                                            | Some(Action::Hold { x, y, .. }) => m.point(*x, *y),
+                                            _ => (0, 0),
+                                        }
+                                    }
+                                    ResizeTarget::Wheel(i) => match g.profile.wheels.get(i) {
+                                        Some(wl) => m.point(wl.cx, wl.cy),
+                                        None => (0, 0),
+                                    },
+                                }
+                            };
+                            let dx = pos.x - (rect.min.x + cx as f32 * scale);
+                            let dy = pos.y - (rect.min.y + cy as f32 * scale);
+                            let new_r = ((dx * dx + dy * dy).sqrt() / scale).max(0.01);
+                            let mut g = lock_shared(&self.shared);
                             let m = g.profile.mapper((w, h));
                             match target {
                                 ResizeTarget::Bind(i) => {
-                                    match g.profile.binds.get(i).map(|b| &b.action) {
-                                        Some(Action::Tap { x, y, .. })
-                                        | Some(Action::Hold { x, y, .. }) => m.point(*x, *y),
-                                        _ => (0, 0),
-                                    }
-                                }
-                                ResizeTarget::Wheel(i) => match g.profile.wheels.get(i) {
-                                    Some(wl) => m.point(wl.cx, wl.cy),
-                                    None => (0, 0),
-                                },
-                            }
-                        };
-                        let dx = pos.x - (rect.min.x + cx as f32 * scale);
-                        let dy = pos.y - (rect.min.y + cy as f32 * scale);
-                        let new_r = ((dx * dx + dy * dy).sqrt() / scale).max(0.01);
-                        let mut g = lock_shared(&self.shared);
-                        let m = g.profile.mapper((w, h));
-                        match target {
-                            ResizeTarget::Bind(i) => {
-                                if let Some(b) = g.profile.binds.get_mut(i) {
-                                    match &mut b.action {
-                                        Action::Tap { radius, .. }
-                                        | Action::Hold { radius, .. } => {
-                                            // 界面按像素拖动,存储换算成相对值
-                                            *radius = m.rel_len(new_r);
+                                    if let Some(b) = g.profile.binds.get_mut(i) {
+                                        match &mut b.action {
+                                            Action::Tap { radius, .. }
+                                            | Action::Hold { radius, .. } => {
+                                                // 界面按像素拖动,存储换算成相对值
+                                                *radius = m.rel_len(new_r);
+                                            }
+                                            _ => {}
                                         }
-                                        _ => {}
+                                    }
+                                }
+                                ResizeTarget::Wheel(i) => {
+                                    if let Some(wl) = g.profile.wheels.get_mut(i) {
+                                        wl.radius = m.rel_len(new_r);
                                     }
                                 }
                             }
-                            ResizeTarget::Wheel(i) => {
-                                if let Some(wl) = g.profile.wheels.get_mut(i) {
-                                    wl.radius = m.rel_len(new_r);
+                        }
+                    }
+                }
+
+                if resp.clicked() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let px = ((pos.x - rect.min.x) / scale) as i32;
+                        let py = ((pos.y - rect.min.y) / scale) as i32;
+                        // 等比内接必然在某一维留下余量:点在余量里不算"点到截图",
+                        // 否则会取到一个屏幕外的坐标(以前命中区就等于图片本身,没这问题)。
+                        let on_image = rect.contains(pos);
+                        if on_image && let Some(slot) = self.picking {
+                            // W2-2:武装期间空间失去对齐(手机转了屏 / 截图被换)也要拦住。
+                            // 保持武装不消费 —— 对齐后直接再点即可,不必重新[取点]。
+                            if let Some(m) = self.space_guard() {
+                                self.log(format!("取点被阻止:{},本点未写入", m.describe()));
+                            } else {
+                                self.picking = None;
+                                self.assign_coord(slot, px, py);
+                                // 新增取点后若尚未设键位,立即进入等待按键
+                                if slot == CoordSlot::NewBind && self.draft.key.is_none() {
+                                    self.waiting_key = Some(KeySlot::NewBind);
+                                    self.log("已取点,请按下要绑定的按键");
                                 }
                             }
-                        }
-                    }
-                }
-            }
-
-            if resp.clicked() {
-                if let Some(pos) = resp.interact_pointer_pos() {
-                    let px = ((pos.x - rect.min.x) / scale) as i32;
-                    let py = ((pos.y - rect.min.y) / scale) as i32;
-                    if let Some(slot) = self.picking {
-                        // W2-2:武装期间空间失去对齐(手机转了屏 / 截图被换)也要拦住。
-                        // 保持武装不消费 —— 对齐后直接再点即可,不必重新[取点]。
-                        if let Some(m) = self.space_guard() {
-                            self.log(format!("取点被阻止:{},本点未写入", m.describe()));
+                        } else if on_image && let Some(i) = self.wheel_at(px, py) {
+                            // 点到某个摇杆的响应圈:弹出/收起它的方向键信息卡
+                            // (画布上只留"摇杆N",细节按需查看)
+                            self.wheel_info = if self.wheel_info == Some(i) {
+                                None
+                            } else {
+                                Some(i)
+                            };
                         } else {
-                            self.picking = None;
-                            self.assign_coord(slot, px, py);
-                            // 新增取点后若尚未设键位,立即进入等待按键
-                            if slot == CoordSlot::NewBind && self.draft.key.is_none() {
-                                self.waiting_key = Some(KeySlot::NewBind);
-                                self.log("已取点,请按下要绑定的按键");
+                            // 点到图上空白处:收起信息卡,并照旧报一次坐标。
+                            // 点在图片外的余量里(等比内接留下的边):只收卡片,不报坐标。
+                            self.wheel_info = None;
+                            if on_image {
+                                self.log(format!("截图坐标: ({px}, {py})"));
                             }
                         }
-                    } else if let Some(i) = self.wheel_at(px, py) {
-                        // 点到某个摇杆的响应圈:弹出/收起它的方向键信息卡
-                        // (画布上只留"摇杆N",细节按需查看)
-                        self.wheel_info = if self.wheel_info == Some(i) {
-                            None
-                        } else {
-                            Some(i)
-                        };
-                    } else {
-                        // 点到空白处:收起信息卡,并照旧报一次坐标
-                        self.wheel_info = None;
-                        self.log(format!("截图坐标: ({px}, {py})"));
                     }
                 }
-            }
+            });
         }
+    }
+
+    /// 截图小窗(2026-10-09):把截图画布放进一个**独立窗口**,可勾选置顶。
+    ///
+    /// 用独立视口(`show_viewport_immediate`)而不是 `egui::Window`,只有一个理由:
+    /// 只有视口能真正"固定在其他窗口上方"(`with_always_on_top`)—— 同一个进程里的
+    /// `egui::Window` 永远盖不住别的应用。调试信息悬浮窗走的也是这一套,此处不另起炉灶。
+    ///
+    /// 用户 2026-10-10(第 3 条)之后,这个小窗:
+    /// - **按屏幕分辨率自动定比例** —— 竖屏纵向、横屏横向默认 100%,放不下就按
+    ///   "程序窗口 ∩ 系统屏幕"缩到放得下(见 [`shot_popup_area`] / [`shot_auto_base`]);
+    /// - **`±` 同时缩放截图与窗口** —— 每帧按 `shot_zoom` 算出应有的窗口尺寸交给
+    ///   `with_inner_size`(框架只在值变了时才真的下发命令,所以不会顶掉手动拉伸);
+    /// - **带上整套抬头** —— 与下方面板共用 [`Self::ui_shot_header`],不再只有三个按钮。
+    fn ui_shot_window(&mut self, ctx: &egui::Context) {
+        if !self.shot_window_open {
+            return;
+        }
+        // 小窗的绝对基准(屏幕/程序窗口边界下的合适大小)。**每帧重算**:主窗口被
+        // 拉小、或换了截图,小窗里的图跟着变到"仍然放得下"的倍率。
+        //
+        // 高度预算要**先扣掉抬头**(小窗的窗口 = 图 + 抬头):抬头用估算值而不是上一帧
+        // 实测值 —— 实测值随窗口宽度换行、窗口宽度又由这个基准算,两个都取实测就会互相追。
+        let area = shot_popup_area(ctx);
+        let budget = egui::vec2(
+            (area.x - SHOT_POPUP_PAD).max(160.0),
+            (area.y - SHOT_POPUP_HEADER_EST - SHOT_POPUP_PAD).max(160.0),
+        );
+        self.shot_popup_base = match self.shot.as_ref() {
+            Some((_, w, h)) => shot_auto_base(budget.x, budget.y, *w, *h),
+            None => 1.0,
+        };
+        let size = self.shot_window_size(ctx);
+        let mut vb = egui::ViewportBuilder::default()
+            .with_title("scrcpy-pad 截图")
+            .with_inner_size([size.x, size.y])
+            .with_min_inner_size([160.0, 160.0])
+            .with_resizable(true);
+        if self.shot_window_pin {
+            vb = vb.with_always_on_top();
+        }
+        let _ = ctx.show_viewport_immediate(shot_window_viewport_id(), vb, |ui, _class| {
+            // 点右上角的 X(用户 2026-10-09:"点 X:关闭小窗,主程序恢复显示")。
+            // 独立视口的关闭请求要自己接住 —— 不接就等于"点了没反应";
+            // 接住 = 只关小窗(内容随即拼回下方面板),主程序照常在那儿。
+            // 与调试信息悬浮窗同一套写法。
+            if ui.input(|i| i.viewport().close_requested()) {
+                self.shot_window_open = false;
+                // 视口在这一帧里被请求关闭,后面就别再往里画东西了
+                return;
+            }
+            // 抬头 = 与下方面板**同一份**(按钮行 / 显示项目 / 取点中→取消取点…)。
+            // 顺手量一下它实际占多高:`shot_window_size` 要用它把图高加上去,
+            // 否则抬头会把图挤掉一截(抬头会换行,高度不是常数)。
+            let y0 = ui.cursor().top();
+            self.ui_shot_header(ui);
+            self.shot_window_header_h = (ui.cursor().top() - y0).max(ui.spacing().interact_size.y);
+            // 画布自己带滚动区(见 `ui_shot_canvas`),这里不再套一层。
+            // 小窗画哪一层,看它是"从扩展宏弹窗打开"还是"从主界面打开"
+            // (见 `shot_window_virtual`);倍率走小窗专用的绝对基准。
+            self.ui_shot_canvas(ui, ShotCanvasKind::Popup, self.shot_window_virtual);
+        });
     }
 
     /// 命中测试:截图坐标 (px, py) 落在哪个摇杆的响应圈里(没有则 None)。
@@ -10855,6 +13318,66 @@ impl PadApp {
 /// "点一下摇杆看键位"的最小命中半径(截图像素):摇杆调得很小时也点得中
 const WHEEL_CLICK_MIN_RADIUS: f32 = 24.0;
 
+/// 扩展宏弹窗里截图画布区的高度:默认值 / 可拖范围(pt)。
+/// 用户 2026-10-09 第三轮:"文字与图像分界可拖动调整,布局/尺寸正确,不被文字压住" ——
+/// 所以这里不再写死一个 `max_height`,而是留一条能让用户自己定的分界。
+const MACRO_SHOT_DEFAULT_H: f32 = 320.0;
+const MACRO_SHOT_MIN_H: f32 = 120.0;
+const MACRO_SHOT_MAX_H: f32 = 1200.0;
+/// 那条可拖分界条的厚度(pt):够宽好抓,又不至于占地方。
+const MACRO_SHOT_DIVIDER_H: f32 = 10.0;
+
+/// 还没量到截图小窗抬头的实际高度时,按这个估(约两行)。抬头会随窗口宽度换行,
+/// 高度不是常数 —— 但它是"窗口宽度"的函数而不是反过来,所以估算值不会引起来回抖
+/// (见 [`PadApp::shot_window_size`])。
+const SHOT_POPUP_HEADER_EST: f32 = 60.0;
+/// 截图小窗四周留的边(pt):贴着边界算会因窗口装饰与取整差出几个点,
+/// 明明"刚好放得下"却弹出滚动条。
+const SHOT_POPUP_PAD: f32 = 8.0;
+
+/// 截图画布画在哪块地方(用户 2026-10-10 第 3 条)。决定两件互不相干的事:
+/// ①自动倍率怎么算 ②滚动位置各自独立(三块地方互不串)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShotCanvasKind {
+    /// 主界面下方面板:按容器内接(容器拉大图跟着大)。
+    Panel,
+    /// 扩展宏弹窗里拼在虚拟键位下方的那块:同上,只是另占一份滚动位置。
+    Macro,
+    /// 截图小窗:按**屏幕/程序窗口边界**算绝对倍率 —— 不看自己多大,
+    /// 否则"`±` 改窗口尺寸、窗口尺寸又改倍率"会互相追着放大(见 `shot_popup_base`)。
+    Popup,
+}
+
+impl ShotCanvasKind {
+    /// 滚动位置用的 salt:每块画布一份,互不串。
+    fn scroll_salt(self) -> &'static str {
+        match self {
+            Self::Panel => "shot_canvas_scroll_panel",
+            Self::Macro => "shot_canvas_scroll_macro",
+            Self::Popup => "shot_canvas_scroll_popup",
+        }
+    }
+}
+
+/// 截图小窗的视口 Id。创建与"按倍率下发尺寸"必须用同一个,所以收在一处。
+fn shot_window_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("scrcpy_pad_shot_window")
+}
+
+/// 截图小窗最多能占多大地方(pt):程序窗口内容区 ∩ 系统屏幕,四周再留一圈边。
+///
+/// 用户 2026-10-10(第 3 条):"放不下时按程序窗口与系统屏幕边界调整缩放" ——
+/// 判据就是这块地方。留边是因为标题栏/任务栏不归内容区管,贴着算会让窗口少一截。
+/// 取不到系统屏幕尺寸(个别平台不给)时就只按程序窗口算。
+fn shot_popup_area(ctx: &egui::Context) -> egui::Vec2 {
+    let screen = ctx.content_rect().size();
+    let monitor = ctx.input(|i| i.viewport().monitor_size).unwrap_or(screen);
+    let avail =
+        egui::vec2(screen.x.min(monitor.x), screen.y.min(monitor.y)) - egui::vec2(24.0, 24.0);
+    // 兜一个下限:算成 0 或负数会让下面的内接倍率变成 0,图直接看不见。
+    egui::vec2(avail.x.max(200.0), avail.y.max(200.0))
+}
+
 /// 配置目录:profile.yaml / look.json / settings.json 三者同处一地,
 /// 便于一起备份、清理或整体搬走。
 ///
@@ -10883,6 +13406,56 @@ fn profile_path() -> PathBuf {
 /// 「手动 adb 命令」用户预设的落盘位置(与 settings.json 同目录)。
 fn adb_presets_path() -> PathBuf {
     config_dir().join(adbcmd::PRESET_FILE)
+}
+
+/// 一份命名的「宏草稿」(用户 2026-10-09:草稿要能长期保存、之后自如取用)。
+///
+/// 存的正是宏页编辑区那几样东西(即 `macro_page_*`)。刻意做成**一份命名列表**
+/// 而不是给每条宏都存草稿:用户要的用法就一句"编辑区这份先留着,下次接着改",
+/// 所以下拉选 → [载入] / [另存当前草稿] / [删除],与「手动 adb 命令」的用户预设
+/// 完全同一套操作(同一个目录、同一个原子写),学会一个就会另一个。
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct MacroDraft {
+    name: String,
+    /// 触发键;`None` = 还没定 —— 草稿允许是半成品(与"新建宏"必须齐活不同)。
+    key: Option<u16>,
+    fps_only: bool,
+    /// 「按后延迟」(ms,用户 2026-10-10 第 2 条)。`serde(default)` 是必须的:
+    /// 这一项之前的草稿文件里没有这个字段,不给默认值就会**整份草稿库读不出来**。
+    #[serde(default = "default_draft_tail_delay_ms")]
+    tail_delay_ms: u32,
+    steps: Vec<MacroStep>,
+    instructions: Vec<MacroInstruction>,
+    /// 扩展宏的虚拟键位层;`None` = 普通宏。
+    virtual_profile: Option<Profile>,
+}
+
+/// `MacroDraft::tail_delay_ms` 的 serde 默认值:老草稿文件里没有这一项时补齐成
+/// 程序默认的「按后延迟」。默认值是 `0` = 不等(该功能自 2026-10-10 晚起为**可选**,
+/// 由 `Profile::tail_delay_enabled` 总控),所以老草稿读进来不会凭空多出冷却。
+fn default_draft_tail_delay_ms() -> u32 {
+    crate::keymap::DEFAULT_TAIL_DELAY_MS
+}
+
+/// 「宏草稿库」的落盘位置(与 settings.json 同目录)。
+fn macro_drafts_path() -> PathBuf {
+    config_dir().join("macro_drafts.json")
+}
+
+/// 读宏草稿库;文件不存在按空列表处理(首次使用不算错误)。
+fn load_macro_drafts(path: &Path) -> Result<Vec<MacroDraft>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("读取失败: {e}")),
+    };
+    serde_json::from_str(&text).map_err(|e| format!("解析失败: {e}"))
+}
+
+/// 写宏草稿库(原子写:临时文件 + 改名,与设置/配置/预设的落盘方式一致)。
+fn save_macro_drafts(path: &Path, list: &[MacroDraft]) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(list).map_err(|e| format!("序列化失败: {e}"))?;
+    write_atomic(path, &text).map_err(|e| format!("写入失败: {e}"))
 }
 
 /// settings.json 里记着的"上次选用的配置文件";没记(或记的是空白)时返回 None。
@@ -11137,6 +13710,8 @@ fn sanitize_saved_scrcpy_args(raw: &str) -> (String, bool) {
     (out.join(" "), removed)
 }
 
+/// [已废弃 2026-10-08] `VirtualGamepad*` 分支:虚拟手柄右摇杆通道专用,不再维护。
+/// 保留了"虚拟手柄模式下自动补 --mouse/--keyboard/--gamepad=disabled"的既有行为。
 fn prepare_scrcpy_args_with_mode(base: &str, mode: ViewInputMode) -> String {
     let mut args = base.trim().to_string();
     let gamepad_mode = matches!(
@@ -11646,6 +14221,69 @@ fn swipe_controls(
     changed
 }
 
+/// 轮盘方向的短标签(方向行与画布标注共用一套,免得两处各写一份慢慢跑偏)。
+///
+/// `index` 是方向下标(0 基),显示成"上1 / 右2 / 135°3"这种,方便和画布上的
+/// 手改终点标注对上号。
+fn wheel_dir_label(angle_deg: f32, index: usize) -> String {
+    let dir = match angle_deg.round() as i32 {
+        -90 => "上".to_string(),
+        0 => "右".to_string(),
+        90 => "下".to_string(),
+        a if a.abs() == 180 => "左".to_string(),
+        a => format!("{a}°"),
+    };
+    format!("{}{}", dir, index + 1)
+}
+
+/// 「设置位置」落点圆圈的半径(**屏幕显示像素**)——R2,2026-10-08。
+///
+/// 用户要求:方向行点过「设置位置」后,那个落点在截图上要画成**圆圈**而不是圆点。
+/// 圆圈大小 = **min(影响范围, 按键大小)**:
+///
+/// * **影响范围** = [`Wheel::push_px`](crate::keymap::Wheel::push_px)(半径 × 影响范围系数)
+///   —— 方向键按下后手指实际被推出去的距离,这是圆圈"有多大意义"的本体;
+/// * **按键大小** = [`crate::keymap::DEFAULT_RADIUS`],即截图上按键圈的默认大小
+///   —— 作为**上限**。影响范围可以调得很大(半径 300px × 系数 4 = 1200px),
+///   真按它画圆圈会把整块屏幕糊住、反而看不出落点在哪;取小者保证圆圈始终
+///   "像一个手指的接触面"那么大,和截图上的键位圈是同一个视觉尺度。
+///
+/// **当前固定不可调**(用户拍板:现固定,未来可调)。下面这个函数**就是**那个
+/// "预留的 size/半径接口":将来要做「落点圆圈大小」设置,只需在这里加一个入参
+/// (或在 `WheelDirection` 上加 `end_radius: Option<f32>`),全链路
+/// (浮层标注、信息卡、以及将来任何绘制落点的地方)都只改这一处 ——
+/// 所以别再在别处直接写圆点/写死半径。
+fn wheel_dir_end_radius_px(m: &Mapper, w: &crate::keymap::Wheel, scale: f32) -> f32 {
+    let push_px = w.push_px(m) * scale;
+    let key_px = m.len(crate::keymap::DEFAULT_RADIUS) * scale;
+    push_px.min(key_px).max(1.0)
+}
+
+/// 可以当触发键的鼠标键位(evdev 码,与 `capture.rs` 的钩子同一套空间)。
+///
+/// 为什么要专门给一份名单:鼠标键**按不出来**。"按任意键"等待期间按一下鼠标,
+/// 这一次点击同时就是"在截图上取点",两条路会打架。所以改成下拉里直接**选**是哪个键
+/// (用户 2026-10-09 要求)。
+///
+/// 2026-10-10(用户第 2 条"继续补全滚轮逻辑"):四个滚轮方向**都**列出来 ——
+/// 捕获层(Windows/Linux 两侧)本来就在发横向滚轮码(279/280),只是下拉里选不到、
+/// 拦截位也没给它们留,于是"左滚/右滚"永远只能干瞪眼。现在补齐:
+/// 与 277/278 同一套(可选、可绑、可拦)。
+/// 码值对照 `capture.rs::vktable::MOUSE_VK`(272-276)与 `keymap::BTN_WHEEL_*`(277-280)。
+fn mouse_key_choices() -> [(u16, &'static str); 9] {
+    [
+        (crate::keymap::BTN_LEFT, "鼠标左键"),
+        (crate::keymap::BTN_RIGHT, "鼠标右键"),
+        (274, "鼠标中键"),  // BTN_MIDDLE
+        (275, "鼠标侧键1"), // BTN_SIDE (X1)
+        (276, "鼠标侧键2"), // BTN_EXTRA (X2)
+        (crate::keymap::BTN_WHEEL_UP, "滚轮上滚"),
+        (crate::keymap::BTN_WHEEL_DOWN, "滚轮下滚"),
+        (crate::keymap::BTN_WHEEL_LEFT, "滚轮左滚"),
+        (crate::keymap::BTN_WHEEL_RIGHT, "滚轮右滚"),
+    ]
+}
+
 /// 摇杆信息卡:画布上点开某个摇杆时,在它旁边列出四个方向对应的键位。
 ///
 /// 为什么做成"点开才显示":那一长串方向键/启用键一直压在海报一样的游戏画面上,
@@ -11677,22 +14315,36 @@ fn draw_wheel_card(
     let mut lines: Vec<(String, egui::Color32)> = Vec::new();
     lines.push((format!("类型 {}", w.kind.label()), ink));
     for (i, (angle, key)) in w.active_dirs().into_iter().enumerate() {
-        let name = match angle.round() as i32 {
-            -90 => "上".to_string(),
-            0 => "右".to_string(),
-            90 => "下".to_string(),
-            a if a.abs() == 180 => "左".to_string(),
-            a => format!("{a}°"),
+        // 手改过终点的方向标出来:它的触点落点由用户在截图上说了算,
+        // 不再跟影响范围走(方向行那边的「重置」才会退回基准圆)。
+        let manual = w.directions.get(i).is_some_and(|x| x.manual.is_some());
+        let key_label = if key.is_empty() {
+            "未绑定".to_string()
+        } else {
+            key.label()
         };
-        lines.push((format!("{} {} {}", name, i + 1, key_name(key)), ink));
+        lines.push((
+            format!(
+                "{} {}{}",
+                wheel_dir_label(angle, i),
+                key_label,
+                if manual { " · 手改" } else { "" }
+            ),
+            ink,
+        ));
     }
     if let Some(t) = &w.temp {
         let mode = match t.mode {
             TempMode::Hold => "按住启用",
             TempMode::Toggle => "再按切换",
         };
+        let key_label = if t.key.is_empty() {
+            "未绑定".to_string()
+        } else {
+            t.key.label()
+        };
         lines.push((
-            format!("启用 {} · {mode}", key_name(t.key)),
+            format!("启用 {key_label} · {mode}"),
             theme::tone_color(th.wheel_enable, tone),
         ));
     }
@@ -11879,10 +14531,16 @@ fn sanitize_virtual_profile(profile: &mut Profile) {
     profile
         .combos
         .retain(|c| !matches!(c.action, Action::Macro(_)));
-    // 虚拟层只负责键位/轮盘坐标，不继承程序级开关与视角状态。
-    profile.toggle_key = 0;
-    profile.cursor_toggle_key = 0;
+    // 虚拟层只负责键位/轮盘坐标与「锚点」(瞄准锚点)，不继承程序级开关与视角状态。
+    profile.toggle_key = KeySet::new();
+    profile.cursor_toggle_key = KeySet::new();
+    // R4(2026-10-08):弹窗里现在能调 [＋ 锚点],锚点必须留下来 ——
+    // 否则"设置 → 保存 → 再打开"会把刚取的锚点悄悄抹掉(不可预期)。
+    // 其余视角状态(开关键/灵敏度/模式/后坐力…)仍然是程序级的,照旧清空。
+    let anchor = (profile.aim.anchor_x, profile.aim.anchor_y);
     profile.aim = Default::default();
+    profile.aim.anchor_x = anchor.0;
+    profile.aim.anchor_y = anchor.1;
 }
 
 fn virtual_keyboard_lights(
@@ -11906,8 +14564,9 @@ fn virtual_keyboard_lights(
         }
     }
     for wheel in &profile.wheels {
-        for (angle, key) in wheel.active_dirs() {
-            if key != 0 {
+        for (angle, keys) in wheel.active_dirs() {
+            // 组合键方向:集合里每个成员都亮(点亮任一成员都能看到归属)。
+            for key in keys {
                 lights.entry(key).or_insert((
                     if wheel.temp.is_some() {
                         th.wheel_temp
@@ -11918,21 +14577,65 @@ fn virtual_keyboard_lights(
                 ));
             }
         }
+        // R4(2026-10-08):临时摇杆的启用键也要亮 —— 它和方向键一样"归轮盘",
+        // 按下去不会走普通绑定(见 engine.rs `key_owned_by_wheel`)。用 insert
+        // (不是 or_insert):同一个键既是绑定又是启用键时,以启用键为准,
+        // 与引擎的归属口径一致。
+        if let Some(t) = &wheel.temp {
+            for key in t.key {
+                lights.insert(
+                    key,
+                    (
+                        th.wheel_temp,
+                        match t.mode {
+                            TempMode::Hold => "虚拟轮盘启用键(按住启用)".to_string(),
+                            TempMode::Toggle => "虚拟轮盘启用键(再按切换)".to_string(),
+                        },
+                    ),
+                );
+            }
+        }
     }
     lights
 }
 
-/// 截图预览的自动适应倍率：同时限制可用宽度和窗口高度，避免竖屏铺满右侧、
-/// 横屏顶出可视区域。手动 +/- 仍在这个倍率上乘用户倍率。
-fn screenshot_fit_scale(avail_w: f32, window_h: f32, tex_w: u32, tex_h: u32) -> f32 {
+/// 截图预览的**自动适应**倍率：按**容器**的可用宽高做等比内接(contain)。
+///
+/// 2026-10-09 改口径(用户:截图小窗"右/下大片留白,无法靠拉伸去除"):
+/// 旧实现在可用宽高上各砍一刀(`avail*0.94` / `window_h*0.68`)并封顶 1.0,
+/// 于是无论怎么拉窗口,右/下都固定留掉一截空白。现在:
+/// - **不再留边** —— 直接按容器宽高内接,谁先顶到就按谁定,另一维的余量才是无法避免的等比余量;
+/// - **不再封顶 1.0** —— 容器比图大时允许放大填满(否则必然留白);
+/// - 容器尺寸取自**画布所在的容器**(`ui.available_width/height`),
+///   而不是整个窗口高度 —— 小窗、弹窗、下方面板各自按自己的空间适应。
+/// 手动 +/- 仍在这个倍率上乘用户倍率。
+fn screenshot_fit_scale(avail_w: f32, avail_h: f32, tex_w: u32, tex_h: u32) -> f32 {
     if tex_w == 0 || tex_h == 0 {
         return 1.0;
     }
-    let usable_w = (avail_w * 0.94).max(120.0);
-    let usable_h = (window_h * 0.68).max(180.0);
-    (usable_w / tex_w as f32)
-        .min(usable_h / tex_h as f32)
-        .clamp(0.05, 1.0)
+    let by_w = avail_w / tex_w as f32;
+    let by_h = avail_h / tex_h as f32;
+    // 容器尺寸拿不到(NaN/∞,极少数布局中间态)时按原尺寸;为 0 或负数则被下面的
+    // 下限兜住 —— 不能给 1.0,那会让"没地方"的一帧画出一张溢出的大图。
+    let fit = if by_w.is_finite() && by_h.is_finite() {
+        by_w.min(by_h)
+    } else {
+        1.0
+    };
+    fit.clamp(0.05, 4.0)
+}
+
+/// **自动适应倍率**(用户 2026-10-10 第 3 条):竖屏按纵向、横屏按横向给出 **100%**,
+/// 容器放不下时再缩到刚好放得下。
+///
+/// 与 [`screenshot_fit_scale`] 只差一件事:**封顶 1.0**。容器比图还大时不再放大填满
+/// (那是 2026-10-09 的"不留白"口径),因为用户现在明确要"默认 100%":只有 100% 才是
+/// 一像素对一像素,再大就是把图拉糊,取点时也更难对准。
+///
+/// 横竖屏不必各写一句:等比内接天然就是"竖屏顶到纵向、横屏顶到横向"(谁先顶到谁定),
+/// 封顶 1.0 只负责"两边都放得下时就是 100%"。
+fn shot_auto_base(avail_w: f32, avail_h: f32, tex_w: u32, tex_h: u32) -> f32 {
+    screenshot_fit_scale(avail_w, avail_h, tex_w, tex_h).min(1.0)
 }
 
 /// 纵横比相对偏差超过它就地"未对齐"(方案 W2-2 定 2%)。
@@ -11996,6 +14699,68 @@ fn space_mismatch(shot: (u32, u32), inject: (u32, u32)) -> Option<SpaceMismatch>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R4(2026-10-08):扩展宏虚拟层的"净化"必须**留下锚点**。
+    ///
+    /// 弹窗里 [＋ 锚点] 设的锚点要能保存进宏草稿、再打开时还在
+    /// (否则"设置 → 保存到宏草稿 → 再打开"会把刚取的锚点悄悄抹掉,不可预期);
+    /// 其余视角状态(开关/灵敏度/模式)与程序级开关照旧不继承,
+    /// 宏步骤也照旧被剔掉(宏不嵌套)。
+    #[test]
+    fn sanitize_virtual_profile_keeps_the_aim_anchor_only() {
+        let macro_action = || {
+            Action::Macro(MacroAction {
+                virtual_profile: None,
+                steps: Vec::new(),
+                instructions: Vec::new(),
+            })
+        };
+        let mut p = Profile::default();
+        p.binds.push(KeyBind {
+            key: 30,
+            action: Action::Hold {
+                x: 0.1,
+                y: 0.2,
+                radius: 0.03,
+            },
+            fps_only: false,
+            tail_delay_ms: 0,
+        });
+        p.binds.push(KeyBind {
+            key: 31,
+            action: macro_action(),
+            fps_only: false,
+            tail_delay_ms: 0,
+        });
+        p.combos.push(KeyCombo {
+            keys: vec![29, 42],
+            action: macro_action(),
+            fps_only: false,
+            tail_delay_ms: 0,
+        });
+        p.aim.anchor_x = 0.25;
+        p.aim.anchor_y = 0.75;
+        p.aim.enabled = true;
+        p.aim.sensitivity_x = 9.0;
+        p.toggle_key = KeySet::single(66);
+        p.cursor_toggle_key = KeySet::single(65);
+
+        sanitize_virtual_profile(&mut p);
+
+        assert_eq!(
+            (p.aim.anchor_x, p.aim.anchor_y),
+            (0.25, 0.75),
+            "锚点必须留下"
+        );
+        assert!(p.aim.anchor_set());
+        assert!(!p.aim.enabled, "视角开关是程序级的,不继承");
+        assert_ne!(p.aim.sensitivity_x, 9.0, "灵敏度是程序级的,不继承");
+        assert_eq!(p.toggle_key, 0, "总开关键不继承");
+        assert_eq!(p.cursor_toggle_key, 0, "鼠标消隐键不继承");
+        assert_eq!(p.binds.len(), 1, "宏步骤的键位要剔掉");
+        assert_eq!(p.binds[0].key, 30);
+        assert!(p.combos.is_empty(), "宏步骤的组合键也要剔掉");
+    }
 
     /// 亮度网格:自动对比全靠它,索引越界/退化尺寸绝不能 panic
     /// (它每帧、每个标注都要被查一次,一旦 panic 就是整个界面崩掉)。
@@ -12289,6 +15054,49 @@ mod tests {
         );
     }
 
+    /// 宏草稿库(2026-10-09):存出去再读回来必须**逐字段一致** ——
+    /// 草稿的价值全在"下次原样取回",掉一个字段就等于让人重做一遍。
+    /// 顺带盯住"文件不存在 = 空列表"(首次使用不该报错)。
+    #[test]
+    fn macro_drafts_round_trip_and_missing_file_is_empty() {
+        let dir = std::env::temp_dir().join(format!("scrcpy-pad-drafts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("macro_drafts.json");
+        assert!(
+            load_macro_drafts(&path).unwrap().is_empty(),
+            "文件不存在时按空列表处理,不能算错误"
+        );
+        let list = vec![
+            // 半成品草稿:还没有触发键,但有录制步骤 + 设置项(草稿允许不完整)
+            MacroDraft {
+                name: "半成品".into(),
+                key: None,
+                fps_only: false,
+                tail_delay_ms: 30,
+                steps: vec![MacroStep {
+                    code: 65,
+                    pressed: true,
+                    delay_ms: 30,
+                }],
+                instructions: vec![MacroInstruction::Delay { ms: 120 }],
+                virtual_profile: None,
+            },
+            // 带虚拟键位层的草稿(扩展宏那份 profile 必须一起回得来)
+            MacroDraft {
+                name: "带虚拟层".into(),
+                key: Some(66),
+                fps_only: true,
+                tail_delay_ms: 0,
+                steps: Vec::new(),
+                instructions: Vec::new(),
+                virtual_profile: Some(Profile::default()),
+            },
+        ];
+        save_macro_drafts(&path, &list).expect("保存必须成功");
+        assert_eq!(load_macro_drafts(&path).unwrap(), list);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn legacy_uhid_is_never_auto_added() {
         assert_eq!(
@@ -12453,16 +15261,21 @@ mod tests {
         assert!(empty.is_empty());
     }
 
+    /// 2026-10-09 改口径(用户:截图小窗"右/下大片留白,无法靠拉伸去除"):
+    /// 自动适应必须是**精确等比内接** —— 谁先顶到就按谁定,不再各砍一刀留边,也不再封顶 1.0。
     #[test]
-    fn screenshot_fit_scale_respects_window_height_and_width() {
+    fn screenshot_fit_scale_is_exact_contain() {
+        // 竖屏:按高度受限,恰好内接(不留 0.68 那一刀)
         let portrait = screenshot_fit_scale(600.0, 900.0, 1080, 2400);
-        assert!(portrait < 0.4 && portrait > 0.2, "竖屏应按高度限制自动缩小");
+        assert!((portrait - 900.0 / 2400.0).abs() < 1e-6, "{portrait}");
+        // 横屏:按宽度受限,恰好内接(旧的 0.94 缩边已去掉)
         let landscape = screenshot_fit_scale(1200.0, 900.0, 2400, 1080);
-        assert!(
-            landscape < 0.5 && landscape > 0.1,
-            "横屏应按宽度限制自动缩小"
-        );
+        assert!((landscape - 0.5).abs() < 1e-6, "{landscape}");
+        // 容器比图大:允许放大填满 —— 封顶 1.0 就是"右下永远留白"的来源
+        assert!(screenshot_fit_scale(4000.0, 3000.0, 1000, 500) > 1.0);
+        // 退化输入:不 panic,也不给出"溢出的大图"(容器还没布局时给下限)
         assert!(screenshot_fit_scale(0.0, 0.0, 1080, 2400) < 0.1);
+        assert_eq!(screenshot_fit_scale(100.0, 100.0, 0, 0), 1.0);
     }
 
     /// W2-2 验收口径:构造"截图 1080x2400 / 控制通道 2400x1080"必须被拦,

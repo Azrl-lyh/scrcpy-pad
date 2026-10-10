@@ -32,6 +32,8 @@ pub fn zoom_radius(radius: f32, factor: f32) -> f32 {
 /// 两处用到的常量 —— 其余鼠标键已可直接当普通键绑定,不必具名。
 pub const BTN_LEFT: u16 = 272;
 pub const BTN_RIGHT: u16 = 273;
+/// 鼠标中键(滚轮按下)。列出来是因为界面要判"这一下是不是鼠标按键"。
+pub const BTN_MIDDLE: u16 = 274;
 /// 鼠标滚轮的四个方向使用统一码空间的合成键码。
 ///
 /// Windows 低级钩子与 Linux evdev 都没有把滚轮当成普通 Key;为了让它能像
@@ -40,6 +42,27 @@ pub const BTN_WHEEL_UP: u16 = 277;
 pub const BTN_WHEEL_DOWN: u16 = 278;
 pub const BTN_WHEEL_LEFT: u16 = 279;
 pub const BTN_WHEEL_RIGHT: u16 = 280;
+
+/// 是不是滚轮键码(上/下/左/右)。
+///
+/// 用户 2026-10-09(第 3 条"滚动"):滚轮**只能**在[鼠标映射]那份下拉里设定。
+/// 在别处(键位设置、轮盘方向、宏指令键…)用"按任意键"接滚轮,会把用户在清单上
+/// 滚一下鼠标的动作当成一次绑定 —— 不是本意,而且改完还很难看出是怎么改的。
+/// 所以那条捕获路径见到滚轮一律不写(见 `app.rs` 里等待按键的分支)。
+pub const fn is_wheel_code(code: u16) -> bool {
+    matches!(
+        code,
+        BTN_WHEEL_UP | BTN_WHEEL_DOWN | BTN_WHEEL_LEFT | BTN_WHEEL_RIGHT
+    )
+}
+
+/// 是不是鼠标按键码(左 272 / 右 273 / 中 274;滚轮不算,见 [`is_wheel_code`])。
+///
+/// 用途:界面上的「就地取消 / 停止」控件被按下时要把这一下**整体丢掉**
+/// (用户 2026-10-10 第 1 条)—— 能被"按在按钮上"的只有鼠标键,键盘键不会。
+pub const fn is_mouse_button(code: u16) -> bool {
+    matches!(code, BTN_LEFT | BTN_RIGHT | BTN_MIDDLE)
+}
 
 /// 合成鼠标键码的可读名(跨平台共用)
 pub fn mouse_aux_name(code: u16) -> Option<&'static str> {
@@ -50,6 +73,36 @@ pub fn mouse_aux_name(code: u16) -> Option<&'static str> {
         BTN_WHEEL_RIGHT => Some("BTN_WHEEL_RIGHT"),
         _ => None,
     }
+}
+
+/// 「按后延迟」的默认值(毫秒)。用户 2026-10-10 第 2 条。
+///
+/// 一条键位 / 组合键 / 宏**上一次按下结束之后**,至少再等这么久才接受它的下一次
+/// 按下 —— 快速连点、连续划动时"上一动作还没抬起、下一动作已经按下"会互相干扰。
+///
+/// **默认 `0` = 不等**:这是一个**可选功能**(用户 2026-10-10 晚追加要求
+/// "按后延迟改为可选功能"),要**两层都愿意**才生效 ——
+///   ① 总开关 [`Profile::tail_delay_enabled`] 打开(**默认关闭**);
+///   ② 这一条自己的数值 > 0(**默认 0**)。
+/// 所以老配置、新建的键位在任何情况下都**不会**被悄悄加上冷却。30ms 约等于两帧:
+/// 想用时这是个好起点,但它只是"建议值",不再当默认值。
+pub const DEFAULT_TAIL_DELAY_MS: u32 = 0;
+
+/// 「按后延迟」的上限(毫秒)。界面数字框用它定范围。
+///
+/// 2 秒已经远超"防手抖连点"的语义:再长就是刻意的节流,该用别的手段(宏里的等待
+/// 步骤)而不是把一条键位变成半残。上限同时挡住了"手滑多打一位数 → 这个键再也不
+/// 响应"这种只能靠改 YAML 才能恢复的坑。
+pub const MAX_TAIL_DELAY_MS: u32 = 2000;
+
+fn default_tail_delay_ms() -> u32 {
+    DEFAULT_TAIL_DELAY_MS
+}
+
+/// 序列化时省略"就是默认值"的那一份(= `0` = 不用这个功能) —— 老 YAML 读进来
+/// 仍按默认值补齐,而没动过这一项的条目不会被写出一堆 `tail_delay_ms: 0` 噪音。
+fn tail_delay_is_default(v: &u32) -> bool {
+    *v == DEFAULT_TAIL_DELAY_MS
 }
 
 fn default_tap_duration_ms() -> u32 {
@@ -103,6 +156,9 @@ pub enum ViewInputMode {
     UhidMouse,
     /// Legacy scrcpy AOA mouse value; automatically migrated to TouchDrag.
     AoaMouse,
+    // ⚠️【已废弃 deprecated · 2026-10-08】虚拟手柄右摇杆(连续/分段回中)不再维护:
+    // 只保留现有行为以兼容既有配置,不做修复、不做扩展、不加新功能;
+    // 新功能一律不要依赖这条通道(engine.rs 的 GAMEPAD_* / gamepad_* 整块同理)。
     /// Inject a virtual HID gamepad and drive its right stick from mouse motion.
     VirtualGamepadContinuous,
     /// Like continuous gamepad mode, but recenter at the stick limit and carry
@@ -664,6 +720,13 @@ pub struct KeyBind {
     /// 仅在 FPS 模式开启时生效/显示;普通模式下完全让位。
     #[serde(default)]
     pub fps_only: bool,
+    /// 「按后延迟」(ms,用户 2026-10-10 第 2 条):这条键位的上一次按下**结束之后**,
+    /// 至少再等这么久才接受下一次按下。0 = 不等(旧行为)。
+    #[serde(
+        default = "default_tail_delay_ms",
+        skip_serializing_if = "tail_delay_is_default"
+    )]
+    pub tail_delay_ms: u32,
 }
 
 /// A simultaneous chord such as Ctrl+R.  The action fires when all `keys`
@@ -677,6 +740,12 @@ pub struct KeyCombo {
     /// Only active while FPS/open-world view mode is running.
     #[serde(default)]
     pub fps_only: bool,
+    /// 「按后延迟」(ms,用户 2026-10-10 第 2 条):同 [`KeyBind::tail_delay_ms`]。
+    #[serde(
+        default = "default_tail_delay_ms",
+        skip_serializing_if = "tail_delay_is_default"
+    )]
+    pub tail_delay_ms: u32,
 }
 
 /// 轮盘方向冲突时的处理方式。
@@ -700,7 +769,22 @@ impl WheelMode {
     }
 }
 
-/// 轮盘类型：标准四向 / 自定义方向 / 执行轮盘（先点中心再滑到方向）。
+/// 轮盘类型：标准四向 / 多向轮盘 / 执行轮盘（先点中心再滑到方向）。
+///
+/// `Custom` 的**显示名是「多向轮盘」**（R3，2026-10-08；此前的显示名是「自定义方向」）。
+/// YAML 里的取值仍然写 `custom`，所以旧配置一字不用改、行为也一字未改 ——
+/// 只换牌子不改内核：
+///
+/// * **效果≈执行轮盘**：方向集合与执行轮盘完全一样 —— 任意个方向（2–8）、
+///   每个方向可以设任意角度，还能点「设置位置」在截图上直接指定终点；
+///   方向键的落点计算也走同一套（`wheel_combo_offset`：双键取两键方向的中点、
+///   距离规整到基准圆）。
+/// * **行为=普通轮盘**：按下方向键后触点**一直推在目标上**（长久指引），
+///   松开才回中/抬指；**不是**执行轮盘那种"按下→拖动到目标→撤去"的一次性手势。
+///
+/// 于是它和 `Execute` 的差别只在"撤不撤"：`Execute` 每次按下跑一段
+/// 中心→目标的插值滑动然后抬手（`execute_direction_ms` 决定快慢），
+/// `Custom` 则把触点停在目标上等你松手。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum WheelKind {
@@ -714,7 +798,8 @@ impl WheelKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Standard => "标准四向",
-            Self::Custom => "自定义方向",
+            // 多向轮盘（旧显示名「自定义方向」）：效果同执行轮盘、行为同普通轮盘。
+            Self::Custom => "多向轮盘",
             Self::Execute => "执行轮盘",
         }
     }
@@ -724,7 +809,22 @@ impl WheelKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WheelDirection {
     pub angle_deg: f32,
-    pub key: u16,
+    /// 这个方向的触发键(用户 2026-10-10 第 2 条:与其它槽位一样支持组合键,见 [`KeySet`])。
+    ///
+    /// 单键配置序列化成裸整数(老 YAML 一字不改),匹配用
+    /// `KeySet::contains` + "整个集合都按着" —— 于是 `Ctrl+W` 与 `W+Ctrl` 等价。
+    pub key: KeySet,
+    /// 手动指定的**终点**(相对坐标,与轮盘圆心同一坐标系)。
+    ///
+    /// - `Some` = 用户点「设置位置」后在截图上直接点的那个点:触点就推到这里,
+    ///   可以比"影响范围"圆更远、也可以更近 —— 角度和影响范围都不再管它;
+    /// - `None`(默认) = 跟随基准圆:方向由 `angle_deg` 决定、距离由
+    ///   `radius × scope`(影响范围)决定,与旧版行为完全一致。
+    ///
+    /// 只有点该方向的「重置」才会退回 `None`(重新贴回基准圆),
+    /// 之后改影响范围才会再次影响到这个方向 —— 这正是区分"基准"与"手改"的关键。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual: Option<(f32, f32)>,
 }
 /// 临时摇杆的启用模式
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -813,8 +913,9 @@ fn clamp_unit_pos(v: f32, fallback: f32) -> f32 {
 /// 临时摇杆:设置启用键后,方向键仅在启用期间归摇杆,期间同键位的其它绑定失效
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TempWheel {
-    /// 启用键
-    pub key: u16,
+    /// 启用键(用户 2026-10-10 第 2 条:支持组合键,见 [`KeySet`]。
+    /// 空集合 = 没设启用键,此时 `temp` 本不该存在,`Wheel` 会把它当永久轮盘处理)。
+    pub key: KeySet,
     pub mode: TempMode,
 }
 
@@ -822,10 +923,12 @@ pub struct TempWheel {
 /// 坐标为相对值(0..1),半径相对屏幕宽度。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Wheel {
-    pub up: u16,
-    pub down: u16,
-    pub left: u16,
-    pub right: u16,
+    /// 标准轮盘四向的触发键(用户 2026-10-10 第 2 条:与其它槽位一样支持组合键,
+    /// 见 [`KeySet`]。单键配置与旧 YAML 完全互通)。
+    pub up: KeySet,
+    pub down: KeySet,
+    pub left: KeySet,
+    pub right: KeySet,
     pub cx: f32,
     pub cy: f32,
     pub radius: f32,
@@ -862,30 +965,30 @@ pub struct Wheel {
 /// (2 个永久轮盘,`hotpath-bench.md`);换成定长拷贝后归零。
 #[derive(Debug, Clone, Copy)]
 pub struct ActiveDirs {
-    buf: [(f32, u16); 8],
+    buf: [(f32, KeySet); 8],
     len: usize,
 }
 
 impl ActiveDirs {
     fn new() -> Self {
         Self {
-            buf: [(0.0, 0); 8],
+            buf: [(0.0, KeySet::new()); 8],
             len: 0,
         }
     }
 
-    fn push(&mut self, dir: (f32, u16)) {
+    fn push(&mut self, dir: (f32, KeySet)) {
         if self.len < self.buf.len() {
             self.buf[self.len] = dir;
             self.len += 1;
         }
     }
 
-    pub fn as_slice(&self) -> &[(f32, u16)] {
+    pub fn as_slice(&self) -> &[(f32, KeySet)] {
         &self.buf[..self.len]
     }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, (f32, u16)> {
+    pub fn iter(&self) -> std::slice::Iter<'_, (f32, KeySet)> {
         self.as_slice().iter()
     }
 
@@ -897,23 +1000,23 @@ impl ActiveDirs {
         self.len == 0
     }
 
-    pub fn get(&self, index: usize) -> Option<&(f32, u16)> {
+    pub fn get(&self, index: usize) -> Option<&(f32, KeySet)> {
         self.as_slice().get(index)
     }
 
-    pub fn first(&self) -> Option<&(f32, u16)> {
+    pub fn first(&self) -> Option<&(f32, KeySet)> {
         self.as_slice().first()
     }
 
     /// 需要独立 `Vec` 的冷路径(界面、测试)使用;热路径请直接用上面的借用接口。
-    pub fn to_vec(&self) -> Vec<(f32, u16)> {
+    pub fn to_vec(&self) -> Vec<(f32, KeySet)> {
         self.as_slice().to_vec()
     }
 }
 
 impl<'a> IntoIterator for &'a ActiveDirs {
-    type Item = &'a (f32, u16);
-    type IntoIter = std::slice::Iter<'a, (f32, u16)>;
+    type Item = &'a (f32, KeySet);
+    type IntoIter = std::slice::Iter<'a, (f32, KeySet)>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.as_slice().iter()
@@ -921,7 +1024,7 @@ impl<'a> IntoIterator for &'a ActiveDirs {
 }
 
 impl IntoIterator for ActiveDirs {
-    type Item = (f32, u16);
+    type Item = (f32, KeySet);
     type IntoIter = ActiveDirsIter;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -936,9 +1039,9 @@ pub struct ActiveDirsIter {
 }
 
 impl Iterator for ActiveDirsIter {
-    type Item = (f32, u16);
+    type Item = (f32, KeySet);
 
-    fn next(&mut self) -> Option<(f32, u16)> {
+    fn next(&mut self) -> Option<(f32, KeySet)> {
         if self.pos < self.dirs.len {
             let item = self.dirs.buf[self.pos];
             self.pos += 1;
@@ -949,21 +1052,49 @@ impl Iterator for ActiveDirsIter {
     }
 }
 
-/// 切换键"实际按键"的定长集合(最多 2 个)——来源同 [`ActiveDirs`]:
-/// 组合键门控对每个按键事件都要扫描 `switch_keys`(`engine.rs` ingest_button),
-/// 旧实现每条切换键一次 `Vec` 分配,实测 +38.8ns/事件。
-#[derive(Debug, Clone, Copy)]
-pub struct EffectiveKeys {
+/// 一个槽位上绑定的按键集合(最多 2 个,`0` 表示空位,顺序不影响匹配)。
+///
+/// 用户 2026-10-09(第 4 条):"系统键(映射开关、FPS 开关、快睡切换等)可作组合键"。
+/// 这些槽位原来是一个 `u16`,现在统一换成这个集合:
+///   * 匹配规则统一成"事件是这个集合的成员 **且** 集合此刻整个按着"(`engine` 里
+///     `key_set_hit`/切换键那套),因此 `Ctrl+X` 与 `X+Ctrl` 都能触发 —— 顺序无关;
+///   * 界面统一成一个按钮捕获 + `Ctrl+X` 这样的显示;
+///   * **不**给它们加时长/间隔之类的参数(用户同一条要求里的限制)。
+///
+/// 切换键早先已经有这套(旧名 `EffectiveKeys`),现在提成通用类型,一处定义。
+///
+/// 定长栈上存储(零分配):引擎的按键热路径会频繁构造与比较它 ——
+/// 组合键门控对每个按键事件都要扫一遍切换键,旧实现每条一次 `Vec` 分配,
+/// 实测 +38.8ns/事件。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KeySet {
     buf: [u16; 2],
     len: usize,
 }
 
-impl EffectiveKeys {
-    fn new() -> Self {
-        Self {
-            buf: [0; 2],
-            len: 0,
+impl KeySet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 单个键(0 = 空)。
+    pub fn single(key: u16) -> Self {
+        let mut out = Self::new();
+        if key != 0 {
+            out.push(key);
         }
+        out
+    }
+
+    /// 由若干键码构造:滤掉 0、去重、最多留 2 个,**保留给定顺序**。
+    pub fn from_keys(keys: impl IntoIterator<Item = u16>) -> Self {
+        let mut out = Self::new();
+        for k in keys {
+            if k != 0 && !out.as_slice().contains(&k) {
+                out.push(k);
+            }
+        }
+        out
     }
 
     fn push(&mut self, key: u16) {
@@ -997,8 +1128,39 @@ impl EffectiveKeys {
         self.as_slice().first()
     }
 
+    /// 集合里的**最后一个**成员(`None` = 空集合)。
+    ///
+    /// 捕获经 `canonical_chord` 排序后,修饰键在前,所以"最后一个"就是那个普通键
+    /// —— 正好是 `Ctrl+X` 里的 `X`。宏回放把方向键挂到时间轴上时需要一个**唯一**
+    /// 把手(否则 `Ctrl+W` 两个成员会各挂一次、抬起时只解开一个),就用它。
+    pub fn last(&self) -> Option<u16> {
+        self.as_slice().last().copied()
+    }
+
+    /// 单个键的槽位(未绑定返回 None)。老配置与"只允许单键"的槽位都走这里。
+    pub fn only(&self) -> Option<u16> {
+        (self.len == 1).then(|| self.buf[0])
+    }
+
     pub fn contains(&self, key: &u16) -> bool {
         self.as_slice().contains(key)
+    }
+
+    /// `Ctrl+X` 这样的显示文本(空集合返回空串,由调用方给"未绑定")。
+    pub fn label(&self) -> String {
+        self.as_slice()
+            .iter()
+            .map(|k| key_name(*k))
+            .collect::<Vec<_>>()
+            .join("+")
+    }
+
+    /// 集合里的键**此刻全部按着**(空集合恒为 `false`)。
+    ///
+    /// 这是组合键成立的另一半条件:事件只是"集合成员之一"还不够,
+    /// 必须整个集合都按着 —— 于是 `Ctrl+X` 与 `X+Ctrl` 都能触发。
+    pub fn all_held_by(&self, mut down: impl FnMut(u16) -> bool) -> bool {
+        !self.is_empty() && self.iter().all(|k| down(*k))
     }
 
     /// 需要排序/去重/存储的冷路径(配置规范化、界面)使用。
@@ -1007,22 +1169,59 @@ impl EffectiveKeys {
     }
 }
 
-impl IntoIterator for EffectiveKeys {
-    type Item = u16;
-    type IntoIter = EffectiveKeysIter;
-
-    fn into_iter(self) -> Self::IntoIter {
-        EffectiveKeysIter { keys: self, pos: 0 }
+impl From<u16> for KeySet {
+    fn from(key: u16) -> Self {
+        Self::single(key)
     }
 }
 
-/// [`EffectiveKeys`] 的按值迭代器(栈上,零分配)。
-pub struct EffectiveKeysIter {
-    keys: EffectiveKeys,
+/// 与单个键码比较 = "这个槽位**正好**绑定了这一个键"(空集合 ↔ `0`)。
+///
+/// 有意这么做:全程序原来到处是 `ev.code == profile.toggle_key` 这类单键比较,
+/// 有了这层实现,老配置(单键)的语义一字不变、调用点也不用全改;
+/// 而组合键的槽位必须显式用 `contains` + "整个集合都按着" 去匹配
+/// (见 `engine::key_set_hit`),不会因为这里"看起来相等"就误触发。
+impl PartialEq<u16> for KeySet {
+    fn eq(&self, other: &u16) -> bool {
+        if *other == 0 {
+            self.is_empty()
+        } else {
+            self.len == 1 && self.buf[0] == *other
+        }
+    }
+}
+
+impl PartialEq<KeySet> for u16 {
+    fn eq(&self, other: &KeySet) -> bool {
+        other == self
+    }
+}
+
+/// 集合相等 = 成员相同(顺序无关),与匹配语义一致。
+impl PartialEq for KeySet {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.as_slice().iter().all(|k| other.contains(k))
+    }
+}
+
+impl Eq for KeySet {}
+
+impl IntoIterator for KeySet {
+    type Item = u16;
+    type IntoIter = KeySetIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        KeySetIter { keys: self, pos: 0 }
+    }
+}
+
+/// [`KeySet`] 的按值迭代器(栈上,零分配)。
+pub struct KeySetIter {
+    keys: KeySet,
     pos: usize,
 }
 
-impl Iterator for EffectiveKeysIter {
+impl Iterator for KeySetIter {
     type Item = u16;
 
     fn next(&mut self) -> Option<u16> {
@@ -1034,6 +1233,57 @@ impl Iterator for EffectiveKeysIter {
             None
         }
     }
+}
+
+/// 序列化:单键(含空)写成裸整数 —— 老配置原样往返、人看着也清爽;
+/// 两键写成数组(如 `[29, 45]`)。
+impl Serialize for KeySet {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self.len {
+            0 => s.serialize_u16(0),
+            1 => s.serialize_u16(self.buf[0]),
+            _ => self.as_slice().serialize(s),
+        }
+    }
+}
+
+/// 反序列化:既吃裸整数(老配置/单键),也吃数组(组合键)。
+impl<'de> Deserialize<'de> for KeySet {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Def {
+            One(u16),
+            Many(Vec<u16>),
+        }
+        Ok(match Def::deserialize(d)? {
+            Def::One(k) => KeySet::single(k),
+            Def::Many(v) => KeySet::from_keys(v),
+        })
+    }
+}
+
+/// 哪些键码算"修饰键"(Ctrl/Shift/Alt/Win 左右共 8 个)。
+///
+/// 只用于把捕获到的组合键排成 `Ctrl+X` 这种**好认的顺序** ——
+/// 匹配与存储都不依赖顺序(见 [`KeySet`])。
+pub fn is_modifier_key(code: u16) -> bool {
+    matches!(
+        code,
+        29 | 97   // KEY_LEFTCTRL / KEY_RIGHTCTRL
+        | 42 | 54 // KEY_LEFTSHIFT / KEY_RIGHTSHIFT
+        | 56 | 100 // KEY_LEFTALT / KEY_RIGHTALT
+        | 125 | 126 // KEY_LEFTMETA / KEY_RIGHTMETA
+    )
+}
+
+/// 把捕获到的一组键排成规范顺序:修饰键在前,其余按码值。
+/// (捕获是"按下顺序",直接存会把 `X 后 Ctrl` 显示成 `X+Ctrl`。)
+pub fn canonical_chord(keys: &[u16]) -> KeySet {
+    let mut v: Vec<u16> = keys.iter().copied().filter(|k| *k != 0).collect();
+    v.sort_by_key(|k| (!is_modifier_key(*k), *k));
+    v.dedup();
+    KeySet::from_keys(v)
 }
 
 impl Wheel {
@@ -1052,6 +1302,8 @@ impl Wheel {
 
     /// 当前生效的方向集合。标准轮盘返回四向；其它类型返回自定义方向。
     /// 返回定长栈拷贝(零分配),见 [`ActiveDirs`]。
+    /// 当前生效的方向集合。标准轮盘返回四向；多向轮盘([`WheelKind::Custom`])
+    /// 与执行轮盘返回自定义方向集合(两者逐一致 —— 见 [`WheelKind`] 的说明)。
     pub fn active_dirs(&self) -> ActiveDirs {
         let mut out = ActiveDirs::new();
         match self.kind {
@@ -1077,30 +1329,42 @@ impl Wheel {
         out
     }
 
+    /// 这个物理键是否"归本轮盘"(任意生效方向的触发键之一,或临时轮盘的启用键之一)。
+    ///
+    /// 组合键槽位按**成员**判定(与 `vk_find_target` 同口径):`Ctrl+W` 为某方向时,
+    /// `Ctrl` 与 `W` 都算被本轮盘占着 —— 否则那个普通绑定会与组合方向键抢触点。
     pub fn owns_key(&self, code: u16) -> bool {
-        self.temp.as_ref().is_some_and(|t| t.key == code)
-            || self.active_dirs().iter().any(|(_, key)| *key == code)
+        self.temp.as_ref().is_some_and(|t| t.key.contains(&code))
+            || self
+                .active_dirs()
+                .iter()
+                .any(|(_, key)| key.contains(&code))
     }
 
-    /// 切到自定义/执行轮盘时，用标准四向初始化自定义方向，保留旧配置语义。
+    /// 切到多向/执行轮盘时，用标准四向初始化自定义方向，保留旧配置语义。
+    /// (「多向轮盘」= [`WheelKind::Custom`]，显示名见 [`WheelKind::label`]。)
     pub fn ensure_custom_directions(&mut self) {
         if self.directions.is_empty() {
             self.directions = vec![
                 WheelDirection {
                     angle_deg: -90.0,
                     key: self.up,
+                    manual: None,
                 },
                 WheelDirection {
                     angle_deg: 0.0,
                     key: self.right,
+                    manual: None,
                 },
                 WheelDirection {
                     angle_deg: 90.0,
                     key: self.down,
+                    manual: None,
                 },
                 WheelDirection {
                     angle_deg: 180.0,
                     key: self.left,
+                    manual: None,
                 },
             ];
         }
@@ -1118,7 +1382,8 @@ impl Wheel {
             let angle = -90.0 + k * 360.0 / count as f32;
             self.directions.push(WheelDirection {
                 angle_deg: angle,
-                key: 0,
+                key: KeySet::new(),
+                manual: None,
             });
         }
     }
@@ -1130,10 +1395,10 @@ impl Wheel {
     /// 全在这里,界面与默认配置不会再各写一份而慢慢跑偏。
     pub fn new_default(m: &Mapper, cx: f32, cy: f32) -> Self {
         Self {
-            up: 17,    // W
-            down: 31,  // S
-            left: 30,  // A
-            right: 32, // D
+            up: KeySet::single(17),    // W
+            down: KeySet::single(31),  // S
+            left: KeySet::single(30),  // A
+            right: KeySet::single(32), // D
             cx,
             cy,
             radius: m.rel_len(NEW_WHEEL_RADIUS_PX),
@@ -1216,16 +1481,24 @@ pub struct Profile {
     pub screen: Option<(u32, u32)>,
     #[serde(default)]
     pub name: String,
-    /// 映射总开关的切换键,默认 F8 = 66
-    pub toggle_key: u16,
+    /// 映射总开关的切换键,默认 F8 = 66。可写成组合键(如 `[29, 66]` = Ctrl+F8)。
+    pub toggle_key: KeySet,
     /// 全局鼠标消隐切换键：按一下隐藏系统光标，再按一下恢复；不依赖 FPS。
+    /// 可写成组合键(见 [`KeySet`])。
     #[serde(default)]
-    pub cursor_toggle_key: u16,
+    pub cursor_toggle_key: KeySet,
     pub binds: Vec<KeyBind>,
     /// Optional chord recognition.  When disabled, `combos` stays gray and
     /// has no effect on the normal single-key path.
     #[serde(default)]
     pub combos_enabled: bool,
+    /// 「按后延迟」的**总开关**(用户 2026-10-10 晚追加要求:把该功能改成可选)。
+    ///
+    /// 默认 **false** = 整个功能不生效:每条自己的 `tail_delay_ms` 一律按 `0` 处理
+    /// (数值原样保留,便于随时打开)。打开后,才逐条按各自的毫秒值生效。
+    /// 与逐条数值构成"两层都愿意才生效" —— 见 [`DEFAULT_TAIL_DELAY_MS`]。
+    #[serde(default)]
+    pub tail_delay_enabled: bool,
     #[serde(default)]
     pub combos: Vec<KeyCombo>,
     pub wheels: Vec<Wheel>,
@@ -1271,9 +1544,12 @@ impl RecenterMode {
 ///
 /// - `anchor_*`:手指落下的锚点(相对坐标),拖动从该点开始
 /// - `sensitivity_*`:每 1 个鼠标计数对应的设备像素,越大越灵敏
-/// - `hold_key`:仅当该鼠标键(evdev 码)按住时才瞄准;0 表示始终瞄准
-/// - `toggle_key`:独立启停 FPS 模式;0 表示未绑定
-/// - `suspend_key`:按住时暂时退出 FPS 并把光标还给鼠标;0 表示未绑定
+/// - `hold_key`:仅当该鼠标键(evdev 码)按住时才瞄准;空表示始终瞄准
+/// - `toggle_key`:独立启停 FPS 模式;空表示未绑定
+/// - `suspend_key`:按住时暂时退出 FPS 并把光标还给鼠标;空表示未绑定
+///
+/// 这三个(以及压枪 `trigger_key`)都是**系统键**,自 2026-10-09 起可以是组合键
+/// (见 [`KeySet`]),即"这几个键一起按住"才生效,顺序无关。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Aim {
     pub enabled: bool,
@@ -1291,17 +1567,17 @@ pub struct Aim {
     pub recenter_idle_ms: u32,
     /// 阈值归中:偏移超过多少设备像素后归中
     pub recenter_threshold: i32,
-    /// 需要按住才瞄准的鼠标键(evdev 码;0 = 始终瞄准)
-    pub hold_key: u16,
+    /// 需要按住才瞄准的鼠标键(evdev 码;空 = 始终瞄准)。可写成组合键。
+    pub hold_key: KeySet,
     /// FPS 模式指针消隐:是否捕获鼠标(隐藏/冻结系统光标),默认开启
     #[serde(default = "default_capture_mouse")]
     pub capture_mouse: bool,
-    /// 进入/退出 FPS 模式的独立切换键(0 = 未绑定,可用界面按钮启停)
+    /// 进入/退出 FPS 模式的独立切换键(空 = 未绑定,可用界面按钮启停)。可写成组合键。
     #[serde(default)]
-    pub toggle_key: u16,
-    /// “按住才退出”:按住时暂时退出 FPS、恢复普通映射并显示鼠标(0 = 未绑定)
+    pub toggle_key: KeySet,
+    /// “按住才退出”:按住时暂时退出 FPS、恢复普通映射并显示鼠标(空 = 未绑定)。可写成组合键。
     #[serde(default)]
-    pub suspend_key: u16,
+    pub suspend_key: KeySet,
     /// 开放世界模式:不需要射击/开镜,持续把相对鼠标位移映射为水平转向。
     #[serde(default)]
     pub open_world: bool,
@@ -1319,6 +1595,10 @@ pub struct Aim {
     #[serde(default = "default_boundary")]
     pub boundary: bool,
     /// 鼠标视角输入通道。旧 UHID/AOA 配置读取后会迁移为通用触摸拖动。
+    ///
+    /// [已废弃 2026-10-08] 其中的 `VirtualGamepadContinuous` / `VirtualGamepadSegmented`
+    /// (虚拟手柄右摇杆 连续 / 分段回中)不再维护:配置照旧可读、行为照旧不变,
+    /// 但不再修复、不再扩展。其它三个取值(触摸拖动等)不受影响。
     #[serde(default)]
     pub input_mode: ViewInputMode,
     /// FPS 模式内:鼠标滚轮 = 双指缩放(向游戏注入两指张开/捏合手势;
@@ -1367,16 +1647,23 @@ pub struct Recoil {
     pub enabled: bool,
     /// 绑定触发快捷键(evdev 码;0 = 未绑定)。K2er 原文:一般是鼠标左键。
     #[serde(default)]
-    pub trigger_key: u16,
+    pub trigger_key: KeySet,
     /// 控制频率:每秒控制的次数(收敛到 1..=240;默认 60)。
     #[serde(default = "default_recoil_rate")]
     pub rate_hz: f32,
     /// 控制强度:多档,每档 = 每次控制的向下像素位移。空表按单档默认值处理。
     #[serde(default = "default_recoil_strengths")]
     pub strengths: Vec<f32>,
-    /// 鼠标滚轮改变强度:触发键按住期间,滚轮优先用于换档(否则仍是 FPS 缩放)。
+    /// 鼠标滚轮改变强度:触发键(或下面的挡位切换键)按住期间,滚轮优先用于换档
+    /// (否则仍是 FPS 缩放)。
     #[serde(default)]
     pub wheel_switch: bool,
+    /// 挡位切换键(evdev 码或两键组合,顺序无关;空 = 未绑定)。
+    ///
+    /// 用户 2026-10-10(第 3 条):按一下换一档(环绕);按住它时滚轮也能换档
+    /// (上滚 +1 / 下滚 −1),并且这种时候补偿优先于 FPS 滚轮缩放。
+    #[serde(default)]
+    pub switch_key: KeySet,
     /// 摇晃:每次控制在左右方向的随机抖动上限(设备像素;0 = 不摇晃)。
     #[serde(default)]
     pub shake_px: f32,
@@ -1389,10 +1676,11 @@ impl Default for Recoil {
     fn default() -> Self {
         Self {
             enabled: false,
-            trigger_key: 0,
+            trigger_key: KeySet::new(),
             rate_hz: default_recoil_rate(),
             strengths: default_recoil_strengths(),
             wheel_switch: false,
+            switch_key: KeySet::new(),
             shake_px: 0.0,
             sensitivity: 0.0,
         }
@@ -1435,10 +1723,10 @@ impl Default for Aim {
             recenter: RecenterMode::Idle,
             recenter_idle_ms: 120,
             recenter_threshold: 400,
-            hold_key: 0,
+            hold_key: KeySet::new(),
             capture_mouse: true,
-            toggle_key: 0,
-            suspend_key: 0,
+            toggle_key: KeySet::new(),
+            suspend_key: KeySet::new(),
             open_world: false,
             open_world_radius: default_open_world_radius(),
             open_world_smoothing: default_open_world_smoothing(),
@@ -1465,16 +1753,17 @@ impl Default for Profile {
             format_version: PROFILE_VERSION,
             screen: None,
             name: "默认配置".into(),
-            toggle_key: 66, // KEY_F8
-            cursor_toggle_key: 0,
+            toggle_key: KeySet::single(66), // KEY_F8
+            cursor_toggle_key: KeySet::new(),
             binds: Vec::new(),
             combos_enabled: false,
+            tail_delay_enabled: false,
             combos: Vec::new(),
             wheels: vec![Wheel {
-                up: 17,    // W
-                down: 31,  // S
-                left: 30,  // A
-                right: 32, // D
+                up: KeySet::single(17),    // W
+                down: KeySet::single(31),  // S
+                left: KeySet::single(30),  // A
+                right: KeySet::single(32), // D
                 // 相对坐标:左下角偏内,半径 = NEW_WHEEL_RADIUS_PX(150px)
                 // 按参考屏宽换算 —— 与界面上新建摇杆得到的像素半径一致
                 cx: 0.278,
@@ -1529,9 +1818,9 @@ pub struct SwitchKey {
     /// 旧配置的单键触发码；新配置使用 `keys`，正常化时会把旧值搬进去。
     #[serde(default)]
     pub key: u16,
-    /// 切换组合键，最多两个；顺序不影响匹配。
+    /// 切换组合键，最多两个；顺序不影响匹配(见 [`KeySet`])。
     #[serde(default)]
-    pub keys: Vec<u16>,
+    pub keys: KeySet,
     /// 目标组合在 `schemes` 里的下标
     #[serde(default)]
     pub target: usize,
@@ -1542,19 +1831,13 @@ pub struct SwitchKey {
 
 impl SwitchKey {
     /// 实际生效的切换按键(旧字段单键或新字段组合,最多 2 个)。
-    /// 返回定长栈拷贝(零分配),见 [`EffectiveKeys`]。
-    pub fn effective_keys(&self) -> EffectiveKeys {
-        let mut out = EffectiveKeys::new();
+    /// 返回定长栈拷贝(零分配),见 [`KeySet`]。
+    pub fn effective_keys(&self) -> KeySet {
         if self.keys.is_empty() {
-            if self.key != 0 {
-                out.push(self.key);
-            }
+            KeySet::single(self.key)
         } else {
-            for k in self.keys.iter().copied().filter(|k| *k != 0).take(2) {
-                out.push(k);
-            }
+            self.keys
         }
-        out
     }
 }
 
@@ -1748,23 +2031,43 @@ pub const YAML_HEADER: &str = r#"# =============================================
 #                  读取时统一按当前格式处理,手改它没有作用。
 #   toggle_key   : 映射总开关的切换键(evdev 码,默认 66=F8)
 #   cursor_toggle_key : 鼠标消隐切换键(按一下隐藏系统光标,再按一下恢复;0=未绑定)
+#   系统键的"组合键"写法(2026-10-09 起;2026-10-10 扩到滚轮):
+#     本文件里以下槽位既可写**单个整数**，也可写**两个键的数组**（顺序无关）:
+#       toggle_key / cursor_toggle_key / aim.hold_key / aim.toggle_key /
+#       aim.suspend_key / aim.recoil.trigger_key / switch_keys[].keys /
+#       wheels[].up / down / left / right / wheels[].temp.key /
+#       wheels[].directions[].key
+#     例: toggle_key: [29, 66]  表示 Ctrl+F8 同时按住才切换。
+#     单键与 0 仍写成裸整数 —— 老版本读得懂，升级不会把配置读坏。
 #   screen       : 设计这套布局时的屏幕尺寸 [宽, 高](仅作参考,可不填)
 #   binds        : 键位绑定列表
 #     - key      : 物理键(evdev 码;鼠标左/右/中=272/273/274,滚轮=277上/278下/279左/280右)
 #       action   : 动作,取值见下
 #       fps_only : true 时仅在 FPS 模式生效/显示(鼠标技能键建议开启)
+#       tail_delay_ms : 「按后延迟」(毫秒,默认 0 = 不等,不写就是 0)。
+#                  这一条**上一次抬起之后**至少再等这么久才接受下一次按下 ——
+#                  快速连点 / 连续划动时,防止上一动作还没抬起、下一动作已经按下。
+#                  冷却没过就按下来的那一次**不会丢**,会被推迟到冷却结束再执行。
+#                  这是**可选功能**,要两层都愿意才生效:本字段 > 0,且下面的
+#                  `tail_delay_enabled: true`。宏按"整条跑完"再算冷却。
 #   combos_enabled : 是否启用组合键(默认 false)。关闭时 combos 保留但全部失效。
+#   tail_delay_enabled : 「按后延迟」总开关(默认 false)。关闭时每条 tail_delay_ms
+#                  一律按 0 处理(数值原样保留,随时可以打开)。
 #   combos        : 组合键列表。keys[0] 是前缀键,后续 keys 与前缀同时按住才触发:
 #     - keys      : 物理键 evdev 码数组,至少两个;例如 [29, 19] = Ctrl + R
 #       action    : 组合触发时执行的动作(与 binds.action 相同)
-#       fps_only  : true 时只在视角模式运行期间生效
+#       fps_only  : true 时只在 FPS 模式运行期间生效
+#       tail_delay_ms : 同上,这一条组合键自己的「按后延迟」(默认 0 = 不等)
 #   wheels       : 虚拟摇杆(轮盘)列表
-#     up/down/left/right : 四个方向的物理键(evdev 码)
+#     up/down/left/right : 四个方向的物理键(evdev 码,或最多两键的组合)
 #     cx, cy     : 摇杆中心(相对坐标 0..1)
 #     radius     : 视觉半径(相对屏幕宽度的比例)
 #     scope      : 影响范围倍数(手指实际被推离中心的距离 = radius × scope)
 #     mode       : classic(经典)/sensitive(灵敏,同轴后按覆盖)
-#     temp       : 可选。临时轮盘:key = 启用键(evdev 码),mode = Hold|Toggle
+#     directions : 自定义/执行轮盘的方向列表(angle_deg 角度 + key 物理键,
+#                  key 同样可写最多两键的组合) —— standard 轮盘不用它
+#     temp       : 可选。临时轮盘:key = 启用键(evdev 码,或最多两键的组合),
+#                  mode = Hold|Toggle
 #                  (与文件里其它枚举一样,取值首字母大写 —— 这是实际序列化写法)
 #   aim          : 鼠标视角(FPS / 开放世界)
 #     enabled / anchor_x / anchor_y : 是否启用 + 手指落下的锚点(相对坐标)
@@ -1773,16 +2076,20 @@ pub const YAML_HEADER: &str = r#"# =============================================
 #     invert_y   : 是否反转纵向
 #     recenter   : 归中策略 Idle|Threshold|Never(首字母大写,同上)
 #     recenter_idle_ms / recenter_threshold : 静止归中时长 / 阈值归中的偏移阈值
-#     hold_key   : 仅当该鼠标键按住时才瞄准(evdev 码;0 = 始终瞄准)
+#     hold_key   : 仅当该鼠标键按住时才瞄准(evdev 码或两键数组;0 = 始终瞄准)
 #     capture_mouse : FPS 模式指针消隐(默认 true)
-#     toggle_key : 独立启停 FPS 模式的按键(0 = 未绑定)
+#     toggle_key : 独立启停 FPS 模式的按键或组合键(0 = 未绑定)
 #     suspend_key: “按住才退出”,按住时暂时退出 FPS、恢复普通映射并显示光标(0 = 未绑定)
-#     open_world : true 时启用开放世界视角模式(不要求射击/开镜,无限水平转向)
+#     recoil.trigger_key : 后坐力补偿触发键或组合键(0 = 未绑定)
+#     open_world : true 时启用开放世界模式(不要求射击/开镜,无限水平转向),
+#                  FPS 模式的一种变体 —— 界面统一叫「FPS 模式」
 #     open_world_radius : 水平触摸拖动带的回中半径(相对屏幕宽度,默认 0.22)
 #     open_world_smoothing : 位移平滑系数(0.15~1.0,默认 0.85)
 #     input_mode : touch_drag(universal touch drag) / virtual_gamepad_continuous /
 #                  virtual_gamepad_segmented (Xbox 360 HID right stick; segmented recenters at limit)
 #                  legacy uhid_mouse / aoa_mouse are migrated to touch_drag.
+#                  [已废弃 2026-10-08] virtual_gamepad_continuous / virtual_gamepad_segmented
+#                  不再维护:仍可读入并照旧生效,但不会被修复或扩展。
 #   look         : 外观(配色/密度/背景图),随组合一起保存
 #
 # 动作(action)五种写法(注意类型用 YAML 标签标出,即 !Tap 这种写法;
@@ -1837,6 +2144,65 @@ mod tests {
         assert_eq!(mouse_aux_name(BTN_WHEEL_DOWN), Some("BTN_WHEEL_DOWN"));
         assert_eq!(mouse_aux_name(BTN_WHEEL_LEFT), Some("BTN_WHEEL_LEFT"));
         assert_eq!(mouse_aux_name(BTN_WHEEL_RIGHT), Some("BTN_WHEEL_RIGHT"));
+    }
+
+    /// KeySet(用户 2026-10-09 第 4 条):组合键槽位的读写必须与老配置**互通**。
+    ///
+    /// 未绑定与单键写成裸整数(老版本读得懂、文件看着也清爽),两键才写数组。
+    #[test]
+    fn key_set_serializes_single_and_empty_as_plain_integer() {
+        assert_eq!(serde_json::to_string(&KeySet::new()).unwrap(), "0");
+        assert_eq!(serde_json::to_string(&KeySet::single(66)).unwrap(), "66");
+        assert_eq!(
+            serde_json::to_string(&KeySet::from_keys([29, 45])).unwrap(),
+            "[29,45]"
+        );
+        assert_eq!(serde_json::from_str::<KeySet>("0").unwrap(), KeySet::new());
+        assert_eq!(
+            serde_json::from_str::<KeySet>("66").unwrap(),
+            KeySet::single(66)
+        );
+        assert_eq!(
+            serde_json::from_str::<KeySet>("[45,29]").unwrap(),
+            KeySet::from_keys([29, 45]),
+            "顺序无关:读回来的集合与写出去的等价"
+        );
+        // 手写的 YAML 里多塞了键也不该报错:只留前两个(与界面捕获的上限一致)
+        assert_eq!(
+            serde_json::from_str::<KeySet>("[1,2,3]").unwrap(),
+            KeySet::from_keys([1, 2])
+        );
+    }
+
+    /// KeySet 的相等与"与单个键比较"的语义(全程序大量沿用单键写法)。
+    #[test]
+    fn key_set_equality_ignores_order_and_is_exact_against_a_single_code() {
+        assert_eq!(KeySet::from_keys([29, 45]), KeySet::from_keys([45, 29]));
+        assert_eq!(KeySet::from_keys([0, 45, 45]), KeySet::single(45));
+        // 与单个键码比较 = "这个槽位**正好**只有这一个键"
+        assert_eq!(KeySet::single(66), 66u16);
+        assert_eq!(KeySet::new(), 0u16);
+        assert_ne!(KeySet::from_keys([29, 45]), 29u16);
+        assert_ne!(KeySet::from_keys([29, 45]), KeySet::single(29));
+        // 按持判定:整个集合都按着才算(空集合恒 false)
+        assert!(KeySet::from_keys([29, 45]).all_held_by(|k| k == 29 || k == 45));
+        assert!(!KeySet::from_keys([29, 45]).all_held_by(|k| k == 29));
+        assert!(!KeySet::new().all_held_by(|_| true));
+    }
+
+    /// 捕获后的显示顺序:`Ctrl+X` 而不是用户真实的按下顺序(`X+Ctrl`)。
+    #[test]
+    fn canonical_chord_puts_modifiers_first() {
+        let c = canonical_chord(&[45, 29]);
+        assert_eq!(c.as_slice(), &[29, 45], "修饰键必须排在前面");
+        assert_eq!(canonical_chord(&[29, 45]).as_slice(), &[29, 45]);
+        assert_eq!(
+            canonical_chord(&[29, 0, 29]).as_slice(),
+            &[29],
+            "去重并滤 0"
+        );
+        assert!(canonical_chord(&[29, 45]).label().contains('+'));
+        assert_eq!(KeySet::new().label(), "");
     }
 
     #[test]
@@ -1952,14 +2318,44 @@ mod tests {
         assert!(wild.push_px(&m) <= m.len(w.radius) * SCOPE_MAX + 1e-3);
     }
 
+    /// 方向的"手动终点"(2026-10-08「设置位置」)读写兼容:
+    /// 老配置没有这个字段 → None(跟随基准圆,行为与旧版逐一一致);
+    /// 手改点原样往返;None 时不写字段(老版本读新配置不会看到陌生键)。
+    #[test]
+    fn wheel_direction_manual_round_trips_and_defaults_to_none() {
+        let old = r#"{"angle_deg": 0.0, "key": 32}"#;
+        let d: WheelDirection = serde_json::from_str(old).expect("老方向应可解析");
+        assert_eq!(d.manual, None, "缺省必须跟随基准圆");
+        assert_eq!(d.angle_deg, 0.0);
+        assert_eq!(d.key, 32);
+
+        let with = WheelDirection {
+            angle_deg: 33.0,
+            key: KeySet::single(55),
+            manual: Some((0.9, 0.25)),
+        };
+        let text = serde_json::to_string(&with).unwrap();
+        assert!(text.contains("manual"), "手改点必须写进配置:{text}");
+        let back: WheelDirection = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, with);
+
+        let none = WheelDirection {
+            manual: None,
+            ..with
+        };
+        let text = serde_json::to_string(&none).unwrap();
+        assert!(!text.contains("manual"), "None 不该写出字段:{text}");
+        assert_eq!(serde_json::from_str::<WheelDirection>(&text).unwrap(), none);
+    }
+
     /// 斜向推出距离不应超过 scope 描述的范围(归一化后半径分量 < 半径)
     #[test]
     fn wheel_push_px_is_a_radius_scale() {
         let w = Wheel {
-            up: 17,
-            down: 31,
-            left: 30,
-            right: 32,
+            up: KeySet::single(17),
+            down: KeySet::single(31),
+            left: KeySet::single(30),
+            right: KeySet::single(32),
             cx: 0.278,
             cy: 0.375,
             radius: 0.111,
@@ -2004,7 +2400,12 @@ mod tests {
             );
             assert_eq!(
                 (w.up, w.down, w.left, w.right),
-                (17, 31, 30, 32),
+                (
+                    KeySet::single(17),
+                    KeySet::single(31),
+                    KeySet::single(30),
+                    KeySet::single(32)
+                ),
                 "方向键默认 WASD"
             );
             assert!(w.temp.is_none(), "新建摇杆默认是永久摇杆");
@@ -2073,7 +2474,7 @@ mod tests {
             schemes: vec![Profile::default(), {
                 let mut p = Profile::default();
                 p.name = "按键组合2".into();
-                p.toggle_key = 65; // F7
+                p.toggle_key = KeySet::single(65); // F7
                 p.binds.push(KeyBind {
                     fps_only: false,
                     key: 22, // U
@@ -2083,14 +2484,16 @@ mod tests {
                         duration_ms: 40,
                         radius: 0.05,
                     },
+                    tail_delay_ms: 0,
                 });
                 p.binds.push(KeyBind {
                     fps_only: false,
                     key: 23,
                     action: Action::AndroidKey { keycode: 4 },
+                    tail_delay_ms: 0,
                 });
                 p.wheels[0].temp = Some(TempWheel {
-                    key: 57,
+                    key: KeySet::single(57),
                     mode: TempMode::Toggle,
                 });
                 p
@@ -2133,13 +2536,13 @@ mod tests {
         // armed:开启 + 绑了触发键才算具备前提(只开不绑 = 无处触发)
         let armed = Recoil {
             enabled: true,
-            trigger_key: BTN_LEFT,
+            trigger_key: KeySet::single(BTN_LEFT),
             ..Recoil::default()
         };
         assert!(armed.armed());
         let unbound = Recoil {
             enabled: true,
-            trigger_key: 0,
+            trigger_key: KeySet::new(),
             ..Recoil::default()
         };
         assert!(!unbound.armed(), "没绑触发键不算 armed");

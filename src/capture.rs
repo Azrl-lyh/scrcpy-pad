@@ -30,7 +30,7 @@
 
 use anyhow::Result;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
@@ -66,18 +66,6 @@ pub enum CaptureEvent {
 }
 
 impl CaptureEvent {
-    /// 用于"按任意键"绑定捕获:只取按下的按键
-    pub fn pressed_code(&self) -> Option<u16> {
-        match *self {
-            CaptureEvent::Button {
-                code,
-                pressed: true,
-                ..
-            } => Some(code),
-            _ => None,
-        }
-    }
-
     /// 事件自带的捕获时刻(W1-1);引擎与宏录制都按它计时。
     pub fn at(&self) -> Instant {
         match *self {
@@ -95,12 +83,16 @@ impl CaptureEvent {
 ///
 /// 为什么只选这几个:它们是纯"系统命令"键,被映射后几乎必然是想要"抢过来"的;
 /// 而 Space/Tab/Enter/字母数字是输入键,映射开启时用户仍可能需要打字(聊天框),
-/// 一刀切拦截会制造新问题。滚轮(上/下)只在被绑定了滚轮键、或 FPS 滚轮缩放
+/// 一刀切拦截会制造新问题。四个滚轮方向只在被绑定了滚轮键、或 FPS 滚轮缩放
 /// 生效时才拦(FPS 缩放由引擎状态决定,界面每帧据此更新掩码)。
+///
+/// 2026-10-10(用户第 2 条"继续补全滚轮逻辑"):掩码由 `u8` 加宽为 `u16`,
+/// 给横向滚轮 279/280 留位 —— 捕获层两侧本来就在发这两个码,以前没有位可置,
+/// "滚轮左滚/右滚"于是永远拦不住系统的横向滚动。
 ///
 /// 效率:钩子回调里只有"查一次位表 + 读一次原子掩码"(见 `Capture::swallow`),
 /// 掩码在界面线程按配置预先算好,回调不做任何锁操作。
-pub fn swallow_bit(code: u16) -> Option<u8> {
+pub fn swallow_bit(code: u16) -> Option<u16> {
     match code {
         1 => Some(1 << 0),   // KEY_ESC
         87 => Some(1 << 1),  // KEY_F11(全屏)
@@ -110,6 +102,8 @@ pub fn swallow_bit(code: u16) -> Option<u8> {
         276 => Some(1 << 5), // BTN_EXTRA(前进)
         277 => Some(1 << 6), // BTN_WHEEL_UP(系统滚动)
         278 => Some(1 << 7), // BTN_WHEEL_DOWN(系统滚动)
+        279 => Some(1 << 8), // BTN_WHEEL_LEFT(系统横向滚动)
+        280 => Some(1 << 9), // BTN_WHEEL_RIGHT(系统横向滚动)
         _ => None,
     }
 }
@@ -119,17 +113,22 @@ mod swallow_tests {
     use super::swallow_bit;
 
     /// 候选表的位必须两两不同,且覆盖用户点名的 Esc / 右键。
+    /// 候选键(含四个滚轮方向)两两占不同的位,且位置与文档一致。
     #[test]
     fn swallow_bits_are_distinct_and_cover_named_keys() {
-        let mut seen = 0u8;
-        for c in [1u16, 87, 273, 274, 275, 276, 277, 278] {
+        let candidates = [1u16, 87, 273, 274, 275, 276, 277, 278, 279, 280];
+        let mut seen = 0u16;
+        for c in candidates {
             let bit = swallow_bit(c).expect("候选键必须有位");
             assert_eq!(seen & bit, 0, "位重复: {c}");
             seen |= bit;
         }
-        assert_eq!(seen, u8::MAX, "8 个候选键应恰好占满 8 位");
+        // 每个候选键恰好占一位
+        assert_eq!(seen.count_ones() as usize, candidates.len());
         assert_eq!(swallow_bit(1), Some(1), "Esc 在第 0 位");
         assert_eq!(swallow_bit(273), Some(1 << 2), "右键在第 2 位");
+        assert_eq!(swallow_bit(279), Some(1 << 8), "左滚在第 8 位");
+        assert_eq!(swallow_bit(280), Some(1 << 9), "右滚在第 9 位");
     }
 
     /// 非候选键(字母/空格/回车/Tab/Shift 等输入键)永远不拦 ——
@@ -611,16 +610,24 @@ mod hb_tests {
 /// 钩子安装结果的位标志(W0-11)。编码(钩子线程)与解码(界面自检)都走这里,
 /// 免得两边各写一份位运算、把键盘和鼠标对应反了 —— 那会把"键盘没装上"
 /// 报成"鼠标没装上",反而误导排查方向。
+///
+/// 只有 Windows 会装低级钩子,所以在 Linux 构建里这一组编解码函数用不上
+/// (`cargo check` 在 WSL 下会报 3 条 dead_code)。**不能直接把函数注释掉**:
+/// Windows 的钩子线程与界面自检都在用它们,一注释 Windows 就编不过。
+/// 按平台标注才是对的 —— 与"跨平台代码只在一边用得上"这件事本身一致。
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn hook_bits_encode(keyboard: bool, mouse: bool) -> u8 {
     (keyboard as u8) | ((mouse as u8) << 1)
 }
 
 /// 键盘低级钩子是否已装上(bit0);`hook_ok == 0` 时表示"未知",同样返回 false
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn hook_bits_keyboard_ok(bits: u8) -> bool {
     bits & 1 != 0
 }
 
 /// 鼠标低级钩子是否已装上(bit1);`hook_ok == 0` 时表示"未知",同样返回 false
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn hook_bits_mouse_ok(bits: u8) -> bool {
     bits & 2 != 0
 }
@@ -662,7 +669,7 @@ pub struct Capture {
     /// 「拦截系统默认行为」掩码(位定义见 [`swallow_bit`]):某位=1 表示对应
     /// 候选键此刻正在被映射,钩子回调把它从系统输入流里吞掉。
     /// Windows 专用;Linux 侧 `grab` 的 EVIOCGRAB 整把抓取,天然满足同一需求。
-    pub swallow: Arc<AtomicU8>,
+    pub swallow: Arc<AtomicU16>,
     /// 鼠标抓取(FPS 瞄准开启时置 true;Linux 走 EVIOCGRAB,Windows 走光标回中)
     pub mouse_grab: Arc<AtomicBool>,
     /// 独立的光标消隐请求(不影响鼠标事件抓取/回中;Windows 使用透明系统光标)
@@ -698,7 +705,7 @@ impl Capture {
     pub fn start(tx: Sender<CaptureEvent>) -> Result<Self> {
         let grab = Arc::new(AtomicBool::new(false));
         let mouse_grab = Arc::new(AtomicBool::new(false));
-        let swallow = Arc::new(AtomicU8::new(0));
+        let swallow = Arc::new(AtomicU16::new(0));
         let cursor_hide = Arc::new(AtomicBool::new(false));
         let mouse_found = Arc::new(AtomicBool::new(false));
         let hook_lag = Arc::new(AtomicBool::new(false));
@@ -1993,7 +2000,7 @@ mod windows {
     use anyhow::Result;
     use std::collections::HashSet;
     use std::sync::atomic::{
-        AtomicBool, AtomicI32, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering,
+        AtomicBool, AtomicI32, AtomicPtr, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering,
     };
     use std::sync::mpsc::{Sender, channel};
     use std::sync::{Arc, Mutex, OnceLock};
@@ -2004,6 +2011,7 @@ mod windows {
         GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
     };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
     };
@@ -2013,17 +2021,17 @@ mod windows {
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, CreateCursor, CreateWindowExW, DefWindowProcW, DestroyWindow,
-        DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, HC_ACTION, IDC_ARROW,
-        KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LoadCursorW, MSG, MSLLHOOKSTRUCT,
-        OCR_APPSTARTING, OCR_CROSS, OCR_HAND, OCR_HELP, OCR_IBEAM, OCR_NO, OCR_NORMAL, OCR_SIZEALL,
-        OCR_SIZENESW, OCR_SIZENS, OCR_SIZENWSE, OCR_SIZEWE, OCR_UP, OCR_WAIT, PostThreadMessageW,
-        RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SPI_SETCURSORS, SPIF_SENDCHANGE,
-        SYSTEM_CURSOR_ID, SetCursor, SetCursorPos, SetSystemCursor, SetWindowsHookExW,
-        SystemParametersInfoW, UnhookWindowsHookEx, UnregisterClassW, WH_KEYBOARD_LL, WH_MOUSE_LL,
-        WM_APP, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-        WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
-        WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_POPUP,
+        DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowThreadProcessId,
+        HC_ACTION, IDC_ARROW, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LoadCursorW, MSG,
+        MSLLHOOKSTRUCT, OCR_APPSTARTING, OCR_CROSS, OCR_HAND, OCR_HELP, OCR_IBEAM, OCR_NO,
+        OCR_NORMAL, OCR_SIZEALL, OCR_SIZENESW, OCR_SIZENS, OCR_SIZENWSE, OCR_SIZEWE, OCR_UP,
+        OCR_WAIT, PostThreadMessageW, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SPI_SETCURSORS,
+        SPIF_SENDCHANGE, SYSTEM_CURSOR_ID, SetCursor, SetCursorPos, SetSystemCursor,
+        SetWindowsHookExW, SystemParametersInfoW, UnhookWindowsHookEx, UnregisterClassW,
+        WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+        WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+        WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+        WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WindowFromPoint,
     };
 
     /// 抓取鼠标时,光标离屏幕中心超过该比例(相对显示器短边)才拉回中心。
@@ -2205,7 +2213,7 @@ mod windows {
         raw_drop_ms: AtomicU64,
         /// 「拦截系统默认行为」掩码(位定义见 [`swallow_bit`])。界面线程按当前
         /// 配置/映射开关/独占键盘开关预先算好写进来;钩子回调只读一次原子量。
-        swallow: Arc<AtomicU8>,
+        swallow: Arc<AtomicU16>,
         /// 钩子心跳(W1-4)。数值都是 `now_ms()` 基准(同一时钟)。
         hb: Hb,
     }
@@ -2252,7 +2260,7 @@ mod windows {
         }
     }
 
-    fn install_shared(raw_tx: Sender<RawEvent>, swallow: Arc<AtomicU8>) -> *mut WinShared {
+    fn install_shared(raw_tx: Sender<RawEvent>, swallow: Arc<AtomicU16>) -> *mut WinShared {
         let shared = Box::into_raw(Box::new(WinShared {
             raw_tx,
             last_seen: (0..512).map(|_| AtomicU64::new(0)).collect(),
@@ -2575,7 +2583,7 @@ mod windows {
     pub fn start(
         grab: &Arc<AtomicBool>,
         mouse_grab: &Arc<AtomicBool>,
-        swallow: &Arc<AtomicU8>,
+        swallow: &Arc<AtomicU16>,
         cursor_hide: &Arc<AtomicBool>,
         mouse_found: &Arc<AtomicBool>,
         hook_lag: &Arc<AtomicBool>,
@@ -3001,6 +3009,26 @@ mod windows {
         shared.timing.record(began.elapsed().as_nanos() as u64);
     }
 
+    /// 光标(屏幕坐标)下面最上层那个窗口是否**属于本进程**。
+    ///
+    /// 用户 2026-10-09(第 3 条"滚动"):滚轮压在界面自己身上时不该被吞 ——
+    /// 吞掉就等于"界面里的清单/弹窗只能用鼠标拖滚动条"。
+    ///
+    /// 游戏窗口是独立的 `scrcpy.exe` 进程,所以这个判据刚好把两种情况分开:
+    /// 本进程窗口 = 在操作界面(放行给 egui 滚);别的进程 = 在打游戏(照旧吞,交给映射)。
+    ///
+    /// 只在滚轮事件里调用(不是每个鼠标事件),两次 user32 查询,量级可忽略;
+    /// 这里**不取任何锁**(`WindowFromPoint` 是同步的窗口管理器调用,不会回调我们的钩子)。
+    unsafe fn wheel_over_own_window(pt: &POINT) -> bool {
+        let hwnd = unsafe { WindowFromPoint(*pt) };
+        if hwnd.is_null() {
+            return false;
+        }
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        pid != 0 && pid == unsafe { GetCurrentProcessId() }
+    }
+
     unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         let began = Instant::now();
         if code == HC_ACTION as i32 {
@@ -3114,6 +3142,13 @@ mod windows {
                     // 滚轮候选键(上/下)被映射(或正被 FPS 滚轮缩放接管)时吞掉
                     // 系统滚动。**残齿也吞**:还没凑够一齿的余量如果放行,系统侧
                     // 会照滚,等于拦截漏了半拍。
+                    //
+                    // 2026-10-09(用户第 3 条"滚动"):**光标压在本程序自己的窗口上时不吞**。
+                    // 只要配置里绑了滚轮(上一轮新增的[鼠标映射]就是干这个的),这个位就
+                    // 一直置着,于是界面里所有可滚动控件(宏弹窗、截图小窗、各种清单)都
+                    // 只能拖滚动条 —— 用户报的就是这个。判据用 OS 现成的:
+                    // 光标下最上层的那个窗口属于本进程 = 用户在操作界面,滚轮该去滚动界面;
+                    // 属于别的进程(游戏窗口是独立的 scrcpy.exe)= 照旧吞,交给映射,打游戏不变。
                     let cand = if vertical {
                         if delta > 0 {
                             BTN_WHEEL_UP
@@ -3126,7 +3161,9 @@ mod windows {
                         BTN_WHEEL_LEFT
                     };
                     if let Some(bit) = swallow_bit(cand) {
-                        if shared.swallow.load(Ordering::Relaxed) & bit != 0 {
+                        if shared.swallow.load(Ordering::Relaxed) & bit != 0
+                            && !unsafe { wheel_over_own_window(&ms.pt) }
+                        {
                             return 1;
                         }
                     }
@@ -3772,7 +3809,7 @@ mod windows {
         };
         use std::collections::HashSet;
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
         use std::sync::mpsc::channel;
 
         /// W1-2:相对/绝对/空位移的分类。绝对坐标判定优先于"零位移"——
@@ -3840,9 +3877,9 @@ mod windows {
         #[test]
         fn restart_replaces_windows_hook_shared_transport() {
             let (tx1, _rx1) = channel::<RawEvent>();
-            let first = install_shared(tx1, Arc::new(AtomicU8::new(0)));
+            let first = install_shared(tx1, Arc::new(AtomicU16::new(0)));
             let (tx2, _rx2) = channel::<RawEvent>();
-            let second = install_shared(tx2, Arc::new(AtomicU8::new(0xFF)));
+            let second = install_shared(tx2, Arc::new(AtomicU16::new(0xFF)));
             assert_ne!(first, second);
             // 重装后的共享结构必须带着**新的**拦截掩码 Arc,而不是沿用旧的
             assert_eq!(
