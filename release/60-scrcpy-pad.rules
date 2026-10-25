@@ -1,0 +1,26 @@
+# scrcpy-pad:让当前活动会话的用户无需加入 input 组即可读取 /dev/input/event*
+#
+# 为什么需要这条规则:程序靠 evdev 直读键盘鼠标(以及 EVIOCGRAB 独占),
+# 而 /dev/input/event* 默认是 root:input 0660 —— 普通用户既不是 root 也不在
+# input 组时,程序启动就会硬失败("无权限读取输入设备")。
+#
+# 传统做法是 `sudo usermod -aG input $USER` + 注销重登,代价是:
+#   * 必须注销重登(组身份在登录时定死),而且会对**所有**输入设备无限期授权;
+#   * 用户常常忘了重登,看到的是一个"起来了但键盘没反应"的界面。
+#
+# `TAG+="uaccess"` 是 systemd-logind 的标准做法:规则装上之后,logind 会自动给
+# **当前活动会话**的用户配 ACL —— 不需要加组,不需要重新登录,切换用户/会话时
+# 权限随之迁移(离线的那个会话拿不到)。
+#
+# 安装(需要 root 一次,之后永久生效):
+#   sudo install -m 0644 60-scrcpy-pad.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=input
+#
+# 卸载:删掉那个文件后重跑上面两条 udevadm 命令。
+
+# 输入事件节点:读取(捕获键鼠 + EVIOCGRAB 都只需要读权限)
+KERNEL=="event*", SUBSYSTEM=="input", TAG+="uaccess"
+
+# /dev/uinput:只在做反向注入自检时需要;不做就不影响程序运行。
+# 注释掉是默认 —— 它允许用户建任意虚拟输入设备,权限面比 event* 大得多。
+#KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess"

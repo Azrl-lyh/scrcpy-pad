@@ -28,7 +28,18 @@ function Build-Windows {
     }
 
     $out = Join-Path $Here 'windows-x86_64'
-    if (Test-Path -LiteralPath $out) { Remove-Item -LiteralPath $out -Recurse }
+    # 不要"先删后拷":程序正在运行时旧 exe 会被锁住,Remove-Item 一失败就会
+    # 报出一个看着像"构建失败"的"访问被拒绝",还会把上一次可用的包弄成半残。
+    # 改法:能删就删;删不掉的(被占用的 exe)改名让位,其余文件照常覆盖。
+    if (Test-Path -LiteralPath $out) {
+        Remove-Item -LiteralPath $out -Recurse -Force -ErrorAction SilentlyContinue
+        $locked = Join-Path $out "$Pkg.exe"
+        if (Test-Path -LiteralPath $locked) {
+            $aside = "$locked.inuse-" + (Get-Date -Format 'yyyyMMdd-HHmmss')
+            Move-Item -LiteralPath $locked -Destination $aside -Force
+            Write-Host "[release] 旧 exe 正被占用,已改名让位: $(Split-Path -Leaf $aside)(关掉程序后可自行删除)"
+        }
+    }
     New-Item -ItemType Directory -Path (Join-Path $out 'icons') -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $Root 'target\release\scrcpy-pad.exe') -Destination (Join-Path $out 'scrcpy-pad.exe') -Force
     if (Test-Path -LiteralPath (Join-Path $Root 'icons\scrcpy-pad.png')) {

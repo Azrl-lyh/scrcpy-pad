@@ -25,10 +25,10 @@ use crate::capture::CaptureEvent;
 use crate::control::{ControlClient, GAMEPAD_HID_ID, GAMEPAD_REPORT_DESC};
 use crate::diag_warn;
 use crate::keymap::{
-    Action, Aim, BTN_WHEEL_DOWN, BTN_WHEEL_LEFT, BTN_WHEEL_RIGHT, BTN_WHEEL_UP, KeyBind, KeyCombo,
-    KeySet, MacroAction, MacroInstruction, MacroWheelPart, Mapper, Profile, RecenterMode,
-    SWIPE_SAMPLES, SwitchDirection, SwitchKey, TempMode, ViewInputMode, Wheel, WheelKind,
-    WheelMode, easing_apply, is_wheel_code, key_name, swipe_points,
+    Action, Aim, BTN_WHEEL_DOWN, BTN_WHEEL_LEFT, BTN_WHEEL_RIGHT, BTN_WHEEL_UP, HorizontalWave,
+    KeyBind, KeyCombo, KeySet, MacroAction, MacroInstruction, MacroWheelPart, Mapper, Profile,
+    RecenterMode, SWIPE_SAMPLES, SwitchDirection, SwitchKey, TempMode, ViewInputMode, Wheel,
+    WheelKind, WheelMode, easing_apply, is_wheel_code, key_name, swipe_points,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -74,6 +74,16 @@ mod consts {
     pub const WHEEL_PID_BASE: u64 = 2000;
     /// 瞄准指针的固定 id(与普通绑定 1000+、轮盘 2000+ 区分开)
     pub const AIM_PID: u64 = 3000;
+    /// 「重叠换手」用的第二根瞄准指(见 [`super::aim_overlap_handoff`])。
+    ///
+    /// 为什么必须**另起一个号**:换手要"新指先落、旧指后抬",两根瞄准指必须
+    /// 同时在按。而 scrcpy-server 的 `PointersState` 对**已存在**的 pid 再 DOWN
+    /// 只会返回原来的 index —— 那等于拿一根已经按下的手指重发 DOWN(语义非法,
+    /// 设备端 slot 顺序也会跟着乱),所以重叠期间的两根指必须是两个不同的 pid。
+    ///
+    /// 号段取在瞄准段(3000)里、紧挨主号:段宽没有别的依赖(瞄准只有这一组
+    /// 固定号,不像 FPS/组合/宏那样按段清理),两个号都远离 1000+/2000+/4000+。
+    pub const AIM_PID_ALT: u64 = 3001;
     /// FPS 专用绑定:`fps_bind_pid(idx) = FPS_PID_BASE + idx`。
     pub const FPS_PID_BASE: u64 = 4000;
     /// FPS 段宽度:按 pid 反查/清理排程与按下表时用(见 `cancel_fps_scheduled`)。
@@ -193,6 +203,11 @@ mod consts {
     pub const MACRO_KEY_SPAN_MIN_MS: u64 = 10;
     /// 录制步骤按键找不到配对"抬起"时的默认按住时长(80ms ≈ 一次自然点按)。
     pub const MACRO_KEY_SPAN_DEFAULT_MS: u64 = 80;
+    /// 「长按重复」(用户 2026-10-11 第 2 条)下一轮相对"这一轮结束时刻"多让出的
+    /// 毫秒数。间隔为 0 时也得让:主循环对**同一时刻**的动作严格按入队顺序执行,
+    /// 而下一轮是**后**追加进去的 —— 真让它和收尾的"兜底抬起"同刻,那一抬会把
+    /// 下一轮的按下一并抬掉(设备端看到的是"按了一下立刻松")。
+    pub const REPEAT_ROUND_MARGIN_MS: u64 = 1;
     /// 执行轮盘滑动时长的取值范围(毫秒,用户可调值的护栏)。
     pub const EXEC_WHEEL_MIN_MS: u32 = 30;
     pub const EXEC_WHEEL_MAX_MS: u32 = 500;
@@ -204,26 +219,6 @@ mod consts {
 // 常量统一从 `consts` 取用:下面的代码仍按裸名引用(不必处处写 `consts::`),
 // 且 `DEVICE_MAX_POINTERS` 还有界面侧引用,所以这里是 pub re-export。
 pub use consts::*;
-
-/// Ctrl / Alt 的 evdev 键码,用于识别"Ctrl+Alt 交还鼠标"这一组合
-const KEY_LEFTCTRL: u16 = 29;
-const KEY_RIGHTCTRL: u16 = 97;
-const KEY_LEFTALT: u16 = 56;
-const KEY_RIGHTALT: u16 = 100;
-
-fn is_ctrl(code: u16) -> bool {
-    code == KEY_LEFTCTRL || code == KEY_RIGHTCTRL
-}
-
-fn is_alt(code: u16) -> bool {
-    code == KEY_LEFTALT || code == KEY_RIGHTALT
-}
-
-/// Ctrl+Alt 组合的触发判定:两者都按住时,按下的那一方触发一次切换。
-/// 这样一次组合只会切换一次,按住不放也不会连发。
-fn ctrl_alt_chord(code: u16, pressed: bool, ctrl_down: bool, alt_down: bool) -> bool {
-    pressed && ctrl_down && alt_down && (is_ctrl(code) || is_alt(code))
-}
 
 /// 引擎内部使用的按键事件:与 capture::CaptureEvent::Button 同构,
 /// 保留 code/pressed 字段名以便下方既有逻辑直接复用。
@@ -362,6 +357,12 @@ impl ComboGate {
             || profile.cursor_toggle_key.contains(&event.code)
             || profile.aim.toggle_key.contains(&event.code)
             || profile.aim.suspend_key.contains(&event.code)
+            // S②:鼠标独占的手动开关热键必须**立刻**到达引擎,不许被组合键判定
+            // 窗口扣住 —— 隔膜开着时鼠标点不了任何窗口,这个键是唯一的退路。
+            || profile.aim.shield_key.contains(&event.code)
+            // A(2026-10-11):「唤醒视角」同理 —— 锁死时键盘是唯一还通的路,
+            // 这个键被判定窗口扣住 45/120ms 就等于"按了没反应"。
+            || profile.aim.wake_key.contains(&event.code)
             || profile.aim.hold_key.contains(&event.code)
             || profile.aim.recoil.trigger_key.contains(&event.code)
             || profile.aim.recoil.switch_key.contains(&event.code)
@@ -476,6 +477,8 @@ fn key_has_single_action(profile: &Profile, code: u16) -> bool {
         || profile.cursor_toggle_key.contains(&code)
         || profile.aim.toggle_key.contains(&code)
         || profile.aim.suspend_key.contains(&code)
+        || profile.aim.shield_key.contains(&code)
+        || profile.aim.wake_key.contains(&code)
         || profile.aim.hold_key.contains(&code)
         || profile.aim.recoil.trigger_key.contains(&code)
         || profile.aim.recoil.switch_key.contains(&code)
@@ -489,15 +492,64 @@ fn resolve_switch_target(
 ) -> Option<usize> {
     match switch.direction {
         SwitchDirection::Target => (switch.target < scheme_count).then_some(switch.target),
-        SwitchDirection::Next => (scheme_count != 0).then_some((active_scheme + 1) % scheme_count),
-        SwitchDirection::Prev => {
-            if scheme_count == 0 {
-                None
-            } else {
-                Some((active_scheme + scheme_count - 1) % scheme_count)
-            }
+        // B21-C(用户 2026-10-18):Next/Prev 在**勾选集合**里轮换(空 = 全部参与)。
+        // 纯逻辑抽到 `rotate_target`,它自己被表驱动单测逐条钉住。
+        SwitchDirection::Next => {
+            rotate_target(switch.rotate_set.as_deref(), active_scheme, scheme_count, 1)
         }
+        SwitchDirection::Prev => rotate_target(
+            switch.rotate_set.as_deref(),
+            active_scheme,
+            scheme_count,
+            -1,
+        ),
     }
+}
+
+/// 在参与轮换的组合里按 step(±1)找下一个目标组合。
+///
+/// 三条硬口径(用户 2026-10-18 第 2 条 "按键后轮换鼠标键位集合…只有勾住的键位才能
+/// 在轮换的集合里";2026-10-23 第 3 条又把"全不选"变成可表达的状态):
+/// 1. 参与集合由 crate::keymap::rotate_members **统一算出**(引擎与界面共用同一口径):
+///    None ⇒ 全部组合参与(与旧行为逐字节一致,老配置不用迁移);
+///    Some([]) ⇒ **一个都不参与** ⇒ 没有可切的目标,返回 None;
+/// 2. 集合里**越界或重复**的下标一律忽略 —— 配置文件会被手改(normalize
+///    也只做一部分校验),引擎**不许**因此 panic 或跳到不存在的组合;
+/// 3. 当前生效组合**不在集合里**时,Next 取集合里**大于**当前值的第一个(绕回最小),
+///    Prev 取**小于**当前值的最大一个(绕回最大)—— 这样"勾掉当前这套"之后再按
+///    切换键,行为仍然是可预期的单向移动,而不是原地打转。
+fn rotate_target(
+    rotate_set: Option<&[usize]>,
+    active_scheme: usize,
+    scheme_count: usize,
+    step: isize,
+) -> Option<usize> {
+    if scheme_count == 0 {
+        return None;
+    }
+    // 有效集合:去重、去越界、升序(顺序无关 ⇒ 结果与配置文件里写的顺序无关);
+    // None 在这里展开成 0..scheme_count,于是下面只剩两条分支要判。
+    let set = crate::keymap::rotate_members(rotate_set, scheme_count);
+    if set.is_empty() {
+        // Some([]):用户明确点了"全不选" ⇒ 没有可切的目标。
+        // (旧版"空集合退化成模运算"的兜底已上移到 rotate_members 的 None 分支,
+        //  这里不再有"空 = 全部"的含义。)
+        return None;
+    }
+    if set.len() == 1 {
+        return Some(set[0]);
+    }
+    let next = if step > 0 {
+        set.iter().copied().find(|&i| i > active_scheme)
+    } else {
+        set.iter().rev().copied().find(|&i| i < active_scheme)
+    };
+    Some(match (next, step > 0) {
+        (Some(i), _) => i,
+        // 绕回:Next 回到最小、Prev 回到最大
+        (None, true) => set[0],
+        (None, false) => set[set.len() - 1],
+    })
 }
 
 /// 普通键位并发跟踪器:每个绑定索引独立记录"是否已按下",
@@ -708,6 +760,19 @@ pub struct EngineLive {
 pub struct PressGates {
     binds: Vec<Option<Instant>>,
     combos: Vec<Option<Instant>>,
+    /// 冷却里被**扣住**的那一次按下(用户 2026-10-11 第 1 条):每条键位/组合键
+    /// 各一格,存的是当初排进 [`SchedAct::Redispatch`] 的键码。
+    ///
+    /// 为什么需要它:Windows 上按住不放会连发 `KEYDOWN`(自动重复),而这些事件
+    /// 到达时 `fresh_press = false` —— 旧实现让它们整条绕过冷却判定、又落进各动作
+    /// 分支的 `if fresh_press` 守卫里被丢掉(既不执行、也不会在冷却结束时补捉)。
+    /// 现在冷却里到达的**按下**事件一律"扣住"一格:只有原本为空的那一次才排
+    /// `Redispatch`(自动重复因此天然去重,不必回头遍历 `scheduled`),到期由
+    /// [`redispatch_press`] 取走这一格。
+    ///
+    /// 分两张表与 `binds`/`combos` 同构(见 [`Self::latch`] 的车道映射)。
+    pending_binds: Vec<Option<u16>>,
+    pending_combos: Vec<Option<u16>>,
 }
 
 impl PressGates {
@@ -741,10 +806,43 @@ impl PressGates {
     fn hold_combo(&mut self, i: usize, until: Instant) {
         Self::push(&mut self.combos, i, until);
     }
+    /// 扣住第 `i` 格那一次被冷却挡下的按下;返回**原本是空的**才为 `true`
+    /// (调用方据此决定要不要排 [`SchedAct::Redispatch`])。
+    ///
+    /// 新格子按需补长、补 `None`(与 [`Self::push`] 同风格,**绝不造"此刻"**);
+    /// 车道与 [`Self::bind_gate`] / [`Self::combo_gate`] 完全一致:FPS 车道与
+    /// 普通车道共用 `binds` 这张表(它们的下标本来就取自同一张 `profile.binds`)。
+    fn latch(&mut self, lane: BindLane, i: usize, code: u16) -> bool {
+        let v = match lane {
+            BindLane::Combo => &mut self.pending_combos,
+            BindLane::Normal | BindLane::Fps => &mut self.pending_binds,
+        };
+        if v.len() <= i {
+            v.resize(i + 1, None);
+        }
+        if v[i].is_some() {
+            return false;
+        }
+        v[i] = Some(code);
+        true
+    }
+    /// 取走(并清空)第 `i` 格扣住的那一次按下。**取不到就不造格子** ——
+    /// 这里只读已存在的槽位,越界视为"没扣住任何东西"。
+    fn take_latch(&mut self, lane: BindLane, i: usize) -> Option<u16> {
+        let v = match lane {
+            BindLane::Combo => &mut self.pending_combos,
+            BindLane::Normal | BindLane::Fps => &mut self.pending_binds,
+        };
+        v.get_mut(i).and_then(|cell| cell.take())
+    }
     /// 整表作废(断线 / 关映射 / 换组合):下一次按下从头算,不受上一轮的冷却牵连。
     fn reset(&mut self) {
         self.binds.clear();
         self.combos.clear();
+        // 扣住的按下也一并作废:它记的是"旧配置下那一下",换车/断连后那个下标
+        // 可能已经指向别的键位了(与冷却表同一条纪律)。
+        self.pending_binds.clear();
+        self.pending_combos.clear();
     }
 }
 
@@ -1252,6 +1350,7 @@ fn sync_structures(
             ctl.touch_move(wheel_pid(j), cx, cy);
             ctl.touch_up(wheel_pid(j), cx, cy);
             st.down = false;
+            st.down_unconfirmed = false;
         }
         *wheels = vec![WheelState::default(); profile.wheels.len()];
         // 长按模式的临时轮盘:启用状态直接由"启用键是否还按着"恢复;
@@ -1420,6 +1519,45 @@ pub struct AimLive {
     pub recoil_active: bool,
     /// 压枪当前使用的控制强度档(0 基)
     pub recoil_index: usize,
+    /// 「鼠标独占(隔膜)」的**手动开关**状态(S②)。
+    ///
+    /// 由 [`Aim::shield_key`] 热键翻转(沿触发);映射关闭 / 断连 / 退出时清掉
+    /// (见 `shield_manual_reset` 与 [`aim_release_local`])。界面据此把"鼠标为
+    /// 什么点不了"写清楚,并告诉用户按哪个键能关掉它。
+    pub shield_manual: bool,
+    /// 门控键是否按住(`hold_key == 0` 表示无门控,恒 false)。
+    ///
+    /// 悬浮窗状态行用(用户 2026-10-11 第 6 条):"按住才瞄准"的配置下,
+    /// `门控=0` 就是视角为什么不动的那一个判据。
+    pub gate_down: bool,
+    /// 瞄准锚点是否已经设置。没设锚点 = 落不下指 = 转不动。
+    pub anchor_set: bool,
+    /// 此刻被轮盘 / 其它触点占用的数量(不含瞄准自己)。
+    /// 它与设备十指池见底直接相关(见主循环里 `aim.others` 的维护)。
+    pub others: usize,
+    /// 总映射开关。关着时整条链路都不动 —— 状态行里也要能看见。
+    pub mapping_enabled: bool,
+    /// ---- 卡死自愈(2026-10-12)------------------------------------------
+    /// 设备端输入账本:`dumpsys input` 的 `TouchStates` 触点数。界面每 ~1s 只读
+    /// 灌一次(**不是**引擎取的);`None` = 没读到/解析不出 —— 引擎一律当
+    /// "没有证据",绝不当 0(见 [`ledger_mismatch`])。
+    pub device_pointers: Option<u32>,
+    /// 上面那个账本**读到**的时刻(新鲜度判据:超过 [`DEVICE_LEDGER_FRESH_MS`]
+    /// 的旧账本不参与对账;读失败时界面把它清成 `None`)。
+    pub device_input_seen_at: Option<Instant>,
+    /// 手机屏幕此刻是否被**手**触摸(界面只读监听 `adb::watch_physical_touch`)。
+    /// 两个用途:状态行显示 `手机=摸/离`;对账时解释"账本比本地多的那一个触点"。
+    pub physical_touch: bool,
+    /// 界面请求引擎自愈一次(手机被手触摸的 **Up 边沿**;见
+    /// [`crate::app`]). 引擎每轮取走(`take`)—— 取走即消费,不留到下次。
+    pub self_heal_req: Option<&'static str>,
+    /// 自愈累计次数与最近一次原因(引擎写,界面显示)。只有**真的抬起了一根
+    /// 按着的指**才 +1 —— 空触发不算。
+    pub self_heal_count: u64,
+    pub self_heal_reason: &'static str,
+    /// 界面此刻是否在"宏步进 / 绑定捕获 / 截图取点"这类交互里。这些操作期间
+    /// **不自愈**(用户在界面里操作,不该被莫名其妙的抬指打断)。界面每帧写。
+    pub ui_busy: bool,
 }
 
 /// 瞄准子系统状态
@@ -1438,8 +1576,6 @@ struct AimState {
     mode_active: bool,
     /// 按住临时退出键期间挂起,松开自动恢复
     suspended: bool,
-    /// 用户按 Ctrl+Alt 临时把鼠标交还给系统:此时不瞄准、也不捕获光标
-    released: bool,
     /// 最近一次鼠标位移时间(静止归中的依据)
     last_motion: Option<Instant>,
     /// 当前拖动使用的锚点;锚点被改动时重置拖动
@@ -1457,10 +1593,76 @@ struct AimState {
     recoil_active: bool,
     /// 压枪随机摇晃的 xorshift64 状态(0 表示尚未播种)。
     recoil_rng: u64,
+    /// 压枪水平交替补偿(H①)自**按下触发键**以来的累计时间(秒)。
+    ///
+    /// 相位从"按下触发键的那一刻"起算,失活/松开时归零复位 —— 于是每次开火
+    /// 都从波形的同一点(0)开始。沿用 `recoil_step_plan` 的 `0.25s` 上限。
+    recoil_h_t: f32,
+    /// 压枪水平交替补偿:上一次的波形值。
+    ///
+    /// **水平按波形增量叠加**(`st.ox += 幅度 × (w − prev)`),而不是每拍写一个
+    /// `幅度 × w`:后者在 `w` 来回过零时会变成单向斜坡(总位移无界)。增量式的
+    /// 总位移 = `幅度 × w(t)`,**有界且可复现**。
+    recoil_h_prev: f32,
+    /// 「鼠标独占」的手动开关状态(S②;见 [`AimLive::shield_manual`])。
+    shield_manual: bool,
     /// 无边界模式(`aim_flush_unbounded`)是否已经扣过本轮拖动的拖动死区。
     /// 换手是无缝的,死区只该扣一次;`aim_lift`/`aim_recenter` 之类"重新开始一段拖动"
     /// 的场合会把它清回 false。
     dead_paid: bool,
+    /// 「重叠换手」当前按着的是哪一根瞄准指:`false` = [`AIM_PID`],
+    /// `true` = [`AIM_PID_ALT`]。走重叠路径时每次换手翻转(见
+    /// [`aim_overlap_handoff`]);触点池满而退化成"先抬后按"时不翻 ——
+    /// 那种情形下同一根指抬完立刻重按,pid 不变反而最稳。
+    ///
+    /// 不变式:`st.down == true` ⇔ **当前指向的那根指**正按在设备上。
+    /// 因此"抬指"永远抬的是它(见 [`AimState::active_pid`]),不会去抬一根
+    /// 从没按下的 pid。
+    pid_alt: bool,
+    /// 已经发生的重叠换手次数(仅诊断:与节流日志一起看"跳变那一下是第几次换手")。
+    handoffs: u64,
+    /// 上一次换手日志的时刻 + 被节流窗口压掉的条数(见 [`log_aim_handoff`])。
+    /// 换手在快速甩枪时每秒可能几十次,不节流会把日志刷爆。
+    handoff_log_at: Option<Instant>,
+    handoff_log_skipped: u64,
+    /// 最近一次已知的"其它触点"数(不含瞄准自己):换手日志要拿它跟用户的
+    /// "当时还按着移动键"对上。由两条入口各自刷新 —— 鼠标位移路径用
+    /// `reserved` 参数现算,引擎每轮的维护路径在调用前写一次(见主循环)。
+    others: usize,
+    /// 上一次「静止归中」的时刻(见 [`aim_tick`])。
+    ///
+    /// 归中必须满足**最小间隔**:真机日志里 125 秒 277 次换手、多数累计偏移只有
+    /// 2~3px —— 清零点偏移之后余量立刻填回同一量级,不给间隔就会一路空转
+    /// (每次抬指重按都要占两帧消息,还要搅动设备端的指针集合)。
+    last_recenter: Option<Instant>,
+    /// ---- 卡死自愈(D,2026-10-12)----------------------------------------
+    /// 上一次**真的**抬指重建的时刻(限流用,见 [`self_heal_lift`])。
+    last_self_heal: Option<Instant>,
+    /// 自愈累计次数 + 最近一次原因(仅诊断/悬浮窗显示,镜像进 [`AimLive`])。
+    self_heals: u64,
+    self_heal_reason: &'static str,
+    /// 设备端账本**是否已被证实能反映我们的注入**:曾读到触点数 ≥1 且当时手机
+    /// 没有被手摸(那条 1 只可能是我们注入的指/其它注入触点)。
+    ///
+    /// 为什么需要这条护栏(devprobe 2026-10-12 的结论):AOSP 上 `TouchStates` 是
+    /// InputDispatcher 已分发触点的账本,注入事件理应进账本,但**真机(MIUI)未证实**。
+    /// 若裸判"账本 0 而本地按着",一旦该设备上注入根本不进账本,就会在正常滑动时
+    /// 每 300ms 抬一次指 —— 直接毁掉默认手感。所以这条规则要等账本"看得见我们"
+    /// 之后才生效(见 [`ledger_mismatch`])。
+    ledger_reflects_injection: bool,
+    /// 连续多少**份**账本采样都是"0 而本地按着"([`self_heal_tick`] 的防误触发),
+    /// 以及最后计数的那一份账本的读数时刻(用它当"新的一份"的判据 —— 引擎每
+    /// 4~16ms 一轮,绝不能让每轮都算一份)。
+    ledger_zero_streak: u8,
+    ledger_zero_sample_at: Option<Instant>,
+}
+
+impl AimState {
+    /// 当前按着的瞄准触点号。**所有**瞄准的 down/move/up 都必须用它 ——
+    /// 任何一处写死 [`AIM_PID`] 都会在换手之后演成"抬错指/按错指"。
+    fn active_pid(&self) -> u64 {
+        if self.pid_alt { AIM_PID_ALT } else { AIM_PID }
+    }
 }
 
 /// ⚠️【已废弃 deprecated · 2026-10-08】虚拟手柄右摇杆(连续/分段回中)。
@@ -1500,13 +1702,13 @@ fn aim_active(aim: &Aim, st: &AimState) -> bool {
     if aim.input_mode != ViewInputMode::TouchDrag {
         return false;
     }
-    fps_is_active(aim, st) && !st.released && (aim.open_world || aim.hold_key == 0 || st.gate_down)
+    fps_is_active(aim, st) && (aim.open_world || aim.hold_key == 0 || st.gate_down)
 }
 
-/// FPS 指针消隐条件:控制通道在线、FPS 正在运行、用户没有手动交还鼠标。
+/// FPS 指针消隐条件:控制通道在线、FPS 正在运行。
 /// 与“是否正在瞄准”分离,因此绑了“按住才瞄准”时指针仍然会在 FPS 模式内消隐。
 fn pointer_should_be_hidden(connected: bool, aim: &Aim, st: &AimState) -> bool {
-    connected && aim.capture_mouse && fps_mode_active(aim, st) && !st.released
+    connected && aim.capture_mouse && fps_mode_active(aim, st)
 }
 
 /// [已废弃 2026-10-08] 虚拟手柄视角通道的模式判据(见 `GamepadState` 上的说明)。
@@ -1520,7 +1722,6 @@ fn is_gamepad_mode(mode: ViewInputMode) -> bool {
 fn gamepad_active(aim: &Aim, st: &AimState) -> bool {
     is_gamepad_mode(aim.input_mode)
         && fps_mode_active(aim, st)
-        && !st.released
         && (aim.open_world || aim.hold_key == 0 || st.gate_down)
 }
 
@@ -1742,7 +1943,7 @@ fn gamepad_tick(
 fn aim_lift(ctl: &ControlClient, st: &mut AimState) {
     if st.down {
         let (x, y) = st.cur;
-        ctl.touch_up(AIM_PID, x, y);
+        ctl.touch_up(st.active_pid(), x, y);
         st.sent += 1;
         st.down = false;
     }
@@ -1752,6 +1953,332 @@ fn aim_lift(ctl: &ControlClient, st: &mut AimState) {
     st.last_motion = None;
 }
 
+/// 「唤醒视角」热键的**唯一**动作(A,2026-10-11):把此刻按着的瞄准指抬起来。
+///
+/// 为什么抽成独立函数:与 [`shield_manual_next`] 同一个理由 —— 单测要能直接
+/// 调它(而不是起线程跑整个 `run()`),把"按下之后到底发生了什么"锁死。
+///
+/// 它**只做这一件事**:`mode_active` / `suspended` / 总映射开关 / 门控一个都不碰,
+/// 连 FPS 是否生效都不看(锁死时正是"模式还开着、鼠标却点不了"那种状态)。
+/// `aim_lift` 会把偏移与最后一次位移时刻一起清掉,所以下一次鼠标位移会重新落指,
+/// 不必退出再进 FPS。返回 true = 这次真的抬起了一根按着的指(调用方据此写日志)。
+fn wake_key_action(shared: &SharedState, st: &mut AimState) -> bool {
+    if !st.down {
+        return false;
+    }
+    let g = lock_shared(shared);
+    let Some(ctl) = g.control.as_ref().filter(|c| c.is_connected()) else {
+        return false;
+    };
+    aim_lift(ctl, st);
+    true
+}
+
+// ==================== 卡死自愈(D,2026-10-12) ====================
+
+/// 界面在"手机被手触摸的 Up 边沿"留下的自愈请求原因(见 [`AimLive::self_heal_req`])。
+///
+/// 写成 `pub const` 而不是各写一遍字符串:界面(写)与引擎(读+记日志)必须逐字
+/// 一致,判"这次触发是不是那个请求"也靠它。
+pub const SELF_HEAL_REASON_TOUCH_UP: &str = "手离开手机";
+
+/// 自愈限流:两次**真的**抬指重建之间至少这么久(用户要求 300ms)。
+///
+/// 为什么必须限流:账本按 1/s 才更新一次,但引擎每 4~16ms 就维护一轮 —— 没有
+/// 限流的话"账本 0 而本地按着"这类条件会在窗口内每一轮都命中,变成连续抬指。
+const SELF_HEAL_MIN_GAP: Duration = Duration::from_millis(300);
+
+/// 设备端账本的新鲜度上限:超过这么久没有新账本 ⇒ 只当"没有证据",不参与对账。
+///
+/// 账本取证是 1 次/秒,给它 3 个周期;读失败时界面会把 `device_input_seen_at`
+/// 清成 `None`,所以这一条同时兜住"adb 挂了、账本停在旧值上"的情形。
+const DEVICE_LEDGER_FRESH_MS: u128 = 3000;
+
+/// "账本 0 而本地按着"要连续这么多**份**账本采样都成立才认(见 [`self_heal_tick`])。
+const SELF_HEAL_LEDGER_ZERO_SAMPLES: u8 = 2;
+
+/// 账本对不上的两种形态([`ledger_mismatch`] 的返回值)。
+///
+/// 为什么不是直接给一句话:两种形态的风险不一样 —— "0 而本地按着"可能只是
+/// "这一份账本恰好采在手指刚落下之前",要多看一份才敢动手(见 [`self_heal_tick`]);
+/// "比本地多"不需要(账本得先**看到**多出来的触点,不存在"还没同步到")。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LedgerMismatch {
+    /// 账本触点为 0,而本地认为瞄准指还按着
+    ZeroWhileDown,
+    /// 账本触点比本地多(我们发出的抬起没到设备端 / 手势被丢)
+    MoreThanLocal,
+}
+
+impl LedgerMismatch {
+    /// 日志与悬浮窗用的那一句话
+    fn label(self) -> &'static str {
+        match self {
+            Self::ZeroWhileDown => "设备端账本触点为 0,而本地认为瞄准指还按着",
+            Self::MoreThanLocal => "设备端账本触点比本地多(我们发出的抬起没到设备端)",
+        }
+    }
+}
+
+/// 账本对账(**纯函数**,单测钉着):设备端账本与本地记账对不上时给出原因。
+///
+/// 判据(task-8 原文):
+/// - `ledger == Some(0)` 而本地认为瞄准指还按着(`aim_down`);
+/// - 账本触点数 **大于** 本地认为按着的触点数(`local`,含瞄准指)
+///   —— 说明我们发出去的 UP 没到设备端 / 手势被丢。
+///
+/// 三条护栏(都为"默认开也不许毁掉正常手感"):
+/// - `ledger == None`(没读到 / 解析不出)**一律返回 None**:`<no displays touched>`
+///   之外的解析失败是"未知",不是"没有触点";
+/// - "账本 0 而本地按着"必须先被证实账本**确实反映我们的注入**(`trusted`);
+/// - "账本比本地多"要排除"手机正被手摸"(`physical_touch`):物理手指本来就会
+///   记进账本,那种"多"不是我们丢在路上的 UP。
+fn ledger_mismatch(
+    ledger: Option<u32>,
+    local: usize,
+    aim_down: bool,
+    physical_touch: bool,
+    trusted: bool,
+) -> Option<LedgerMismatch> {
+    let n = ledger? as usize;
+    if aim_down && n == 0 && trusted {
+        return Some(LedgerMismatch::ZeroWhileDown);
+    }
+    if !physical_touch && n > local {
+        return Some(LedgerMismatch::MoreThanLocal);
+    }
+    None
+}
+
+/// "现在要不要自愈"的**纯判定**(单测钉着):返回触发原因,`None` = 不动。
+///
+/// 三个前提全成立才动手:总映射开着、`Aim::self_heal` 开着、当前不在
+/// "宏步进 / 绑定捕获 / 截图取点"这类界面交互里。原因取"界面的请求"优先于
+/// "账本对不上" —— 两者同时成立时,报最先发生的那个(手离开手机)。
+fn self_heal_decision(
+    enabled: bool,
+    self_heal: bool,
+    ui_busy: bool,
+    req: Option<&'static str>,
+    mismatch: Option<&'static str>,
+) -> Option<&'static str> {
+    if !enabled || !self_heal || ui_busy {
+        return None;
+    }
+    req.or(mismatch)
+}
+
+/// 自愈的**唯一**动作:**只抬指重建** —— 与「唤醒视角」键同一个动作([`aim_lift`])。
+///
+/// 为什么抽成独立函数:与 [`wake_key_action`] 同一个理由 —— 单测要能直接调它
+/// (而不是起线程跑整个 `run()`),把"触发之后到底发生了什么"锁死。
+///
+/// 它**只做这一件事**:`mode_active` / `suspended` / 门控 / 总映射 / 配置一个都
+/// 不碰。`aim_lift` 会把偏移与最后一次位移时刻一起清掉,于是下一次鼠标位移会自动
+/// 重新落指 —— 这正是用户实测有效的"零触点之后重建手势",不必退出再进 FPS。
+///
+/// 返回 true = 这次真的抬起了一根按着的指(调用方据此写日志、计数)。没按着、
+/// 或距上次自愈不到 [`SELF_HEAL_MIN_GAP`] 都返回 false。
+fn self_heal_lift(ctl: &ControlClient, st: &mut AimState, now: Instant) -> bool {
+    if !st.down {
+        return false;
+    }
+    if st
+        .last_self_heal
+        .is_some_and(|t| now.saturating_duration_since(t) < SELF_HEAL_MIN_GAP)
+    {
+        return false;
+    }
+    aim_lift(ctl, st);
+    st.last_self_heal = Some(now);
+    st.self_heals += 1;
+    true
+}
+
+/// [`self_heal_lift`] 的"自己去 `Shared` 取控制通道"版本(照 [`wake_key_action`]
+/// 写),供**单测**直接调用 —— 引擎维护路径**不能**用它(`lock_shared` 不可重入,
+/// 那里已经持锁,必须用 [`self_heal_lift`])。
+#[cfg(test)]
+fn self_heal_action(shared: &SharedState, st: &mut AimState, now: Instant) -> bool {
+    if !st.down {
+        return false;
+    }
+    let g = lock_shared(shared);
+    let Some(ctl) = g.control.as_ref().filter(|c| c.is_connected()) else {
+        return false;
+    };
+    self_heal_lift(ctl, st, now)
+}
+
+/// 引擎每轮维护调一次:护栏依据 → 对账 → 判定 → 抬指重建。返回本次自愈的原因。
+///
+/// 调用于**持锁**的维护块里,所以只拿 `ctl` 与几个标量(不能再去 `lock_shared`)。
+/// `local_pointers` = 本地认为按着的**全部**触点数(含瞄准指)。
+fn self_heal_tick(
+    ctl: &ControlClient,
+    enabled: bool,
+    cfg: &Aim,
+    st: &mut AimState,
+    live: &mut AimLive,
+    local_pointers: usize,
+    now: Instant,
+) -> Option<&'static str> {
+    // ① 护栏依据:"账本看得见我们"——**新鲜**账本读到 ≥1 且当时手机没被手摸。
+    //    与谁触发无关,只要成立一次就永久有效(那之后账本里的 0 才算证据)。
+    let fresh = live
+        .device_input_seen_at
+        .is_some_and(|t| now.saturating_duration_since(t).as_millis() <= DEVICE_LEDGER_FRESH_MS);
+    if fresh && !live.physical_touch && live.device_pointers.is_some_and(|n| n >= 1) {
+        st.ledger_reflects_injection = true;
+    }
+    // ② 界面的一次性请求:无论自愈开不开都**取走**。留着的话,用户以后打开
+    //    自愈开关时会凭空抬一次指(那一刻他并没有碰手机)。
+    let req = live.self_heal_req.take();
+    // ③ 账本只在"新鲜"时参与对账(见 DEVICE_LEDGER_FRESH_MS)。
+    let raw = if fresh {
+        ledger_mismatch(
+            live.device_pointers,
+            local_pointers,
+            st.down,
+            live.physical_touch,
+            st.ledger_reflects_injection,
+        )
+    } else {
+        None
+    };
+    // ④ "账本 0 而本地按着"必须**连续两份账本采样**都成立才认。
+    //
+    //    为什么:账本是 1/s 采样 + 一次 adb 往返,单独一份账本可能正好落在"鼠标
+    //    刚按下、设备端还没见到这根指"的窗口里 —— 裸判会把正常的一次起手当成
+    //    故障,每按一次鼠标都可能被抬一次指(那就真的改手感了)。
+    //    "账本比本地多"不需要这道:账本得先**看到**多出来的触点,不存在"还没同步到";
+    //    它的误报源(物理手指)已经由 `physical_touch` 挡掉。
+    let sample_at = live.device_input_seen_at;
+    let new_sample = sample_at.is_some() && sample_at != st.ledger_zero_sample_at;
+    let mismatch = match raw {
+        Some(LedgerMismatch::ZeroWhileDown) => {
+            if new_sample {
+                st.ledger_zero_streak = st.ledger_zero_streak.saturating_add(1);
+                st.ledger_zero_sample_at = sample_at;
+            }
+            (st.ledger_zero_streak >= SELF_HEAL_LEDGER_ZERO_SAMPLES)
+                .then_some(LedgerMismatch::ZeroWhileDown)
+        }
+        other => {
+            st.ledger_zero_streak = 0;
+            st.ledger_zero_sample_at = None;
+            other
+        }
+    };
+    let reason = self_heal_decision(
+        enabled,
+        cfg.self_heal,
+        live.ui_busy,
+        req,
+        mismatch.map(LedgerMismatch::label),
+    )?;
+    // ⑤ 动作:只抬指重建。空触发(没按着 / 还在限流窗口内)不算一次自愈。
+    if !self_heal_lift(ctl, st, now) {
+        return None;
+    }
+    st.self_heal_reason = reason;
+    Some(reason)
+}
+
+/// 换手诊断日志的节流窗口。换手在快速甩枪时每秒可能几十次,`diag` 的纪律是
+/// "日志本身不能成为故障源",所以窗口内只累计条数,到点补一行。
+const AIM_HANDOFF_LOG_MS: u128 = 250;
+
+/// 每次换手一条节流诊断(用户 2026-10-11:"换手那一下视角跳变")。
+///
+/// 为什么必须记这三样:
+/// - `band`(回转半径/可用半径):跳出不出现在别的档位下,先要能把现象和档位对上;
+/// - 换手时的累计偏移:区分"刚起步就换"与"推满一个半径才换";
+/// - **其它触点数**:用户说的"和移动键的按压共同作用"—— 移动指在不在按,
+///   换手在设备端的 `pointerCount` 完全不同(有移动指时永远 ≥ 3)。
+///
+/// 另记 `form`(overlap / fallback)与两个 pid:真机上"哪一次换手跳了"能直接
+/// 对着看,也不用再猜某次换手是不是退化成了旧形态。
+fn log_aim_handoff(st: &mut AimState, band: f32, why: &str, old_pid: u64, overlap: bool) {
+    let now = Instant::now();
+    let due = st
+        .handoff_log_at
+        .is_none_or(|t| now.saturating_duration_since(t).as_millis() >= AIM_HANDOFF_LOG_MS);
+    if !due {
+        st.handoff_log_skipped += 1;
+        return;
+    }
+    let merged = st.handoff_log_skipped;
+    st.handoff_log_skipped = 0;
+    st.handoff_log_at = Some(now);
+    let form = if overlap { "overlap" } else { "fallback" };
+    crate::diag_debug!(
+        "aim",
+        "重叠换手#{}({why}, {form}): 旧 pid {old_pid} → 新 pid {}, 新指落在锚点 ({}, {}), 换手时累计偏移 ({:.1}, {:.1}), 回转半径 band {:.1}, 其它触点 {} 个, 节流窗口内另有 {} 次",
+        st.handoffs,
+        st.active_pid(),
+        st.cur.0,
+        st.cur.1,
+        st.ox,
+        st.oy,
+        band,
+        st.others,
+        merged
+    );
+}
+
+/// 重叠换手:先在新 pid 的锚点上落下,再抬起旧 pid(用户 2026-10-11 的跳变修复)。
+///
+/// **旧形态**:`MOVE(落点)` → `UP(旧指)` → `DOWN(锚点)` → 下一段 `MOVE`。
+/// 这几条常常落在同一次 `write_all` 批次里,于是设备端在同一批/同一帧里收到
+/// "瞄准触点归零 → 又重新落下":
+/// - 瞄准指是**唯一**触点时,`scrcpy-server` 的 `Controller` 会把那次 UP 当成
+///   真正的 `ACTION_UP`(整条手势结束),游戏据此结算抬手惯性 —— 多转一截;
+/// - 重新 DOWN 会把这根指 append 到 `PointersState` 末尾(slot 顺序抖动),
+///   与同时按着的移动指互相影响,正是用户说的"和移动键的按压共同作用"。
+///
+/// **新形态**:`DOWN(新 pid, 锚点)` → `UP(旧 pid, 旧落点)` → 在新 pid 上 `MOVE`。
+/// 全程不存在"零瞄准触点"的瞬间 —— 即使一根移动指都没按,瞄准指也始终 ≥ 1,
+/// 换手那一刻是 2:`pointerCount` 永远 ≥ 2,设备端不会因为瞄准而发真 `ACTION_UP`。
+/// 两个 pid 不同(见 [`AIM_PID_ALT`]),新指的 DOWN 一定是新槽位。
+///
+/// 位移总量不受影响:拖动是增量语义,UP/DOWN 本身不产生转动(设备端只在
+/// `MOVE` 上取位移),新指从锚点起步、下一段 `MOVE` 接着推。
+///
+/// `from` 是旧指此刻的落点(抬指坐标必须给对);返回后 `st.cur` = 锚点。
+///
+/// **触点池见底时的退化**(唯一不重叠的情形,`others + 2 > DEVICE_MAX_POINTERS`,
+/// 即瞄准自己在按、其它触点已经有 9 个 = 池满):重叠要多占一个触点,而
+/// scrcpy-server 的 `PointersState` 满池时**直接丢掉**那一次 DOWN —— 本地却会
+/// 以为新指按下了,之后所有 MOVE 都发给一根设备端不存在的指,瞄准"看起来死了"
+/// (比跳变更难排查)。这种边角退回**旧形态**(先抬后按:抬完正好腾出一个空位,
+/// DOWN 一定落得下),pid 不变。代价是这一瞬间会出现零瞄准触点(与修复前同),
+/// 换来的是本地状态不与设备脱节。正常玩法(其它触点 ≤ 8)永远走重叠。
+/// 日志里的 `form` 字段会把这两条路区分开。
+fn aim_overlap_handoff(
+    ctl: &ControlClient,
+    st: &mut AimState,
+    band: f32,
+    why: &str,
+    anchor: (i32, i32),
+    from: (i32, i32),
+) {
+    let old_pid = st.active_pid();
+    let overlap = st.others + 2 <= DEVICE_MAX_POINTERS;
+    if overlap {
+        st.pid_alt = !st.pid_alt;
+        ctl.touch_down(st.active_pid(), anchor.0, anchor.1);
+        ctl.touch_up(old_pid, from.0, from.1);
+    } else {
+        ctl.touch_up(old_pid, from.0, from.1);
+        ctl.touch_down(old_pid, anchor.0, anchor.1);
+    }
+    st.sent += 2;
+    st.cur = anchor;
+    st.handoffs += 1;
+    log_aim_handoff(st, band, why, old_pid, overlap);
+}
+
 /// 没有控制通道时只清理本地状态
 fn aim_release_local(st: &mut AimState) {
     st.down = false;
@@ -1759,6 +2286,32 @@ fn aim_release_local(st: &mut AimState) {
     st.oy = 0.0;
     st.dead_paid = false;
     st.last_motion = None;
+    // S② 复位路径②:断连(以及随通道一起停用的那些路径)必须清掉手动独占
+    // —— 隔膜开着而一个触摸都注入不出去时,用户连别的窗口都点不了。
+    shield_manual_reset(st);
+}
+
+/// 「鼠标独占」手动开关的**翻转判定**(S②,纯函数便于单测)。
+///
+/// 与 FPS 开关键同一条纪律:只认"物理事件 + 键集合此刻整个按着 + 上升沿"。
+/// `hit` 来自 [`functional_key_hit`](宏事件恒为 `false`),`fresh_press` 来自
+/// [`note_physical`](Windows 自动重复的第二次 KEYDOWN 不是上升沿)—— 两条
+/// 合起来保证"按一下只翻一次,连发/宏都不连翻"。
+fn shield_manual_next(current: bool, hit: bool, fresh_press: bool) -> bool {
+    if hit && fresh_press {
+        !current
+    } else {
+        current
+    }
+}
+
+/// 「鼠标独占」手动开关的**复位**(S② 的安全底线)。
+///
+/// 三条复位路径都必须经它:①映射关闭(引擎每轮 `!enabled` 分支);
+/// ②断连([`aim_release_local`]);③程序退出(界面 `Drop` + `Capture::drop`
+/// 直接写原子开关,另有这条兜底)。**绝不允许出现"鼠标被永久锁死"**。
+fn shield_manual_reset(st: &mut AimState) {
+    st.shield_manual = false;
 }
 
 /// 锚点换算成像素并钳进当前屏幕内。锚点可能是在别的屏幕方向下取的
@@ -1770,6 +2323,19 @@ fn aim_anchor(m: &Mapper, aim: &Aim) -> (i32, i32) {
         x.clamp(0, (m.w as i32 - 1).max(0)),
         y.clamp(0, (m.h as i32 - 1).max(0)),
     )
+}
+
+/// 让"当前拖动用的是哪个锚点"这条记录作废(坐标空间变了时必须调,DF-5)。
+///
+/// `anchor_used` 的语义是"正在按着的那根手指是相对哪个锚点落下的":它与当前锚点
+/// 不相等时,下一次位移会先抬指再从新锚点重新按下(见 [`aim_on_motion`] 与
+/// [`open_world_on_motion`])。坐标空间一变,旧锚点在设备端的位置就作废了,
+/// 于是必须强制它们"不相等"一次。
+///
+/// 哨兵取 `(-1, -1)`:锚点由 [`aim_anchor`] 从屏幕像素算出、且钳在 `[0, w-1] ×
+/// [0, h-1]` 内,恒为非负,所以这个值永远不可能等于真锚点。
+fn aim_invalidate_anchor(st: &mut AimState) {
+    st.anchor_used = (-1, -1);
 }
 
 /// 应用拖动死区后的有效偏移。死区内的轻微手抖视为没有移动；
@@ -1872,6 +2438,11 @@ fn inject_zoom_gesture(
 
 /// 归中:在当前位置抬指,回到锚点重新按下。
 /// 这一轮拖动产生的转向已经生效,玩家侧只是看到视角继续转动。
+///
+/// **与换手同一形态**(用户 2026-10-11:换成"有边界 + 静止归中"就不跳了,
+/// 说明跳的是"抬指→重按"这个动作本身)—— 所以这里也走
+/// [`aim_overlap_handoff`]:先在新 pid 的锚点落下,再抬旧 pid。否则用户换个
+/// 归中策略又会撞上同一个跳变。
 fn aim_recenter(ctl: &ControlClient, m: &Mapper, aim: &Aim, st: &mut AimState) {
     if !st.down {
         st.ox = 0.0;
@@ -1880,17 +2451,17 @@ fn aim_recenter(ctl: &ControlClient, m: &Mapper, aim: &Aim, st: &mut AimState) {
         return;
     }
     let (cx, cy) = st.cur;
-    ctl.touch_up(AIM_PID, cx, cy);
-    st.sent += 1;
+    let (ax, ay) = aim_anchor(m, aim);
+    // 换手日志要记"归中前累计了多少偏移",所以先换手、后清零。
+    let band = aim.recenter_threshold.max(8) as f32;
+    aim_overlap_handoff(ctl, st, band, "归中", (ax, ay), (cx, cy));
     st.ox = 0.0;
     st.oy = 0.0;
     st.dead_paid = false;
-    let (ax, ay) = aim_anchor(m, aim);
-    ctl.touch_down(AIM_PID, ax, ay);
-    st.sent += 1;
-    st.cur = (ax, ay);
-    // 刚归中,重置静止计时,避免立刻再次归中
-    st.last_motion = Some(Instant::now());
+    // 刚归中:重置静止计时(避免立刻再次归中)并记下最小间隔的起点(见 aim_tick)。
+    let now = Instant::now();
+    st.last_motion = Some(now);
+    st.last_recenter = Some(now);
 }
 
 /// 无边界模式换手跑步机的单帧最大段数(纯兜底)。
@@ -1899,6 +2470,22 @@ fn aim_recenter(ctl: &ControlClient, m: &Mapper, aim: &Aim, st: &mut AimState) {
 /// "锚点贴着屏幕边缘 → 可用矩形只剩几像素" + "单帧巨量位移" 这种病态组合兜底,
 /// 保证不会在这一帧里死循环。手感上永远用不到。
 const AIM_TREADMILL_MAX_HOPS: usize = 32;
+
+/// 无边界跑步机**单次调用**最多消费的位移(设备像素)。
+///
+/// 为什么需要(用户 2026-10-11 实测:"一直是连续的,但某一段距离会突然加速"):
+/// 跑步机原先把"本次要消费的偏移"一次拆成若干段、在**同一帧**里全部注入 ——
+/// 一帧的鼠标位移只要跨过回转半径,设备端就会在这一帧里收到一整段换手
+/// (最多一个回转半径,用户是 200px)。游戏端对"每帧位移/速度"有任何增益或
+/// 钳制,这一帧就会被放大成一次突兀的加速。现在把交付摊到多帧:每次调用
+/// 最多走这么多像素,**没走完的余量留在 `st.ox/oy`**,由下一次鼠标位移
+/// 或引擎每轮的 [`aim_drain_pending`] 接着推 —— 累计总量仍然精确相等
+/// (见 `unbounded_treadmill_spreads_a_huge_step_across_frames`)。
+///
+/// 取值:瞄准期间引擎按 [`IDLE_FAST_MS`](4ms) 跑,32px/轮 ≈ 8000px/s 的
+/// 交付上限,远高于手速与灵敏度能产生的位移;它只在"单帧夹带巨量位移"
+/// (卡顿后的合并位移、极快的甩枪)时才真的起作用。取 24~48 都合理。
+const AIM_MAX_STEP_PX: f32 = 32.0;
 
 /// 无边界模式下,锚点周围"触点可以安全停留"的矩形边界(相对锚点的偏移上下限)。
 ///
@@ -1910,7 +2497,7 @@ const AIM_TREADMILL_MAX_HOPS: usize = 32;
 /// 2. **回转半径**(`recenter_threshold`,界面上的「回转半径」)—— 决定手指多久抬一次;
 /// 3. 两者取小即可,不做额外下限:锚点贴边时那个方向的可用量就是 0,
 ///    这方向本来也转不动(硬推只会把触点推到屏外被丢弃)。
-fn aim_band_limits(m: &Mapper, aim: &Aim, ax: i32, ay: i32) -> (f32, f32, f32, f32) {
+pub(crate) fn aim_band_limits(m: &Mapper, aim: &Aim, ax: i32, ay: i32) -> (f32, f32, f32, f32) {
     let band = aim.recenter_threshold.max(8) as f32;
     let axf = ax as f32;
     let ayf = ay as f32;
@@ -1934,6 +2521,12 @@ fn aim_band_limits(m: &Mapper, aim: &Aim, ax: i32, ay: i32) -> (f32, f32, f32, f
 /// 返回 `(各段偏移, 下一帧继续用的偏移)`。末尾偏移写回 `st.ox/oy`,
 /// 表示"手指现在停在相对锚点的哪个位置",下一帧的位移从这里接着算 ——
 /// 它**始终被钳在可用矩形内**(兜底截断时余量宁可丢掉,也不让累计偏移失控)。
+///
+/// **零进展即停**(本次修复,DF-2):某一方向上 `aim_band_limits` 给出的可用量是 0
+/// (锚点贴边)时,钳制结果恒为 `(0, 0)` —— 旧实现会照推不误地跑满
+/// [`AIM_TREADMILL_MAX_HOPS`] 段,每段都让调用方发一对 UP/DOWN 去"换手",
+/// 既灌满写队列、又把累计位移静默丢掉。现在第一段就发现推不动,直接返回
+/// **空段表**(调用方据此一条触摸消息都不发)。
 fn plan_aim_treadmill(
     ox: f32,
     oy: f32,
@@ -1947,6 +2540,11 @@ fn plan_aim_treadmill(
     loop {
         let sx = rest_x.clamp(-left, right);
         let sy = rest_y.clamp(-up, down);
+        // 这一段的钳制结果是零 = 这个方向一点都不推得动:再循环下去每一段都还是
+        // 零,只能空转到 32 段上限。到此为止,段表到此为空(或保持已产出的段)。
+        if sx == 0.0 && sy == 0.0 {
+            break;
+        }
         segs.push((sx, sy));
         rest_x -= sx;
         rest_y -= sy;
@@ -1961,6 +2559,21 @@ fn plan_aim_treadmill(
     (segs, (nx.clamp(-left, right), ny.clamp(-up, down)))
 }
 
+/// 跑步机"手指此刻相对锚点停在哪里"(还没落指 = 就在锚点上,即 0)。
+///
+/// `st.ox/oy` 的语义是"手指位置 **+** 还没送出去的余量",所以"本次新增了多少位移"
+/// 必须用它扣出来 —— 上限只该压这个增量,不该压手指已经站住的位置。
+/// 结果按可用矩形钳一下即可:正常路径下 `st.cur` 本来就在矩形里。
+fn aim_finger_offset(st: &AimState, anchor: (i32, i32), lim: (f32, f32, f32, f32)) -> (f32, f32) {
+    if !st.down {
+        return (0.0, 0.0);
+    }
+    (
+        (st.cur.0 as f32 - anchor.0 as f32).clamp(-lim.0, lim.1),
+        (st.cur.1 as f32 - anchor.1 as f32).clamp(-lim.2, lim.3),
+    )
+}
+
 /// 无边界模式(「无边界」勾选)的注入路径:无缝换手跑步机。
 ///
 /// 与有边界路径的唯一区别是落点约束:不钳在屏幕内,而是钳在
@@ -1970,6 +2583,18 @@ fn plan_aim_treadmill(
 ///
 /// 死区只在这一轮拖动开始时扣一次(`st.dead_paid`):换手在物理上是无缝的,
 /// 若每换一次手都重新扣一个死区,连续转向会越转越慢甚至中途停住。
+///
+/// **跨帧摊开**(用户 2026-10-11 实测:"一直是连续的,但某一段距离会突然加速")。
+/// 旧实现把"本次要消费的偏移"一次拆成若干段、在**同一帧**里全部灌给设备:一帧的
+/// 位移只要跨过回转半径,那一帧就会带上一次完整的换手(最多一个回转半径,用户是
+/// 200px),游戏端对"每帧位移/速度"的增益或钳制会把它放大成一次突兀的加速。
+/// 现在单次调用最多消费 [`AIM_MAX_STEP_PX`](只压**新增**的位移,见
+/// [`aim_finger_offset`]),没消费完的部分原样留在 `st.ox/oy` 里,由下一次鼠标
+/// 位移或引擎每轮的 [`aim_drain_pending`] 接着推。
+///
+/// **总量精确**:留回去的正是"本次没有消费的那部分"(`ox - cx`),所以跨帧累计
+/// 交付的拖动量严格等于鼠标累计位移(见 `unbounded_treadmill_spreads_a_huge_step_across_frames`)。
+/// 唯一的例外是"这个方向根本推不动"—— 那时按既有纪律直接丢弃(见下面的空段表分支)。
 fn aim_flush_unbounded(ctl: &ControlClient, m: &Mapper, aim: &Aim, st: &mut AimState) {
     let dead = aim.drag_deadzone.clamp(0.0, 400.0);
     let mag = st.ox.hypot(st.oy);
@@ -1984,39 +2609,93 @@ fn aim_flush_unbounded(ctl: &ControlClient, m: &Mapper, aim: &Aim, st: &mut AimS
 
     let (ax, ay) = aim_anchor(m, aim);
     let lim = aim_band_limits(m, aim, ax, ay);
-    let (segs, next) = plan_aim_treadmill(ox, oy, lim, AIM_TREADMILL_MAX_HOPS);
     let axf = ax as f32;
     let ayf = ay as f32;
 
+    // 本次真正要交付的增量(手指位置 -> 期望偏移),按上限压一次。
+    let finger = aim_finger_offset(st, (ax, ay), lim);
+    let (need_x, need_y) = (ox - finger.0, oy - finger.1);
+    let need = need_x.hypot(need_y);
+    let (mut cx, mut cy) = (ox, oy);
+    if need > AIM_MAX_STEP_PX {
+        let k = AIM_MAX_STEP_PX / need;
+        cx = finger.0 + need_x * k;
+        cy = finger.1 + need_y * k;
+    }
+
+    let (segs, next) = plan_aim_treadmill(cx, cy, lim, AIM_TREADMILL_MAX_HOPS);
+
+    // 空段表 = 这个方向一点都不推得动(锚点贴边、可用量为 0):一条触摸消息都不发。
+    // 旧实现会在这里先按下一根手指、再发 32 对 UP/DOWN —— 手指最终停在锚点上,
+    // 用户看到的却是"不动",而写队列已被这 62 条消息灌满(DF-2)。
+    // 仍然把(被钳回矩形的)累计偏移写回:与逐段路径同一口径,不会让推不动的
+    // 位移悄悄积压到换个锚点之后突然一次性打出去(**推不动就丢弃**,与上限无关)。
+    if segs.is_empty() {
+        st.ox = next.0;
+        st.oy = next.1;
+        st.dead_paid = true;
+        return;
+    }
+
     if !st.down {
-        ctl.touch_down(AIM_PID, ax, ay);
+        ctl.touch_down(st.active_pid(), ax, ay);
         st.down = true;
         st.sent += 1;
         st.cur = (ax, ay);
     }
+    let band = aim.recenter_threshold.max(8) as f32;
     for (k, (sx, sy)) in segs.iter().enumerate() {
         let (tx, ty) = ((axf + sx).round() as i32, (ayf + sy).round() as i32);
         if st.cur != (tx, ty) {
-            ctl.touch_move(AIM_PID, tx, ty);
+            ctl.touch_move(st.active_pid(), tx, ty);
             st.sent += 1;
             st.cur = (tx, ty);
         }
         if k + 1 < segs.len() {
-            // 无缝换手:在这一段的落点抬指,回锚点重新按下,下一段从这里继续。
-            // 拖动是增量语义,抬指/重按本身不产生转动,玩家侧只看到视角继续转。
-            ctl.touch_up(AIM_PID, tx, ty);
-            st.sent += 1;
-            ctl.touch_down(AIM_PID, ax, ay);
-            st.sent += 1;
-            st.cur = (ax, ay);
+            // 无缝换手:**重叠**换手(先在新 pid 的锚点落下,再抬旧指,见
+            // [`aim_overlap_handoff`])。拖动是增量语义,抬指/重按本身不产生转动,
+            // 玩家侧只看到视角继续转;但设备端全程至少有一根瞄准指按着,
+            // 不会因为瞄准而收到真 `ACTION_UP`。
+            aim_overlap_handoff(ctl, st, band, "无边界跑步机", (ax, ay), (tx, ty));
         }
     }
     // 手指现在停在"相对锚点的 next"处;写回累计偏移,下一帧从这里继续累计。
+    // 再加上"被上限拦住、本次没有消费"的那一部分(`ox - cx`)—— 于是下次调用
+    // (或引擎每轮的 [`aim_drain_pending`])接着把余量推出去,总量不丢。
     // 注意不要在这里改 `last_motion`:它必须是事件的捕获时刻(由 `aim_flush` 统一写入),
     // 否则排队/宏步进期间静止归中会算错。
-    st.ox = next.0;
-    st.oy = next.1;
+    st.ox = next.0 + (ox - cx);
+    st.oy = next.1 + (oy - cy);
     st.dead_paid = true;
+}
+
+/// 把无边界跑步机上**还没消费完的余量**接着推出去(见 [`aim_flush_unbounded`] 的上限)。
+///
+/// 为什么必须有一个与事件无关的出口:上限把交付摊到多帧之后,余量不能只等
+/// "下一次鼠标位移" —— 用户停手时不再有位移事件,余量会卡在 `st.ox/oy` 里,
+/// 表现是"松手后视角还差一截没转过去",而且静止归中一旦抬指就把它丢了。
+/// 引擎每轮维护都调一次(瞄准期间 [`IDLE_FAST_MS`] ≈ 4ms 一轮),余量在几十毫秒内送完。
+///
+/// 纪律:
+/// ①**绝不刷新 `last_motion`** —— 余量的推进不是"用户在动鼠标",否则静止归中会被
+///   无限推迟(跑步机自己不碰 `last_motion`,见上面的说明);
+/// ②只走**无边界跑步机**这一条路,不改落点、不碰 `RecenterMode`;
+/// ③`open_world` / 有边界 / 没落指 / 锚点记录对不上时什么都不做,交给正常位移路径;
+/// ④余量已为 0 时一条触摸消息都不发(不算状态,不占写队列)。
+fn aim_drain_pending(ctl: &ControlClient, m: &Mapper, aim: &Aim, st: &mut AimState) {
+    if aim.boundary || aim.open_world || !st.down || !st.dead_paid || !aim_active(aim, st) {
+        return;
+    }
+    let anchor = aim_anchor(m, aim);
+    if st.anchor_used != anchor {
+        return; // 锚点刚变:落点记录作废,交给位移路径抬指重按
+    }
+    let lim = aim_band_limits(m, aim, anchor.0, anchor.1);
+    let finger = aim_finger_offset(st, anchor, lim);
+    if (st.ox - finger.0).hypot(st.oy - finger.1) < 0.5 {
+        return;
+    }
+    aim_flush_unbounded(ctl, m, aim, st);
 }
 /// 鼠标相对位移 -> 手机上的拖动。
 /// 返回是否因为触点池已满而没能落下瞄准触点(供诊断计数;落不下就不落下,
@@ -2031,6 +2710,8 @@ fn aim_on_motion(
     at: Instant,
     reserved: usize,
 ) -> bool {
+    // 换手日志要的"其它触点"数:这条路径拿到的是现算的 `reserved`(不含瞄准自己)。
+    st.others = reserved;
     if aim.open_world {
         return open_world_on_motion(ctl, m, aim, st, dx, dy, at, reserved);
     }
@@ -2068,6 +2749,32 @@ fn aim_on_motion(
 /// 抽出来是为了让**两条来源**共用同一条注入路径:鼠标位移(`aim_on_motion`)
 /// 与压枪节拍(`recoil_tick`)。死区、边界、阈值归中的语义因此天然一致 ——
 /// 压枪增量不会绕过任何一条既有纪律。
+/// 停顿多久之后的第一次瞄准位移,先"**续接**"一次(见 [`aim_flush`])。
+///
+/// # 为什么需要(用户 2026-10-11 第 6 条,真机复现三次)
+///
+/// 手指碰一下手机屏之后,设备端多出一根**不是我们注入**的手指;UE 类游戏往往
+/// 就此结束我们那根"相机指"的拖动。而本地 `st.down` 仍是 true,于是引擎此后
+/// **只发 MOVE、永远不再发 DOWN** —— MOVE 发给一根游戏那边已经不存在的触摸,
+/// 石沉大海,视角**锁死**,只有"退出重进 FPS"(那会补一次 DOWN)才恢复。
+///
+/// 我们看不到物理触摸,但"瞄着瞄着停了半秒又动"是它的自然伴随信号。
+/// 400ms:短于"重新握鼠"的间隔,远长于正常连续甩枪的帧间隔(60fps 下 16ms),
+/// 所以正常对枪踩不到,"碰了手机再回来"必踩到。代价与既有换手完全相同
+/// (一次 UP+DOWN,视角不改变,位移总量守恒)。
+/// "停顿时的**分离式**续接"是否启用。
+///
+/// **默认关闭**,理由见 [`AIM_RESUME_GAP`] 处那段注释:用户 2026-10-11 提出他可能用
+/// "两根手指按着手机屏滑动视角",而我们抬指那一瞬的 `ACTION_UP` 有可能被游戏当成
+/// "手势结束"从而打断他的手势 —— 在他确认用法之前,这个行为不许自动生效。
+///
+/// 做成**运行时可写**而非常量,是为了让无头端到端测试(`sim::tests`)能显式打开它、
+/// 验证"启用后必须经过设备端零瞄准触点那一刻,并且之后会重新落指"这条不变量。
+pub(crate) static AIM_RELIFT_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+const AIM_RESUME_GAP: Duration = Duration::from_millis(400);
+
 fn aim_flush(ctl: &ControlClient, m: &Mapper, aim: &Aim, st: &mut AimState, at: Instant) {
     let dead = aim.drag_deadzone.clamp(0.0, 400.0);
     let mag = st.ox.hypot(st.oy);
@@ -2078,6 +2785,19 @@ fn aim_flush(ctl: &ControlClient, m: &Mapper, aim: &Aim, st: &mut AimState, at: 
         // 死区内只累计偏移，不注入移动；last_motion 不刷新，
         // 因此静止归中计时会继续走，稍后自动抬指回锚点。
         return;
+    }
+    // 停顿之后的**第一次位移**:是否做"**分离式**续接"(只抬指、下次位移再落指)。
+    //
+    // **默认关闭**(用户 2026-10-11 提出的顾虑:他可能用"两根手指按着手机屏滑动视角",
+    // 而我们抬指那一瞬的 `ACTION_UP` 有可能被游戏当成"手势结束",从而打断他的双指操作)。
+    // 在用户确认用法之前,这个行为**不许自动生效** —— 恢复手段仍是他已有的 F8(关/开映射)。
+    // 打开后才是:只抬指,留出"零瞄准触点"的瞬间(这是 F8/F9 能解开卡死的同一机制),
+    // 下一次位移(通常 8~16ms 后)重新落指。
+    let resumed = st
+        .last_motion
+        .is_some_and(|t| at.saturating_duration_since(t) >= AIM_RESUME_GAP);
+    if resumed && st.down && AIM_RELIFT_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        aim_lift(ctl, st);
     }
     // W1-1:用事件的捕获时刻,而不是引擎处理它的时刻 —— 后者在排队/宏步进
     // 期间会滞后,静止归中会提前触发或延后触发。
@@ -2092,9 +2812,9 @@ fn aim_flush(ctl: &ControlClient, m: &Mapper, aim: &Aim, st: &mut AimState, at: 
 
     let (tx, ty, hit_edge) = aim_target(m, aim, st);
     if st.down {
-        ctl.touch_move(AIM_PID, tx, ty);
+        ctl.touch_move(st.active_pid(), tx, ty);
     } else {
-        ctl.touch_down(AIM_PID, tx, ty);
+        ctl.touch_down(st.active_pid(), tx, ty);
         st.down = true;
     }
     st.sent += 1;
@@ -2125,6 +2845,8 @@ fn open_world_on_motion(
     at: Instant,
     reserved: usize,
 ) -> bool {
+    // 与 `aim_on_motion` 同一口径:`reserved` 是"其它触点"数(不含瞄准自己)。
+    st.others = reserved;
     if !aim_active(aim, st) {
         return false;
     }
@@ -2167,28 +2889,58 @@ fn open_world_on_motion(
         st.ox = -radius;
     }
 
+    // 纵向:开放世界**没有**纵向跑步机(设计上只有水平回转),所以把累计偏移
+    // 钳在"锚点到上下边缘"的可用空间里。为什么必须钳:落点 = 锚点 + 偏移
+    // (`aim_target`),而不出屏是硬约束 —— `control.rs` 只做下界钳制(`max(0)`),
+    // 越出上/下边缘的触摸会被设备端**整条丢弃**,表现是"这一帧什么都没发生",
+    // 连带着把触点也丢掉。钳住之后最坏情况只是"这个方向到边就停"(与手指
+    // 顶在屏幕边上一致),压枪的补偿量也不会把触点推出屏幕。
+    let up_room = anchor.1 as f32;
+    let down_room = (m.h - 1.0 - anchor.1 as f32).max(0.0);
+    st.oy = st.oy.clamp(-up_room, down_room);
+
     let (tx, ty, _) = aim_target(m, aim, st);
     if !st.down {
-        ctl.touch_down(AIM_PID, anchor.0, anchor.1);
+        ctl.touch_down(st.active_pid(), anchor.0, anchor.1);
         st.down = true;
         st.cur = anchor;
     }
-    ctl.touch_move(AIM_PID, tx, ty);
+    ctl.touch_move(st.active_pid(), tx, ty);
     st.cur = (tx, ty);
 
     if carried != 0.0 {
-        // Seamless recenter: lift, reset to the anchor, then immediately apply
-        // the residual offset so the camera keeps moving in the same direction.
-        ctl.touch_up(AIM_PID, tx, ty);
+        // Seamless recenter: press the new pointer at the anchor **before**
+        // lifting the old one (see [`aim_overlap_handoff`]), then immediately
+        // apply the residual offset so the camera keeps moving in the same
+        // direction.  The old ordering (up → down) left an instant with zero
+        // aiming pointers, which the server turns into a real ACTION_UP.
         st.ox = carried.clamp(-radius, radius);
         st.oy = 0.0;
         let (rx, ry, _) = aim_target(m, aim, st);
-        ctl.touch_down(AIM_PID, anchor.0, anchor.1);
-        ctl.touch_move(AIM_PID, rx, ry);
+        aim_overlap_handoff(ctl, st, radius, "开放世界回转", anchor, (tx, ty));
+        ctl.touch_move(st.active_pid(), rx, ry);
         st.cur = (rx, ry);
     }
     false
 }
+
+/// 「静止归中」的最小位移门槛(**设备像素**)。
+///
+/// 为什么不能是"偏移 ≠ 0":真机日志(2026-10-11,debug 级)里 **125 秒 277 次换手**,
+/// 而绝大多数换手的"累计偏移"只有 **2~3px** —— 归中把偏移清零之后,余量/微小位移
+/// 立刻又把它填回这个量级,于是归中自己变成了一台每秒 2~5 次的"抬指 + 重按"机器
+/// (重叠换手期间设备端 `pointerCount` 还常年 ≥ 2)。它既直接伤手感,又是
+/// "手指碰一下手机屏就锁死"的合理成因:设备端指针集合被高频 down/up 搅乱。
+///
+/// 14px 远小于人眼能察觉的转向量(灵敏度 2.0 时约 7 个鼠标计数),又远大于余量噪声,
+/// 所以正常"甩完停手 → 回锚点"完全不受影响,只杀掉这种空转。
+const RECENTER_MIN_OFFSET_PX: f32 = 14.0;
+
+/// 两次「静止归中」之间的最小间隔(见 [`aim_tick`])。
+///
+/// 门槛挡住"2px 空转"之后,还能防住"持续有余量在喂"的病态情形(例如压枪在
+/// 持续加偏移):没有它,归中会每轮维护(4~16ms)触发一次。
+const RECENTER_MIN_GAP: Duration = Duration::from_millis(250);
 
 /// 定期维护:映射关闭/门控松开 -> 收手;静止归中 -> 回锚点
 fn aim_tick(ctl: &ControlClient, m: &Mapper, aim: &Aim, st: &mut AimState) {
@@ -2199,12 +2951,24 @@ fn aim_tick(ctl: &ControlClient, m: &Mapper, aim: &Aim, st: &mut AimState) {
     if !st.down || aim.recenter != RecenterMode::Idle {
         return;
     }
+    // 压枪**正在施加位移**时不算"静止":否则"归中拉回锚点 → 压枪又拉下去"会以
+    // 压枪节拍(默认 60Hz)反复触发抬指重按 —— 真机日志里那些 2~3px 的换手正是
+    // 这么来的。松开触发键后归中照常(那时手已经离开锚点,该拉回来)。
+    if st.recoil_active {
+        return;
+    }
     let idle_ms = aim.recenter_idle_ms.max(16) as u128;
     let paused = st
         .last_motion
         .map(|t| t.elapsed().as_millis() >= idle_ms)
         .unwrap_or(false);
-    if paused && (st.ox != 0.0 || st.oy != 0.0) {
+    // 两个"别空转"的门槛(见 [`RECENTER_MIN_OFFSET_PX`] / [`RECENTER_MIN_GAP`]):
+    // 只有**真的离开过锚点**、且距上次归中够久,才值得抬指重按一次。
+    let displaced = st.ox.hypot(st.oy) >= RECENTER_MIN_OFFSET_PX;
+    let quiet = st
+        .last_recenter
+        .is_none_or(|t| t.elapsed() >= RECENTER_MIN_GAP);
+    if paused && displaced && quiet {
         aim_recenter(ctl, m, aim, st);
     }
 }
@@ -2239,12 +3003,56 @@ fn recoil_shake(state: &mut u64) -> f32 {
     ((v >> 40) as f32 / (1u32 << 23) as f32) - 1.0
 }
 
+/// 水平交替补偿(H①)的波形(纯函数,便于单测)。
+///
+/// 输入是相位(弧度),输出 `w ∈ [-1, 1]`;两种波形都满足 `w(0) = 0` 且
+/// `w` 在 0 处**上升**(与正弦同相),于是"每次按下触发键都从同一点开始"。
+fn recoil_horizontal_wave(wave: HorizontalWave, phase: f32) -> f32 {
+    match wave {
+        HorizontalWave::Sine => phase.sin(),
+        HorizontalWave::Triangle => {
+            // 三角波 = 幅值线性往返。先把相位折到 [0, 1) 的"圈内位置":
+            // 0.00 → 0,0.25 → +1,0.50 → 0,0.75 → −1,回到 1.00 → 0。
+            let t = (phase / std::f32::consts::TAU).rem_euclid(1.0);
+            if t < 0.25 {
+                4.0 * t
+            } else if t < 0.75 {
+                2.0 - 4.0 * t
+            } else {
+                4.0 * t - 4.0
+            }
+        }
+    }
+}
+
+/// 开放世界模式下是否允许 H①(水平**振荡**补偿)。
+///
+/// **结论:不允许(只保留 H② 的常量偏置)** —— 依据是实测(见
+/// `open_world_band_clips_the_horizontal_wave`):开放世界里 `st.ox` 归
+/// 「回转带」管([`open_world_on_motion`] 把水平偏移钳在 `open_world_radius`
+/// 半径内,越带就抬指重按换手),而 H① 是**持续振荡**:
+/// * 幅度一旦越过回转半径,每个半周期都会顶到带边 → 反复触发"抬指重按"
+///   (= 用户点名过的"换手那一下视角跳变"),而振荡本身被钳掉一截,
+///   补偿量不再等于配置的幅度;
+/// * 即便没越带,振荡也在**占用**用户自己甩枪要用的那条带(可用行程被
+///   振荡吃掉 ±幅度),而回转带原本就是开放世界唯一的水平几何。
+///
+/// 这两条都随"当时屏幕宽度 / 锚点贴边程度"而变(半径是运行时算的),
+/// 所以按**模式**一刀切停用,并在界面上写明(不静默失效);
+/// H②(每档常量偏置)不受影响 —— 它只是个常量,由回转带正常消费。
+pub fn recoil_horizontal_wave_allowed(open_world: bool) -> bool {
+    !open_world
+}
+
 /// 压枪/后坐力补偿的节拍(V2-1)。与 `aim_tick` 并列,引擎循环每个迭代调用一次:
 ///
 /// - 生效条件:K2er 原文"需要配合瞄准模式使用" → `aim_active` 必须成立;
 ///   触发键必须是**物理上真的按住**(`Held` 是唯一可信依据,宏事件不算);
 /// - 到拍后把 向下=`控制强度`×拍数、水平=±`摇晃` 增量并进累计偏移,
 ///   经 [`aim_flush`] 走与鼠标位移**完全相同**的注入/死区/边界/归中路径;
+/// - H①(用户 2026-10-11"左右抖动也要消"):水平=幅度×(波形增量),
+///   **有界振荡**;幅度/周期/波形**都取当前档**(每档一套,切档时与垂直强度
+///   一起切);H②:水平 += 每档偏置×拍数(常量);
 /// - 一 tick 最多一条 touch_move,残余拍数留在 `recoil_frac`(不逐帧发命令);
 /// - 松开触发键/失活即停:清空节拍状态、不注入任何收尾动作
 ///   (要不要归中是 `RecenterMode` 的职责,与压枪无关)。
@@ -2257,12 +3065,16 @@ fn recoil_tick(
     at: Instant,
 ) {
     let r = &aim.recoil;
-    let active =
-        r.armed() && key_set_down(&r.trigger_key, held) && aim_active(aim, st) && !aim.open_world;
+    let active = r.armed() && key_set_down(&r.trigger_key, held) && aim_active(aim, st);
     st.recoil_active = active;
     if !active {
         st.recoil_last = None;
         st.recoil_frac = 0.0;
+        // H①:相位从"按下触发键的那一刻"起算 —— 失活/松开就复位到起点,
+        // 于是每次开火都从同一点开始(两次开火的 `st.ox` 序列逐拍相同)。
+        // 波形按**当前档**取(每档一套);老配置还没迁移时读值回落全局种子。
+        st.recoil_h_t = 0.0;
+        st.recoil_h_prev = recoil_horizontal_wave(r.horizontal_wave_at(st.recoil_index), 0.0);
         return;
     }
     // 档位收敛:界面删档/换配置后,运行下标可能越界
@@ -2276,12 +3088,43 @@ fn recoil_tick(
     st.recoil_last = Some(at);
     let (frac, steps) = recoil_step_plan(r.rate_hz, st.recoil_frac, dt);
     st.recoil_frac = frac;
+
+    // ---- H① 水平交替补偿(每档一套):按**波形增量**叠加 ----
+    // 幅度/周期/波形三项都取自**当前档**(用户 2026-10-11:"切换的时候让水平补偿
+    // 和垂直补偿一起切换") —— 换档即换一整套水平参数,与垂直强度同一档位下标。
+    // 时间照走(即使这一轮没攒够一拍):相位是"按下以来的时间",不是"第几拍"
+    // —— 用拍数推相位会让波形随控制频率变样。`dt` 与 `recoil_step_plan`
+    // 同一口径地上限 0.25s(长卡顿之后不把波形瞬移一大截)。
+    let h_px = r.horizontal_px_at(st.recoil_index);
+    let h_period_secs = r.horizontal_period_secs_at(st.recoil_index);
+    let h_wave = r.horizontal_wave_at(st.recoil_index);
+    let mut h_delta = 0.0;
+    if r.horizontal_wave_armed_at(st.recoil_index) && recoil_horizontal_wave_allowed(aim.open_world)
+    {
+        st.recoil_h_t += dt.clamp(0.0, 0.25);
+        let phase = std::f32::consts::TAU * st.recoil_h_t / h_period_secs;
+        let w = recoil_horizontal_wave(h_wave, phase);
+        h_delta = h_px * (w - st.recoil_h_prev);
+        st.recoil_h_prev = w;
+    }
+    if steps < 1.0 {
+        // 没攒够一拍:增量照旧并进累计偏移(下一拍统一注入),
+        // 但这一轮一条触摸消息都不发(一 tick 最多一条 touch_move)。
+        st.ox += h_delta;
+        return;
+    }
     let strength = r.strength_at(st.recoil_index);
-    if steps < 1.0 || strength <= 0.0 {
+    let gear_h = r.gear_horizontal_at(st.recoil_index);
+    if strength <= 0.0 && gear_h == 0.0 && h_delta == 0.0 {
         return;
     }
     // K2er 原文:"控制视角向下移动"。触摸坐标 y 向下为正,直接加在累计偏移上。
-    st.oy += strength * steps;
+    if strength > 0.0 {
+        st.oy += strength * steps;
+    }
+    // H② 每档水平偏置:按拍叠加(与垂直同一条纪律),正 = 向右。
+    st.ox += gear_h * steps;
+    st.ox += h_delta;
     let shake = r.shake_px.max(0.0);
     if shake > 0.0 {
         let mut jitter = 0.0;
@@ -2290,7 +3133,27 @@ fn recoil_tick(
         }
         st.ox += jitter * shake;
     }
-    aim_flush(ctl, m, aim, st, at);
+    if aim.open_world {
+        // 开放世界:落点与"水平回转"的几何由 [`open_world_on_motion`] 维护
+        // (它钳的是 `open_world_radius`,不认可无边界跑步机的可用矩形),
+        // 压枪就只能把偏移交给**同一条路**落下去,否则两条路各写一遍
+        // `st.ox/oy` 会互相打架。
+        //
+        // 旧实现在生效条件里写着 `&& !aim.open_world`,等于"开放世界方案里
+        // 压枪永远不生效"(用户 2026-10-11 核对的「三角洲」方案正是
+        // `open_world=true` + `recoil.enabled=true`):勾了开启、绑了左键,
+        // 却一点补偿都没有。现在按同一套几何注入(纵向由
+        // `open_world_on_motion` 钳在锚点到上下边缘之间,不会把触点推出屏)。
+        //
+        // `reserved` 传"最近一次已知的其它触点数"(主循环每轮刷新):压枪这条
+        // 路拿不到现算值,但重叠换手的诊断日志与触点预算都该看这个真实值,
+        // 而不是写死的 0。
+        let others = st.others;
+        open_world_on_motion(ctl, m, aim, st, 0.0, 0.0, at, others);
+    } else {
+        // 无边界走跑步机、有边界走落点钳制 —— 与鼠标位移完全同一条路。
+        aim_flush(ctl, m, aim, st, at);
+    }
 }
 
 pub struct Shared {
@@ -2317,6 +3180,15 @@ pub struct Shared {
     /// 而"关一次开一次映射"恰好会触发一次重新确认,于是看起来像开关的问题。
     /// 现在引擎自己会在"空闲后第一次按键"时请求一次,不必让用户手动关开。
     pub space_recheck: bool,
+    /// 界面刚刚**重新确认过**坐标空间(鼠标活动触发的 `space_recheck` 走完一轮)。
+    ///
+    /// 为什么需要它:坐标空间一变,设备端此刻按着的那几根手指全都是在**旧空间**里
+    /// 落下的 —— 位置已经错了,新空间的边界还可能把某个落点判成出屏。光把尺寸刷新
+    /// 不够,必须先把它们全部收手,让下一次事件按新空间重新落指(DF-5 的引擎侧)。
+    ///
+    /// 由界面置位、引擎取走并清零(一次性请求;`Shared` 没有 `Default`,
+    /// 所以这里只声明,不提供默认值)。
+    pub space_changed_release: bool,
     /// 顶栏[映射:开/关]按钮请求引擎执行一次"关闭映射"的收尾。
     ///
     /// 为什么需要它:关闭映射时必须抬起所有仍按着的触点(否则手机上会一直按着,
@@ -2406,6 +3278,22 @@ enum SchedAct {
         y: i32,
         lane: BindLane,
     },
+    /// **连点的一击按下**(用户 2026-10-13,V2-2)。
+    ///
+    /// 与 `Up` 配对使用:`ReDown` 按下 → 稍后 `Up` 抬起,构成"再点一下"。
+    ///
+    /// 为什么不复用 `MacroClick`:那个走**宏的 lane 与运行表**(`macro_down`),
+    /// 抬起时会核对"宏的运行表里有没有这个 pid" —— 普通键位的连点不在那张表里,
+    /// 于是抬起被拒(实测 `down 1 up 0`)。连点属于普通键位,必须走普通 lane。
+    ///
+    /// 为什么需要单独一个变体(而不是再用一次 `Down`):`Down` 是"从无到有"的
+    /// 语义(会走 `try_down` 查触点池),而连点是"同一根指头再点一下" ——
+    /// 设备端看到的是同一个 pid 的 DOWN/UP 交替,不走触点池分配。
+    ReDown {
+        pid: u64,
+        x: i32,
+        y: i32,
+    },
     Move {
         pid: u64,
         x: i32,
@@ -2455,6 +3343,33 @@ enum SchedAct {
         lane: BindLane,
         code: u16,
     },
+    /// 「长按重复」里**组合键**那一轮的到点重跑(用户 2026-10-11 第 2 条)。
+    ///
+    /// 与 [`Self::Redispatch`] 同一条"重新走一遍触发路径"的思路,区别是重跑的
+    /// 不是一次被延迟的按下,而是**下一轮循环**:到点重跑 `handle_combo_event`
+    /// (带 `repeat_trigger`),整组键仍按着就再跑一轮、并且再排下下轮;
+    /// 松手了就走了空 —— 正在跑的那一轮照旧跑完,只是不再排下一轮。
+    ///
+    /// `code` 是那一下的键码(组合键是虚拟码):配置在下标处被换掉时用它核对,
+    /// 与 `Redispatch` 同一道守卫。
+    ComboRedispatch {
+        idx: usize,
+        lane: BindLane,
+        code: u16,
+    },
+    /// 「长按重复」里**键位/宏**那一轮的到点重跑(用户 2026-10-11 第 2 条)。
+    ///
+    /// 与 [`Self::Redispatch`] 的执行路径完全相同(都走 `redispatch_press`),
+    /// 单独留一个变体只为一件事:**关映射 / 断连时必须作废它**。
+    /// `Redispatch` 是"用户已经按下的那一次,冷却没过先扣住" —— 那一发是用户的
+    /// 真实意图,作废它等于吞掉一次输入(既有语义,不动);而 `RepeatRedispatch`
+    /// 只是"循环的下一轮",关映射之后绝不该再去动设备。两者混在一个变体里就
+    /// 没法只取消后者(见 [`cancel_repeat_scheduled`])。
+    RepeatRedispatch {
+        idx: usize,
+        lane: BindLane,
+        code: u16,
+    },
 }
 
 #[derive(Default, Clone)]
@@ -2473,6 +3388,16 @@ struct WheelState {
     sent_at: Option<Instant>,
     /// 临时轮盘当前是否处于启用状态(永久轮盘恒为 true)
     active: bool,
+    /// 这次落指**没有得到确认**(DF-13):`touch_down` 是乐观写入 —— 设备端十指池
+    /// 已满时那条 DOWN 会被悄悄丢掉,而本地已经记成"手指落在圆心"。
+    /// 手指于是永远停在圆心:用户看到的是"轮盘推不动,换个方向又好了"。
+    ///
+    /// 置位条件按**本地预算**判断(落指后正好占满 [`DEVICE_MAX_POINTERS`],见
+    /// [`update_wheel`]);置位后由 [`wheel_keepalive`] 的下一个节拍补一套
+    /// `UP(上次落点) → DOWN(圆心) → MOVE(落点)`,**每次落指最多补一次**。
+    down_unconfirmed: bool,
+    /// 已经为落指补过几次(诊断与单测用;正常路径恒为 0/1)。
+    down_retries: u64,
 }
 
 /// 引擎线程独占的可变运行状态。
@@ -2516,10 +3441,17 @@ pub(crate) fn release_all(
     match ctl {
         Some(c) => {
             let m = shared.profile.mapper(screen);
-            // 瞄准触点一并抬起(否则松手后仍按在屏幕上)
-            if st.release_fps {
-                aim_lift(c, st.aim);
-            }
+            // 瞄准触点**无条件抬起**(否则松手后仍按在屏幕上)。
+            //
+            // 2026-10-11:无头端到端场景 `sim::tests::scenario_disable_releases_every_finger`
+            // 抓到的真实缺陷 —— `release_fps:false` 的两条路径(顶栏[映射:开/关]
+            // 与总开关键)原本连**瞄准**也一起跳过,而"留给下一次事件的
+            // `fps_needs_release` 分支收口"这个兜底**不成立**:`fps_mode_active`
+            // 只看 `aim.enabled`,**不认总映射开关**(见它的注释),于是关掉映射后
+            // `fps_running` 仍为真、`fps_needs_release` 永远为假,那根手指就一直
+            // 按在手机上(用户看到的正是"关映射了手机上还按着一根手指")。
+            // 现在 `release_fps` 只管 FPS 专用键位(`fps_fingers` / fps 系统键)。
+            aim_lift(c, st.aim);
             // 遍历按下表本身的长度而不是当前绑定数:被删掉的槽位里可能还记着"按着",
             // 漏掉它就是一个永久卡在设备上的触点(触点池会被越用越少)。
             let n = st.fingers.down.len().max(shared.profile.binds.len());
@@ -2563,6 +3495,7 @@ pub(crate) fn release_all(
                 c.touch_move(wheel_pid(j), cx, cy);
                 c.touch_up(wheel_pid(j), cx, cy);
                 ws.down = false;
+                ws.down_unconfirmed = false;
             }
         }
         None => {
@@ -2584,6 +3517,9 @@ pub(crate) fn release_all(
         ws.pressed = [false; 4];
         ws.custom_pressed = [false; 8];
         ws.active = false;
+        // 收尾时"补按"也必须作废:不清的话下一次开打的第一轮保活会对着一个
+        // 早已抬起的轮盘补一套 UP/DOWN/MOVE(DF-13)。
+        ws.down_unconfirmed = false;
     }
     // 「按后延迟」的冷却表一并作废(用户 2026-10-10 第 2 条)。
     //
@@ -2592,6 +3528,23 @@ pub(crate) fn release_all(
     // 而且"重新开打的第一下"本来就该立刻生效。所以这里与触点、轮盘、瞄准
     // 同一步清干净。
     st.gates.reset();
+}
+
+/// "空闲多久之后请求重新确认一次坐标空间"(见 [`Shared::space_recheck`])。
+///
+/// 3 秒:短到"切窗口回来看一眼再打"就能覆盖,长到正常的连点/连推绝不会踩到
+/// (踩到的代价只是一次多余的空间查询,不是错误)。
+const SPACE_RECHECK_IDLE: Duration = Duration::from_secs(3);
+
+/// "距上次活动 ≥ `idle` ⇒ 请求重新确认坐标空间"的判定,顺带把"最近一次活动时刻"
+/// 推进到 `now`(纯函数,便于单测)。
+///
+/// **鼠标位移与按键共用这一份**(单一真相):只看按键的话,"整局只用鼠标瞄准、
+/// 不敲键盘"的玩法永远等不到重查 —— 而那正是最容易碰上"手机在别的窗口转屏"的人群。
+fn space_recheck_due(last: &mut Option<Instant>, now: Instant, idle: Duration) -> bool {
+    let due = last.map(|t| now.duration_since(t) >= idle).unwrap_or(false);
+    *last = Some(now);
+    due
 }
 
 /// "本地还有没抬起来的东西"判定:控制通道断开时靠它决定要不要走 [`release_all`] 收场
@@ -2672,10 +3625,6 @@ pub fn run(
     let mut gates = PressGates::default();
     let mut aim = AimState::default();
     let mut gamepad = GamepadState::default();
-    // Ctrl+Alt 组合:按下即把鼠标交还给系统,再按一次收回(需用全局钩子判定,
-    // 因为开打时焦点通常在 scrcpy 窗口,主程序收不到按键)
-    let mut ctrl_down = false;
-    let mut alt_down = false;
     // 顶栏按钮请求的收尾是否已经执行过(用于识别请求的上升沿)
     let mut toolbar_release_prev = false;
     // "触点池已满"这类解释性日志的节流时刻(避免刷屏)
@@ -2687,7 +3636,8 @@ pub fn run(
     let mut pending_notice: Option<String> = None;
     // 空闲后重新确认坐标空间(见 Shared::space_recheck)
     let mut pending_space_recheck = false;
-    let mut last_key_at: Option<Instant> = None;
+    // 最近一次"活动"(按键**或**鼠标位移)的时刻,见 [`space_recheck_due`]
+    let mut last_activity_at: Option<Instant> = None;
     // 控制通道上一帧是否可用:用来识别"由断到通"的那一刻(见主循环里重建触点的分支)
     let mut connected_prev = false;
     // 通道刚恢复/首次连上:本帧必须强制按物理按键真值重建一遍触点
@@ -2749,6 +3699,10 @@ pub fn run(
                                         _ => {}
                                     }
                                 }
+                                // 连点的一击按下(用户 2026-10-13,V2-2):同一 pid 再落指。
+                                // 不走触点池(那是"从无到有"的语义)—— 设备端看到的就是
+                                // 同一根指头的 DOWN/UP 交替,与手动连点完全一样。
+                                SchedAct::ReDown { pid, x, y } => c.touch_down(pid, x, y),
                                 SchedAct::Move { pid, x, y } => c.touch_move(pid, x, y),
                                 SchedAct::MacroAndroidKey { keycode, down } => {
                                     if down {
@@ -2762,9 +3716,7 @@ pub fn run(
                                 SchedAct::MacroFps { on } => {
                                     aim.mode_active = on;
                                     aim.suspended = false;
-                                    if on {
-                                        aim.released = false;
-                                    } else {
+                                    if !on {
                                         aim_lift(c, &mut aim);
                                         release_fps_binds(
                                             c,
@@ -2847,6 +3799,7 @@ pub fn run(
                                                 let (x, y) = st.last;
                                                 c.touch_up(wheel_pid(wheel), x, y);
                                                 st.down = false;
+                                                st.down_unconfirmed = false;
                                             }
                                         } else {
                                             let _ = update_wheel(c, &m, wheel, &w, st, reserved);
@@ -2902,11 +3855,18 @@ pub fn run(
                                     if let Some(st) = wheels.get_mut(wheel) {
                                         st.down = false;
                                         st.last = (x, y);
+                                        st.down_unconfirmed = false;
                                     }
                                 }
                                 // 「按后延迟」到期:把当初被推迟的那次按下补上
                                 // (用户 2026-10-10 第 2 条)。
-                                SchedAct::Redispatch { idx, lane, code } => {
+                                // 「长按重复」的组合键那一轮重跑走的是同一条路
+                                // (用户 2026-10-11 第 2 条):`redispatch_press`
+                                // 的组合车道会把 `handle_combo_event` 重新走一遍,
+                                // 那里再判"整组键还按着没有",按着就接着排下下轮。
+                                SchedAct::Redispatch { idx, lane, code }
+                                | SchedAct::ComboRedispatch { idx, lane, code }
+                                | SchedAct::RepeatRedispatch { idx, lane, code } => {
                                     let m = g.profile.mapper((c.screen_w, c.screen_h));
                                     let reserved = wheel_pointers(&wheels)
                                         + fps_fingers.count
@@ -2943,8 +3903,13 @@ pub fn run(
 
         // 顶栏[映射:开/关]按钮请求的收尾(上升沿触发一次)。
         // 与总开关键走同一份 release_all,保证"用按钮关映射"也不会在手机上留下按住的触点。
-        // release_fps:false(D3=A,2026-10-06 用户拍板):FPS 专用触点同样留给
-        // 下一次事件的 fps_needs_release 分支收口(与总开关键路径一条纪律)。
+        // release_fps:false(D3=A,2026-10-06 用户拍板):**FPS 专用键位**的触点
+        // 不在这里释放,留给下一次事件的 fps_needs_release 分支收口。
+        // ⚠ 2026-10-11 修正:这句原本把**瞄准触点**也算进"不在这里释放",而那条
+        // 兜底对它并不成立(`fps_mode_active` 不认总映射开关,关掉映射后
+        // `fps_needs_release` 永远为假,那根手指会一直按在手机上)。瞄准触点现在由
+        // `release_all` 自己无条件抬起 —— 见那里的注释与场景测试
+        // `sim::tests::scenario_disable_releases_every_finger`。
         {
             let mut g = lock_shared(&shared);
             if g.toolbar_release && !toolbar_release_prev {
@@ -2975,10 +3940,45 @@ pub fn run(
                     },
                 );
                 g.control = ctl;
-                // 重新开打时恢复鼠标捕获(丢掉上一局的"交还鼠标"状态)
-                aim.released = false;
             }
             toolbar_release_prev = g.toolbar_release;
+
+            // 坐标空间被界面**重新确认**过(一次性请求,见 [`Shared::space_changed_release`])。
+            //
+            // 为什么必须收手重来:此刻按在设备上的每一根手指都是在**旧空间**里落下的
+            // —— 坐标已经错了,新空间的边界还可能让其中某个落点变成"出屏"(出屏的触摸
+            // 会被设备端整条丢弃,于是本地以为按着、设备端什么都没有)。全部抬起来,
+            // 让下一次事件按新空间重新落指,比"带着错位的触点继续打"安全得多。
+            // `release_fps: true`:FPS 专用触点与瞄准触点同样属于"按在设备上的东西"。
+            if g.space_changed_release {
+                g.space_changed_release = false;
+                let ctl = g.control.take();
+                let screen = ctl
+                    .as_ref()
+                    .map(|c| (c.screen_w, c.screen_h))
+                    .unwrap_or((0, 0));
+                release_all(
+                    ctl.as_ref(),
+                    &mut g,
+                    screen,
+                    EngineState {
+                        fingers: &mut fingers,
+                        fps_fingers: &mut fps_fingers,
+                        combo_fingers: &mut combo_fingers,
+                        wheels: &mut wheels,
+                        active_android_keys: &mut active_android_keys,
+                        fps_active_android_keys: &mut fps_active_android_keys,
+                        combo_active_android_keys: &mut combo_active_android_keys,
+                        release_fps: true,
+                        aim: &mut aim,
+                        gates: &mut gates,
+                    },
+                );
+                g.control = ctl;
+                // 锚点记录一并作废:下一次位移必须从**新空间**的锚点重新落指,
+                // 而不是沿用"上一根手指相对旧锚点"的落点。
+                aim_invalidate_anchor(&mut aim);
+            }
         }
 
         // 瞄准定期维护 + 同步鼠标捕获状态。
@@ -2993,6 +3993,15 @@ pub fn run(
             let cfg = s.profile.aim.clone();
             let enabled = s.enabled;
             mapping_enabled = enabled;
+            if !enabled {
+                // S② 复位路径①(**与事件无关**):映射关闭 = "我要正常用鼠标了"
+                // —— 手动独占必须清掉,否则重新开映射时鼠标会莫名其妙又被吞掉。
+                // 为什么放在这条每轮维护里、而不是事件派发路径的 `!enabled` 分支:
+                // 用顶栏[映射:开/关]按钮关掉映射时,之后可能**一个按键事件都不来**,
+                // 藏在事件路径里就会漏掉这一次清零(重新开映射 = 鼠标再次被独占,
+                // 而用户并没有再按那个热键)。
+                shield_manual_reset(&mut aim);
+            }
             let connected = s
                 .control
                 .as_ref()
@@ -3005,9 +4014,9 @@ pub fn run(
                 || aim.down
                 // 压枪(V2-1):触发键按住期间保持快档,节拍才够稳
                 || aim.recoil_active;
-            // 仅当映射开启、控制通道在线、瞄准启用且未被 Ctrl+Alt 释放时才捕获光标,
+            // 仅当映射开启、控制通道在线、瞄准启用时才捕获光标,
             // 避免出现"光标被冻结但什么都做不了";
-            // 指针消隐与"按住才瞄准"分离:进入 FPS 即消隐,仅暂时退出/手动交还时显示。
+            // 指针消隐与"按住才瞄准"分离:进入 FPS 即消隐,仅暂时退出时显示。
             mouse_grab.store(
                 enabled && pointer_should_be_hidden(connected, &cfg, &aim),
                 Ordering::Relaxed,
@@ -3015,11 +4024,58 @@ pub fn run(
             match s.control.as_ref() {
                 Some(ctl) if connected => {
                     let m = s.profile.mapper((ctl.screen_w, ctl.screen_h));
+                    // 换手诊断要的"其它触点"数(不含瞄准自己):这三条维护路径
+                    // (归中 / 压枪 / 跑步机余量)拿不到现算值,所以在调用前刷一次
+                    // —— 与下面 `wheel_keepalive` 的口径一致,只是把瞄准那 1 个排除掉。
+                    aim.others = wheel_pointers(&wheels)
+                        + fingers.count
+                        + fps_fingers.count
+                        + combo_fingers.count
+                        + macro_down.len();
+                    // 轨迹:瞄准/模式状态心跳(见 `trace::aim_state`)。放在这里是因为
+                    // "其它触点数"刚算完 —— 那正是判断"是不是池子满了落不下指"的依据。
+                    crate::trace::aim_state(
+                        s.enabled,
+                        aim.mode_active,
+                        aim.suspended,
+                        aim.gate_down,
+                        s.profile.aim.anchor_set(),
+                        aim.down,
+                        aim.others,
+                    );
                     aim_tick(ctl, &m, &cfg, &mut aim);
+                    // ---- 卡死自愈(D,2026-10-12):与事件无关地对账 ----
+                    // 放在 `aim_tick` 之后是刻意的:抬指会清掉累计偏移,必须是同一轮里
+                    // 的**最后一步**,否则归中/余量推进又会往上一段拖动里写回偏移。
+                    // 三条前提(总映射开 / self_heal 开 / 不在界面交互中)与 300ms 限流
+                    // 都在 `self_heal_tick` 里判;触发原因由它返回,这里只负责写日志
+                    // (`pending_notice` 由循环顶部统一落进界面日志,见它的声明处)。
+                    {
+                        let local_pointers = aim.others + usize::from(aim.down);
+                        if let Some(reason) = self_heal_tick(
+                            ctl,
+                            enabled,
+                            &cfg,
+                            &mut aim,
+                            &mut s.aim_live,
+                            local_pointers,
+                            Instant::now(),
+                        ) {
+                            pending_notice = Some(format!(
+                                "卡死自愈#{}({reason}):已抬起瞄准指,下次位移自动重新落指",
+                                aim.self_heals
+                            ));
+                        }
+                    }
                     // 压枪(V2-1):与 aim_tick 同处"控制通道在线"分支,每次迭代结算一拍。
                     // 放在这里(而不是事件派发里)是因为它必须**与事件无关**地跑:
                     // 按住开火键不动的那些迭代,才是压枪真正干活的时刻。
                     recoil_tick(ctl, &m, &cfg, &mut aim, &held, Instant::now());
+                    // 无边界跑步机的余量推进(用户 2026-10-11:交付按帧摊开之后,
+                    // 余量不能只等下一次鼠标位移 —— 见 `aim_drain_pending`)。
+                    // 同样"与事件无关":它**不刷新** `last_motion`,所以静止归中
+                    // 的计时与这条调用无关。
+                    aim_drain_pending(ctl, &m, &cfg, &mut aim);
                     // 轮盘保活:把"按着的轮盘"的落点按周期重发一遍,自愈被链路
                     // 丢掉的那一条 Move(见 wheel_keepalive)。放在这里是因为它
                     // 必须**与事件无关**地跑 —— 旧的缺口正是"没有方向变化就永远
@@ -3132,6 +4188,9 @@ pub fn run(
             if !connected {
                 // 宏触点/系统键同样"通道不在=没人再会去抬":排程作废、运行表清空。
                 // (dirty 判定不知道宏的状态,所以这里在 dirty 之外单独收口。)
+                // 「长按重复」的下一轮同样作废:通道不在时它只会在设备上重跑一条
+                // 没人管的动作(见 `cancel_repeat_scheduled`)。
+                cancel_repeat_scheduled(&mut scheduled);
                 cancel_macro_scheduled(
                     &mut scheduled,
                     None,
@@ -3188,6 +4247,8 @@ pub fn run(
                     w.pressed = [false; 4];
                     w.custom_pressed = [false; 8];
                     w.active = false;
+                    // 本地与设备端都被清空了,补按标志一并作废(DF-13)。
+                    w.down_unconfirmed = false;
                 }
                 // 长按型临时轮盘从物理镜像重推导(2026-10-06):断线期间用户可能
                 // 一直按着 E/Q 这类启用键,事件早在断线前就送完了 —— 只清不推,
@@ -3211,6 +4272,11 @@ pub fn run(
                     aim.recoil_index = req.min(n - 1);
                 }
             }
+            // 悬浮窗状态行的引擎侧快照(用户 2026-10-11 第 6 条:让用户一边打一边
+            // 就能看见"为什么转不动")。**纯只读镜像,不参与任何判定** —— 这里
+            // 取的四个判据与上面 `trace::aim_state` 摊开的是同一批(门控/锚点/
+            // 其它触点/总映射),只是目的地从轨迹文件换成界面。
+            let aim_anchor_set = s.profile.aim.anchor_set();
             let l = &mut s.aim_live;
             l.ox = aim.ox;
             l.oy = aim.oy;
@@ -3224,6 +4290,17 @@ pub fn run(
             // 压枪(V2-1):界面用它显示"正在生效/当前第几档"
             l.recoil_active = aim.recoil_active;
             l.recoil_index = aim.recoil_index;
+            // 「鼠标独占」手动开关(S②):界面据此算隔膜判据、写状态行
+            l.shield_manual = aim.shield_manual;
+            // 悬浮窗状态行:门控 / 锚点 / 其它触点 / 总映射
+            l.gate_down = aim.gate_down;
+            l.anchor_set = aim_anchor_set;
+            l.others = aim.others;
+            l.mapping_enabled = s.enabled;
+            // 卡死自愈(D):次数与最近原因给悬浮窗/面板看(账本/请求/忙闲那几项是
+            // **界面写、引擎读**,这里绝不能覆盖)。
+            l.self_heal_count = aim.self_heals;
+            l.self_heal_reason = aim.self_heal_reason;
             // 触点占用是"此刻"的量:轮盘/瞄准的状态可能刚被上面的维护改动过
             // (宏触点也算:它们同样占着设备端的十指池,见 macro_down)
             live.pointers = fingers.count
@@ -3246,6 +4323,9 @@ pub fn run(
         if !mapping_enabled {
             combo_gate.reset();
             cancel_combo_scheduled(&mut scheduled);
+            // 「长按重复」的下一轮也一并作废:判据 `Held` 在关映射期间不变,
+            // 不作废的话它到点仍会重跑一条宏(用户已经明确关掉映射了)。
+            cancel_repeat_scheduled(&mut scheduled);
             {
                 let g = lock_shared(&shared);
                 cancel_macro_scheduled(
@@ -3287,6 +4367,10 @@ pub fn run(
         } else {
             match rx.recv_timeout(wait) {
                 Ok(CaptureEvent::Button { code, pressed, at }) => {
+                    // 轨迹(`SCRCPY_PAD_TRACE`):记在**门控之前** —— 轨迹要复原的是
+                    // "捕获层看到了什么",而不是"引擎最后认了什么"。两者之差
+                    // (组合键窗口吞掉的、被隔膜影响的)恰恰是排查时要看的东西。
+                    crate::trace::button(code, pressed);
                     // GUI 捕获/宏录制需要原始按下与抬起，不能等组合键门控结束，
                     // 否则组合键前缀会被延迟，甚至被 suppressed 吞掉。
                     // W1-1:时刻原样转发,宏录制按"按下/抬起发生的那一刻"计时。
@@ -3304,7 +4388,10 @@ pub fn run(
                     };
                     input
                 }
-                Ok(CaptureEvent::Motion { dx, dy, at }) => EngineInput::Motion { dx, dy, at },
+                Ok(CaptureEvent::Motion { dx, dy, at }) => {
+                    crate::trace::motion(dx, dy);
+                    EngineInput::Motion { dx, dy, at }
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     // 捕获通道断开 = 捕获层没了(程序退出,或捕获线程意外死亡),
@@ -3324,6 +4411,7 @@ pub fn run(
                     // 宏的定时动作也要一并取消:否则宏按在手机上的系统键没人抬
                     //(与"关映射"路径同一份实现)。
                     cancel_combo_scheduled(&mut scheduled);
+                    cancel_repeat_scheduled(&mut scheduled);
                     cancel_macro_scheduled(
                         &mut scheduled,
                         ctl.as_ref(),
@@ -3400,6 +4488,7 @@ pub fn run(
                     &mapper,
                     &combo,
                     &g.profile,
+                    &held,
                     &mut macro_exec_seq,
                     index,
                     pressed,
@@ -3453,6 +4542,12 @@ pub fn run(
                 l.suspended = aim.suspended;
                 l.sent = aim.sent;
                 s.live = live;
+                // 鼠标位移也算"活动"(DF-5 的引擎侧):口径与按键路径共用
+                // [`space_recheck_due`]。只用鼠标瞄准、不敲键盘的玩法全靠这一条
+                // 才能在"切窗口待一会儿再回来"之后重新确认坐标空间。
+                if space_recheck_due(&mut last_activity_at, Instant::now(), SPACE_RECHECK_IDLE) {
+                    pending_space_recheck = true;
+                }
                 continue;
             }
         };
@@ -3462,7 +4557,7 @@ pub fn run(
         // W0-6:来源只影响两条纪律(功能键 + 物理镜像);普通绑定对两种来源一视同仁。
         let physical = is_physical(source);
 
-        let (enabled, toggle_key, cursor_toggle_key, aim_hold_key, aim_captured) = {
+        let (enabled, toggle_key, cursor_toggle_key, aim_hold_key) = {
             let g = lock_shared(&shared);
             let aim = &g.profile.aim;
             (
@@ -3470,7 +4565,6 @@ pub fn run(
                 g.profile.toggle_key,
                 g.profile.cursor_toggle_key,
                 aim.hold_key,
-                aim.enabled && aim.capture_mouse && aim.anchor_set(),
             )
         };
 
@@ -3511,22 +4605,26 @@ pub fn run(
             aim.gate_down = key_set_down(&aim_hold_key, &held);
         }
 
-        // Ctrl+Alt:临时把鼠标交还给系统,再按一次收回。
-        // 只在瞄准确实会捕获鼠标时才有意义,避免误触改状态。
-        // 同样只认上升沿:否则 Windows 上按住 Ctrl+Alt 不放,自动重复会把
-        // "交还/收回"来回翻转(与总开关键、切换型启用键同一处理)。
         // FPS 模式独立开关与临时挂起。该处理放在总开关之前:即使总开关键位相同,
         // 两边也只各自翻转一次;如果不同,则 FPS 不依赖普通映射是否开启。
-        let (aim_cfg, aim_toggle_key, aim_suspend_key) = {
+        let (aim_cfg, aim_toggle_key, aim_suspend_key, aim_shield_key, aim_wake_key) = {
             let g = lock_shared(&shared);
             let aim = &g.profile.aim;
-            (aim.clone(), aim.toggle_key, aim.suspend_key)
+            (
+                aim.clone(),
+                aim.toggle_key,
+                aim.suspend_key,
+                aim.shield_key,
+                aim.wake_key,
+            )
         };
         let mut fps_transition = false;
         let mut fps_consumed = false;
         if !enabled {
             aim.mode_active = false;
             aim.suspended = false;
+            // (S② 复位路径①:手动独占的清零在每轮维护块里做 —— 那里的判据
+            //  "与事件无关",顶栏按钮关映射时不会漏。见 `shield_manual_reset`。)
         } else if aim_cfg.enabled {
             // W0-6:FPS 开关与挂起键是功能键,只认物理事件(宏不能替你开关 FPS)。
             if functional_key_hit(source, ev, &aim_toggle_key, &held) {
@@ -3535,7 +4633,10 @@ pub fn run(
                     if aim_cfg.anchor_set() {
                         aim.mode_active = !aim.mode_active;
                         if aim.mode_active {
-                            aim.released = false;
+                            // 进 FPS 立刻重查一次坐标空间:瞄准的整套换算(锚点、半径、
+                            // 灵敏度)都按当前屏幕尺寸算,而用户往往是"在别的窗口待了
+                            // 一会儿才按 FPS 键" —— 那正是手机最可能已经转屏的时刻。
+                            pending_space_recheck = true;
                         }
                     } else {
                         aim.mode_active = false;
@@ -3545,10 +4646,12 @@ pub fn run(
                 }
             }
             // ---- 补偿挡位切换键(用户 2026-10-10 第 3 条) ----
-            // 按一下换一档(环绕),按住它时滚轮也能换档(见下面滚轮那一段)。
-            // 放在这里 = 与其它 FPS 系统键同一条纪律:只认物理事件、按下即消费,
-            // **不再落到普通键位映射**(用户:"补偿切换高于一般键位映射")。
+            // 按一下换一档(环绕)。放在这里 = 与其它 FPS 系统键同一条纪律:
+            // 只认物理事件、按下即消费,**不再落到普通键位映射**
+            // (用户:"补偿切换高于一般键位映射")。
             // 只有"开了后坐力补偿 + 有档位"时才接管,否则这个键留给普通映射用。
+            // (2026-10-11:滚轮换档不再要求按住这个键 —— 它只管"按一下换一档";
+            //  滚轮的接管条件见下面滚轮那一段的 `recoil_takes_wheel`。)
             let recoil_cfg = &aim_cfg.recoil;
             let gear_switch_live = recoil_cfg.enabled && !recoil_cfg.strengths.is_empty();
             if gear_switch_live {
@@ -3558,9 +4661,8 @@ pub fn run(
                         let n = recoil_cfg.strengths.len();
                         aim.recoil_index = (aim.recoil_index.min(n - 1) + 1) % n;
                         pending_notice = Some(format!(
-                            "后坐力补偿:控制强度切换到第 {} 档({})",
-                            aim.recoil_index + 1,
-                            recoil_cfg.strengths[aim.recoil_index]
+                            "后坐力补偿:已切到{}",
+                            recoil_cfg.gear_display(aim.recoil_index)
                         ));
                     }
                 }
@@ -3579,6 +4681,44 @@ pub fn run(
         } else {
             aim.mode_active = false;
             aim.suspended = false;
+        }
+
+        // ---- 「鼠标独占」手动开关(S②,用户 2026-10-11 第二个问题) ----
+        // 为什么不放进上面 `aim_cfg.enabled` 那个分支:它是**输入层的逃生开关**
+        // —— 隔膜开着时连本程序界面都点不了,这个键必须随时可按,不该被
+        // "FPS 瞄准有没有启用"挡住。只要映射开着、键绑了,它就生效。
+        // 纪律与 FPS 开关键逐字相同:只认物理事件 + 上升沿(宏与 Windows 自动
+        // 重复都不连翻),并且按下即消费 —— 不再落到普通键位映射。
+        let shield_hit = enabled && functional_key_hit(source, ev, &aim_shield_key, &held);
+        if shield_hit {
+            fps_consumed = true;
+            let next = shield_manual_next(aim.shield_manual, shield_hit, fresh_press);
+            if next != aim.shield_manual {
+                aim.shield_manual = next;
+                pending_notice = Some(if next {
+                    "鼠标独占:已手动开启(再按一次同一键关闭)".to_string()
+                } else {
+                    "鼠标独占:已手动关闭".to_string()
+                });
+            }
+        }
+
+        // ---- 「唤醒视角」热键(A,2026-10-11) ----
+        // 真机定性:锁死时我们的通道与进程都活着,而**鼠标点不了任何界面**,
+        // 只有键盘还通(用户按 F8 成功恢复过);两种恢复手段(F8 关映射 /
+        // F9 退出重进 FPS)唯一共同的动作就是"把我们按着的那根瞄准指抬起来"。
+        // 所以这个键**只做那一件事**:抬起瞄准指 —— 不关映射、不退出 FPS、
+        // 不改 mode/挂起/门控;下一次鼠标位移会照常重新落指(`aim_lift` 已把
+        // 偏移与最后一次位移时刻一起清掉)。位置与 S② 的「鼠标独占」手动开关
+        // 相同:输入层的逃生键,只要映射开着、键绑了就该生效,不受
+        // "FPS 瞄准有没有启用"影响。纪律逐字相同:只认物理事件 + 上升沿,
+        // 按下即消费(不再落到普通键位映射)。默认未绑定 ⇒ 这一整段不生效。
+        let wake_hit = enabled && functional_key_hit(source, ev, &aim_wake_key, &held);
+        if wake_hit {
+            fps_consumed = true;
+            if fresh_press && wake_key_action(&shared, &mut aim) {
+                pending_notice = Some("视角唤醒:已抬起瞄准指,下次位移重新落指".to_string());
+            }
         }
 
         let fps_running = fps_is_active(&aim_cfg, &aim);
@@ -3660,6 +4800,8 @@ pub fn run(
                             idx,
                             fps_bind_pid(idx),
                             BindLane::Fps,
+                            &held,
+                            None,
                             &mut macro_exec_seq,
                             fresh_press,
                             &ev,
@@ -3726,35 +4868,13 @@ pub fn run(
             continue;
         }
 
-        // W0-6:ctrl/alt 镜像是物理真值,宏事件不参与 —— 宏里按一下 Ctrl
-        // 不该替你"把鼠标交还给系统"。整条 Ctrl+Alt 交还/收回同理,只认物理事件。
-        if physical {
-            if is_ctrl(ev.code) {
-                ctrl_down = ev.pressed;
-            } else if is_alt(ev.code) {
-                alt_down = ev.pressed;
-            }
-        }
-        if physical
-            && aim_captured
-            && aim.mode_active
-            && ctrl_alt_chord(ev.code, ev.pressed && fresh_press, ctrl_down, alt_down)
-        {
-            aim.released = !aim.released;
-        }
-
-        // 空闲(≥3 秒没有任何按键)之后的第一批按键:顺手请界面重新确认一次坐标空间。
-        // 用户常见操作就是"切到别的窗口待一会儿再回来打" —— 这期间手机可能已经转屏,
-        // 而坐标空间只在开映射/截图/连接时才更新。不确认的话触点会落在错的地方,
-        // 表现同样是"按键不反应",还很难查(以前只能靠关一次开一次映射来碰运气)。
-        {
-            let idle = last_key_at
-                .map(|t| t.elapsed() >= Duration::from_secs(3))
-                .unwrap_or(false);
-            last_key_at = Some(Instant::now());
-            if idle {
-                pending_space_recheck = true;
-            }
+        // 空闲(≥ [`SPACE_RECHECK_IDLE`] 没有任何按键/鼠标位移)之后的第一批输入:
+        // 顺手请界面重新确认一次坐标空间。用户常见操作就是"切到别的窗口待一会儿
+        // 再回来打" —— 这期间手机可能已经转屏,而坐标空间只在开映射/截图/连接时
+        // 才更新。不确认的话触点会落在错的地方,表现同样是"按键不反应",还很难查
+        // (以前只能靠关一次开一次映射来碰运气)。
+        if space_recheck_due(&mut last_activity_at, Instant::now(), SPACE_RECHECK_IDLE) {
+            pending_space_recheck = true;
         }
 
         // 总开关键:任何时候都生效,但只在**按下的那一瞬间**翻转一次。
@@ -3777,10 +4897,13 @@ pub fn run(
                 // 关闭时释放所有按下中的触点与系统键,并停用全部临时轮盘
                 // (与顶栏按钮共用同一份实现,两条路径行为必须完全一致)
                 //
-                // release_fps:false(D3=A,2026-10-06 用户拍板):FPS 专用触点
-                // **不在这里**释放,而是由下一次事件走 fps_needs_release 分支
-                // 收口(那里才拿得到瞄准上下文)。FPS 瞄准中直接关映射时,
-                // 触点会在下一次任意按键/鼠标事件时被抬掉。
+                // release_fps:false(D3=A,2026-10-06 用户拍板):FPS **专用键位**的
+                // 触点不在这里释放,而是由下一次事件走 fps_needs_release 分支
+                // 收口(那里才拿得到瞄准上下文)。
+                // ⚠ 2026-10-11 修正:上面这句原来把**瞄准触点**也归进了"不在这里
+                // 释放",而那条兜底对瞄准并不成立(`fps_mode_active` 不认总映射
+                // 开关,关映射后 fps_needs_release 永远为假)—— 瞄准触点现在由
+                // `release_all` 无条件抬起。
                 let ctl = g.control.take();
                 let screen = ctl
                     .as_ref()
@@ -3805,8 +4928,6 @@ pub fn run(
                 );
                 g.control = ctl;
             } else {
-                // 每次重新开打都恢复捕获,避免上一局的"交还鼠标"状态带过来
-                aim.released = false;
                 // 重新开打时按**物理按键状态**对账一遍:用户此刻按住不放的键
                 // 立刻生效,而不是要松手再按一次(关映射时全部触点都被抬起了)
                 if let Some(ctl) = g.control.as_ref() {
@@ -4244,28 +5365,33 @@ fn dispatch_input(d: &mut Dispatch<'_>) -> bool {
     // 用户 2026-10-10(第 3 条):这一段整体提到"缩放判据"**之前** ——
     // 以前换档裹在 `wheel_zoom_dir`(要求 FPS 模式 + 开了滚轮缩放)里面,
     // 于是关掉滚轮缩放就没法换档。现在换档只看补偿自己的配置。
+    //
+    // 用户 2026-10-11(口径纠正):**勾选[滚轮换档]就由它接管滚轮** ——
+    // 不再要求"触发键 / 挡位切换键按住期间"(那条旧口径下,用户勾了框却
+    // 以为滚轮坏了)。判定条件见下面的 `recoil_takes_wheel`。
     if ev.code == BTN_WHEEL_UP || ev.code == BTN_WHEEL_DOWN {
         let dir = if ev.code == BTN_WHEEL_UP { 1.0 } else { -1.0 };
-        // ---- 压枪换档(V2-1 + 2026-10-10):触发键 / 挡位切换键按住期间,
-        // 滚轮优先切换"控制强度" —— K2er 原文:"鼠标滚轮改变强度"。
-        // "补偿优先"的落点就是这里:两者会同时想用滚轮时,补偿先拿走。
+        // ---- 压枪换档(V2-1 + 2026-10-11) ----
+        // 接管条件(全部满足才接管,否则滚轮**原样退回**缩放/普通绑定):
+        //   ① FPS 模式生效中(`fps_active`)—— 和缩放同一条门槛;
+        //   ② 压枪启用(`enabled`);
+        //   ③ 勾了[滚轮换档](`wheel_switch`);
+        //   ④ 至少**两个"参与换档"的档位**(`gear_wheel`,缺省/越界按 true)。
+        // 第 ④ 条:只剩一个参与档位时"换档"没有落点,接管只会把缩放吃掉,
+        // 所以退回缩放(界面上有对应提示)。一个都没勾选 → 一律不接管。
+        // 换档只在参与档位之间跳(上滚 = 向后一档,下滚 = 向前一档,环绕)。
         let r = &profile.aim.recoil;
-        let gear_held = key_set_down(&r.trigger_key, &held) || key_set_down(&r.switch_key, &held);
-        let recoil_takes_wheel = r.enabled && r.wheel_switch && r.strengths.len() >= 2 && gear_held;
+        let recoil_takes_wheel =
+            fps_active && r.enabled && r.wheel_switch && r.wheel_gear_count() >= 2;
         if recoil_takes_wheel {
             if fresh_press {
                 let n = r.strengths.len();
                 let i = aim_st.recoil_index.min(n - 1);
-                aim_st.recoil_index = if dir > 0.0 {
-                    (i + 1) % n
-                } else {
-                    (i + n - 1) % n
-                };
-                *pending_notice = Some(format!(
-                    "后坐力补偿:控制强度切换到第 {} 档({})",
-                    aim_st.recoil_index + 1,
-                    r.strengths[aim_st.recoil_index]
-                ));
+                let step = if dir > 0.0 { 1 } else { -1 };
+                if let Some(next) = r.step_gear(i, step) {
+                    aim_st.recoil_index = next;
+                    *pending_notice = Some(format!("后坐力补偿:已切到{}", r.gear_display(next)));
+                }
             }
             return true;
         }
@@ -4316,6 +5442,8 @@ fn dispatch_input(d: &mut Dispatch<'_>) -> bool {
             idx,
             bind_pid(idx),
             BindLane::Normal,
+            held,
+            None,
             &mut macro_exec_seq,
             fresh_press,
             &ev,
@@ -4484,7 +5612,16 @@ fn apply_scheme_switch(
 /// 避免旧排程把新一撃提前抬起。
 fn cancel_up_for(pid: u64, scheduled: &mut Vec<(Instant, SchedAct)>) {
     let target = pid;
-    scheduled.retain(|(_, act)| !matches!(act, SchedAct::Up { pid: p, .. } if *p == target));
+    // **连点的 ReDown 必须一起清**(用户 2026-10-13,V2-2):
+    // 只清 `Up` 的话,松键后那些还没到点的 `ReDown` 仍会落指 ——
+    // 而它们的配对 `Up` 已被清掉 ⇒ 设备端留下一根**永远不抬**的手指
+    // (表现就是"松键后一直按着")。这正是"松键立刻停"的实现点。
+    scheduled.retain(|(_, act)| {
+        !matches!(
+            act,
+            SchedAct::Up { pid: p, .. } | SchedAct::ReDown { pid: p, .. } if *p == target
+        )
+    });
 }
 
 /// 取消尚未执行的 FPS 专用点按/滑动排程。
@@ -4508,6 +5645,9 @@ fn cancel_combo_scheduled(scheduled: &mut Vec<(Instant, SchedAct)>) {
             lane: BindLane::Combo,
             ..
         } => false,
+        // 组合键的「长按重复」下一轮同样属于组合车道:关掉组合键 / 关映射之后
+        // 绝不该再重跑一轮(判据只看 `Held`,而用户的手可能还按着)。
+        SchedAct::ComboRedispatch { .. } => false,
         SchedAct::Move { pid, .. }
             if (COMBO_PID_BASE..COMBO_PID_BASE + COMBO_PID_SPAN).contains(pid) =>
         {
@@ -4550,6 +5690,24 @@ fn cancel_macro_scheduled(
                 | SchedAct::MacroWheel { .. }
                 | SchedAct::MacroClick { .. }
                 | SchedAct::MacroMove { .. }
+        )
+    });
+}
+
+/// 作废「长按重复」还没到期的**下一轮**(关映射 / 断连 / 捕获层退出时调用)。
+///
+/// 为什么非作废不可:循环的判据是"触发键此刻仍按着"([`Held`]),而关映射时
+/// 用户的手往往还按着 —— 那一轮到点会照旧重跑一条宏、再排下下轮,用户却已经
+/// 明确关掉了映射。作废的只是**循环的下一轮**:已经排好的这一轮动作由
+/// [`cancel_macro_scheduled`] 按运行表清掉(宏触点/系统键都抬干净)。
+///
+/// **不碰** [`SchedAct::Redispatch`]:那是"用户已经按下的那一次,冷却没过先扣住",
+/// 作废它等于吞掉一次真实输入(既有语义,不动)。
+fn cancel_repeat_scheduled(scheduled: &mut Vec<(Instant, SchedAct)>) {
+    scheduled.retain(|(_, act)| {
+        !matches!(
+            act,
+            SchedAct::ComboRedispatch { .. } | SchedAct::RepeatRedispatch { .. }
         )
     });
 }
@@ -4681,6 +5839,7 @@ fn deactivate_wheel(ctl: &ControlClient, m: &Mapper, j: usize, w: &Wheel, st: &m
         ctl.touch_move(pid, cx, cy);
         ctl.touch_up(pid, cx, cy);
         st.down = false;
+        st.down_unconfirmed = false;
     }
 }
 
@@ -4796,12 +5955,70 @@ fn release_combo_binds(
     fingers.free_all();
 }
 
+/// 「长按重复」的**触发条件**(用户 2026-10-11 第 2 条):循环排下一轮之前要
+/// 重新核对"触发处此刻还按着没有"。两种触发处在这一层就分开了 ——
+///
+///   * [`Self::Key`]:**键位**触发(宏/普通绑定那一行走 `handle_bind_event`),
+///     判据是那根物理键仍在 [`Held`] 里;宏自己的 `repeat_while_held` 为真时
+///     由宏分支直接构造它。
+///   * [`Self::Set`]:**组合键**触发(走 `handle_combo_event`),判据是
+///     `key_set_down` —— 整组键都还按着,松开任一成员立刻不成立。
+///
+/// 组合这一份由 [`handle_combo_event`] 传进来,同时也是"触发处唯一"的落点:
+/// 组合的动作即使是也开了长按重复的宏,也不会再排第二份循环。
+#[derive(Clone, Copy)]
+enum RepeatKeys<'a> {
+    Key(u16),
+    Set(&'a [u16]),
+}
+
+impl RepeatKeys<'_> {
+    /// 触发处此刻还按着没有。
+    fn still_held(&self, held: &Held) -> bool {
+        match self {
+            Self::Key(code) => held.has(*code),
+            // 与 [`key_set_down`] 同口径:`KeySet::all_held_by` 对空集合也给 `true`,
+            // 而"整组键都按着"绝不能把"一个成员都没有"算成按着 —— 组合键构造时
+            // 至少两个成员,这里是同一道守卫。
+            Self::Set(keys) => !keys.is_empty() && keys.iter().all(|k| held.has(*k)),
+        }
+    }
+}
+
+/// 「长按重复」两轮之间的间隔(ms):**用触发处自己那一条的「按后延迟」**,
+/// 并且与冷却完全是同一条口径 —— [`Profile::tail_delay_enabled`] 总开关关着时
+/// 一律按 0 处理(数值原样留着,打开开关立刻生效)。
+fn repeat_gap_ms(profile: &Profile, tail_delay_ms: u32) -> u64 {
+    if profile.tail_delay_enabled {
+        tail_delay_ms as u64
+    } else {
+        0
+    }
+}
+
+/// 排一个「长按重复」的下一轮。
+///
+/// 为什么不做任何排序:主循环对**同一时刻**的动作严格按入队顺序执行(见到期
+/// 动作收集处的说明),而这里只是把新循环**追加**到队尾 —— 同刻时它天然排在
+/// 已有动作之后;调用方给的 `at` 又严格晚于那一轮已排出的最后一个动作
+/// (见 [`repeat_next_round_at`]),所以连"同刻"都不会发生。
+///
+/// 刻意**不在这里遍历 `scheduled` 做防御性断言**:这是热路径,一次遍历就是
+/// 一次 O(队列长度) 的开销,而"严格晚于"是调用方算出来的、不是猜的。
+///
+/// 每次只排**下一轮**(绝不一次排 N 轮):`scheduled` 的增长与"用户还按着多久"
+/// 无关,一个待跑的循环最多占一格。
+fn schedule_repeat_after(scheduled: &mut Vec<(Instant, SchedAct)>, at: Instant, act: SchedAct) {
+    scheduled.push((at, act));
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_combo_event(
     ctl: &ControlClient,
     m: &Mapper,
     combo: &KeyCombo,
     profile: &Profile,
+    held: &Held,
     macro_exec: &mut u64,
     index: usize,
     pressed: bool,
@@ -4817,21 +6034,77 @@ fn handle_combo_event(
         key: virtual_code,
         action: combo.action.clone(),
         fps_only: combo.fps_only,
-        // 组合键的「按后延迟」跟着组合自己走(用户 2026-10-10 第 2 条)
+        // 组合键的「按后延迟」跟着组合自己走(用户 2026-10-10 第 2 条);
+        // 长按重复打开时它同时是两轮之间的间隔。
         tail_delay_ms: combo.tail_delay_ms,
     };
+    handle_combo_event_with(
+        ctl,
+        m,
+        &bind,
+        combo.keys.as_slice(),
+        combo.repeat_while_held,
+        profile,
+        held,
+        macro_exec,
+        index,
+        pressed,
+        fingers,
+        active_android_keys,
+        scheduled,
+        reserved,
+        live,
+        gates,
+    )
+}
+
+/// [`handle_combo_event`] 的可复用主体:组合的成员键与"这一组开没开长按重复"由
+/// 调用方给(真组合键、以及**虚拟层的组合**都用它)。
+///
+/// 「长按重复」的触发处在这里一锤定音(用户 2026-10-11 第 2 条):
+///
+///   * 组合**自己**开了这一项 → 循环归组合,`repeat_trigger` 就是整组成员键
+///     (动作哪怕是也开了这一项的宏也不再排第二份 —— 触发处唯一);
+///   * 组合没开、但**动作那条宏自己**开了 → 循环归宏,判据换成"整组键还按着"
+///     ([`RepeatKeys::Set`])。不能留给宏那一支用 [`RepeatKeys::Key`]:宏在组合
+///     车道里看到的是**虚拟码**,而 [`Held`] 里从来不会有虚拟码 —— 那样这一项
+///     会静默失效。
+///   * 两边都没开 → 不排循环。
+#[allow(clippy::too_many_arguments)]
+fn handle_combo_event_with(
+    ctl: &ControlClient,
+    m: &Mapper,
+    bind: &KeyBind,
+    keys: &[u16],
+    combo_repeat: bool,
+    profile: &Profile,
+    held: &Held,
+    macro_exec: &mut u64,
+    index: usize,
+    pressed: bool,
+    fingers: &mut Fingers,
+    active_android_keys: &mut HashSet<u16>,
+    scheduled: &mut Vec<(Instant, SchedAct)>,
+    reserved: usize,
+    live: &mut EngineLive,
+    gates: &mut PressGates,
+) -> Option<(u16, RefuseReason)> {
+    let macro_wants_repeat = matches!(&bind.action, Action::Macro(mac) if mac.repeat_while_held);
+    let repeat_trigger = (combo_repeat || macro_wants_repeat).then_some(RepeatKeys::Set(keys));
     handle_bind_event(
         ctl,
         m,
         profile,
-        &bind,
+        bind,
         index,
         combo_pid(index),
         BindLane::Combo,
+        held,
+        repeat_trigger,
         macro_exec,
         pressed,
         &CaptureKey {
-            code: virtual_code,
+            code: bind.key,
             pressed,
         },
         fingers,
@@ -4900,6 +6173,11 @@ fn handle_bind_event(
     idx: usize,
     pid: u64,
     lane: BindLane,
+    // 物理按键真值:长按重复每排下一轮之前要重新核对触发处还按着没有。
+    held: &Held,
+    // 「长按重复」的触发处(用户 2026-10-11 第 2 条):`Some` = **触发这次动作的
+    // 是组合键那一份**(即使动作是宏),`None` = 由这一条键位/宏自己那份决定。
+    repeat_trigger: Option<RepeatKeys<'_>>,
     // 宏执行实例号(每次触发自增,给 [`MacroPlan`] 分配独立 pid 段)。
     macro_exec: &mut u64,
     fresh_press: bool,
@@ -4929,30 +6207,72 @@ fn handle_bind_event(
         BindLane::Combo => gates.combo_gate(idx),
         BindLane::Normal | BindLane::Fps => gates.bind_gate(idx),
     };
+    // 「按后延迟」的**自动重复闸门**(用户 2026-10-11 第 2 条):按住不放时 Windows
+    // 会连发 `KEYDOWN`,下面那条"扣住一次、到点补捉"的规则本是为**单次**按下设计的
+    // (用户 2026-10-11 第 1 条)。可长按重复自己就会一轮接一轮地排,再叠一层补捉就是
+    // **两份循环** —— 而且补捉那一份还会把间隔从"这一条的按后延迟"变成
+    // "Windows 自动重复间隔 + 按后延迟"。所以:这一条只要**由长按重复接管**
+    // (键位/宏自己开着,或触发处是开着这一项的宏/组合键),自动重复的 KEYDOWN
+    // 就整条放行到下面按老规矩处理 —— 各动作分支的 `fresh_press` 守卫会把它们丢掉,
+    // 既不重复触发、也不排队补捉。**只在"还按着同一个键"时这样**(`held.has(bind.key)`,
+    // 与循环自己的判据同一份口径):这判据让"冷却里按下的新一次按下"照旧被扣住补捉。
+    // 组合车道的 `bind.key` 是**虚拟码**、永远不在 `Held` 里,所以那里这道闸门恒不生效 ——
+    // 无妨:组合成员键的自动重复根本到不了这里,`ComboGate` 在 `active` 期间就把它们吞了。
+    let repeat_owned = repeat_trigger.is_some()
+        || match &bind.action {
+            Action::Macro(mac) => mac.repeat_while_held,
+            _ => false,
+        };
+    let auto_repeat_passes_through =
+        repeat_owned && !fresh_press && ev.pressed && held.has(bind.key);
     // `tail > 0` 这一条不能省:总开关是在**开着打**的时候被用户关掉的,表里会留着
     // 关之前挂上的冷却 —— 只看 `now < g` 的话,那些陈旧条目仍然会把之后每一次按下
     // 推迟几百毫秒,而用户以为"我已经把它关了"。冷却是否有效,以**此刻的 `tail`**
     // 为准,不以表里有没有残值为准。
+    //
+    // 判据是 `ev.pressed` 而**不是** `fresh_press`(用户 2026-10-11 第 1 条):按住不放
+    // 时 Windows 会连发 `KEYDOWN`(自动重复),它们到达时 `fresh_press = false` ——
+    // 旧实现让这些事件绕过冷却判定、再被各分支的 `if fresh_press` 守卫丢掉,等于
+    // "消息收了、既不执行也不补捉"。现在照收:**扣住**一格,到点再补捉执行。
+    // `ev.pressed` 保证抬起事件永远不走这条分支;长按重复接管时例外(见上)。
     if tail > 0
-        && fresh_press
+        && ev.pressed
+        && !auto_repeat_passes_through
         && let Some(g) = gate
         && now < g
     {
-        scheduled.push((
-            g,
-            SchedAct::Redispatch {
-                idx,
-                lane,
-                code: bind.key,
-            },
-        ));
+        // 只有原本空着的那一次才排程:自动重复的后续每一发都只是"再确认一次
+        // 这次按下还扣着",不会各排一条 —— 去重天然成立,不必回头翻 `scheduled`。
+        if gates.latch(lane, idx, bind.key) {
+            scheduled.push((
+                g,
+                SchedAct::Redispatch {
+                    idx,
+                    lane,
+                    code: bind.key,
+                },
+            ));
+        }
         return None;
     }
     // 把这条的冷却推到 `until`(只往后推,不提前)。
     let mut hold_until: Option<Instant> = None;
+    // 长按重复:下一个循环排在这一刻(见各分支末尾的"排下一轮")。
+    let mut repeat_at: Option<Instant> = None;
+    // 这一轮**跑完**的时点(不加间隔);组合键的非宏动作在排程处直接给。
+    let mut repeat_end: Option<Instant> = None;
+    // 两轮之间的间隔用**触发处自己那一条**的「按后延迟」(见 `repeat_gap_ms`)。
+    let mut repeat_tail: u32 = bind.tail_delay_ms;
+    // 组合键的触发条件先算出来:不管它的动作是宏(下面那一支)还是别的(分支里
+    // 排完这一轮也算出结束时刻),判据都是"整组键还按着"。
+    let combo_repeat = repeat_trigger.filter(|keys| keys.still_held(held));
     match &bind.action {
         Action::Tap {
-            x, y, duration_ms, ..
+            x,
+            y,
+            duration_ms,
+            repeat_interval_ms,
+            ..
         } => {
             let (px, py) = m.point(*x, *y);
             if *duration_ms == 0 {
@@ -4977,7 +6297,8 @@ fn handle_bind_event(
                 }
                 if fingers.try_down(idx, reserved) {
                     ctl.touch_down(pid, px, py);
-                    let up_at = now + Duration::from_millis((*duration_ms as u64).max(MIN_TAP_MS));
+                    let tap_ms = (*duration_ms as u64).max(MIN_TAP_MS);
+                    let up_at = now + Duration::from_millis(tap_ms);
                     scheduled.push((
                         up_at,
                         SchedAct::Up {
@@ -4987,12 +6308,57 @@ fn handle_bind_event(
                             lane,
                         },
                     ));
+                    // ---- 连点(用户 2026-10-13,V2-2) ----
+                    // `repeat_interval_ms > 0` 时:按住期间每隔这么久再点一次。
+                    //
+                    // **必须用普通 lane 的 `ReDown`/`Up`(不是 `MacroClick`)**:
+                    // `MacroClick` 走的是**宏自己的 lane 与运行表**(`macro_down`),
+                    // 而连点属于**普通键位** —— 用错会把触点记到宏的账上,
+                    // 执行时因为"宏的运行表里没有这个 pid"而拒绝抬起
+                    // (实测:`down 1 up 0`,连点一次都没生效 —— 被 sim 测试抓出)。
+                    //
+                    // 排程一次性展开,每击自带配对的抬起 ⇒ 不会留下"只按不抬"。
+                    // 松键时由 `cancel_repeat_scheduled` 统一清掉未执行的排程。
+                    if *repeat_interval_ms > 0 {
+                        // 间隔必须**大于**单次按住时长,否则下一击的按下会落在
+                        // 上一击还没抬起的时候(点击互相叠住)。
+                        let interval = (*repeat_interval_ms as u64).max(tap_ms + 1);
+                        // 上限 64 击:远超人手按住时长能触发的数量,且保证排程向量
+                        // 有界(不会因为一次按键就撑爆内存)。
+                        const MAX_REPEAT_BURST: u64 = 64;
+                        let mut t = up_at;
+                        for _ in 0..MAX_REPEAT_BURST {
+                            t += Duration::from_millis(interval);
+                            scheduled.push((t, SchedAct::ReDown { pid, x: px, y: py }));
+                            scheduled.push((
+                                t + Duration::from_millis(tap_ms),
+                                SchedAct::Up {
+                                    pid,
+                                    x: px,
+                                    y: py,
+                                    lane,
+                                },
+                            ));
+                        }
+                    }
                     // 冷却从"这一下抬起"开始算 —— 也就是按住时长跑完之后。
                     hold_until = Some(up_at + Duration::from_millis(tail));
                 } else {
                     let reason = down_failure_reason(fingers, idx);
                     refuse(live, bind.key, reason);
                     return Some((bind.key, reason));
+                }
+            } else if *repeat_interval_ms > 0 {
+                // ---- 连点:松键立刻停(用户 2026-10-13,V2-2) ----
+                // 连点是"按住期间才点"的行为,所以物理键一抬起来就必须把
+                // **还没到点**的那些排程全部清掉。不清的话它们会继续落指,
+                // 而配对的抬起仍在 ⇒ 表现为"松手后还在自己点"。
+                //
+                // 清的是同一 pid 的 `Up` + `ReDown`(见 `cancel_up_for`)。
+                // 注意:这里**不碰** `fingers` 的按下状态 —— 首击的抬起由上面
+                // 那个已排的 `Up` 负责,它到点会正常 release。
+                if !ev.pressed {
+                    cancel_up_for(pid, scheduled);
                 }
             }
         }
@@ -5018,23 +6384,59 @@ fn handle_bind_event(
         Action::Swipe(s) => {
             if fresh_press {
                 if fingers.try_down(idx, reserved) {
-                    let points = swipe_points(
-                        s.path,
-                        m.point(s.start.0, s.start.1),
-                        m.point(s.end.0, s.end.1),
-                        SWIPE_SAMPLES,
-                    );
+                    // ---- 轨迹录制优先(用户 2026-10-13,V2-2) ----
+                    // 有 `recorded_points` 就按**用户录制的真实轨迹**走:
+                    // 逐点换算成设备像素,时间轴按**点间距离占比**分配总时长
+                    // (见 `Swipe::point_timeline_ms` 的理由:等分会让慢速段
+                    // 看起来突然加速)。没有则走既有的"起点→终点 + 路径采样"
+                    // —— 那条路**一个字节都没改**。
+                    let points: Vec<(i32, i32)> = if s.recorded_points.len() >= 2 {
+                        s.recorded_points
+                            .iter()
+                            .map(|(x, y)| m.point(*x, *y))
+                            .collect()
+                    } else {
+                        swipe_points(
+                            s.path,
+                            m.point(s.start.0, s.start.1),
+                            m.point(s.end.0, s.end.1),
+                            SWIPE_SAMPLES,
+                        )
+                    };
                     if points.len() >= 2 {
                         let (x0, y0) = points[0];
                         ctl.touch_down(pid, x0, y0);
-                        scheduled.extend(plan_swipe(
-                            now,
-                            pid,
-                            lane,
-                            &points,
-                            s.duration_ms as u64,
-                            s.easing,
-                        ));
+                        if s.recorded_points.len() >= 2 {
+                            // 轨迹:按真实点与它们的时间轴排程
+                            let times = s.point_timeline_ms();
+                            for (k, &(px, py)) in points.iter().enumerate().skip(1) {
+                                let t_ms = times.get(k).copied().unwrap_or(s.duration_ms);
+                                scheduled.push((
+                                    now + Duration::from_millis(t_ms as u64),
+                                    SchedAct::Move { pid, x: px, y: py },
+                                ));
+                            }
+                            // 收尾抬起(轨迹末点之后)
+                            let last = points[points.len() - 1];
+                            scheduled.push((
+                                now + Duration::from_millis(s.duration_ms as u64),
+                                SchedAct::Up {
+                                    pid,
+                                    x: last.0,
+                                    y: last.1,
+                                    lane,
+                                },
+                            ));
+                        } else {
+                            scheduled.extend(plan_swipe(
+                                now,
+                                pid,
+                                lane,
+                                &points,
+                                s.duration_ms as u64,
+                                s.easing,
+                            ));
+                        }
                         // 滑动走完 + 冷却,才允许下一次按下("连续划动时相互干扰")
                         hold_until = Some(
                             now + Duration::from_millis(s.duration_ms as u64)
@@ -5070,13 +6472,71 @@ fn handle_bind_event(
             if fresh_press {
                 let exec = *macro_exec;
                 *macro_exec = exec.wrapping_add(1);
-                let total =
+                let span =
                     schedule_macro(mac, profile, m, now, scheduled, &mut MacroPlan::new(exec));
+                // 「长按重复」的触发处(用户 2026-10-11 第 2 条)**只有一处**:
+                //   * 组合键那一份(`repeat_trigger`)优先 —— 组合打开这一项、
+                //     它的动作又是也开着这一项的宏时,循环仍归组合,不排两份;
+                //   * 否则看宏自己的 `repeat_while_held`(触发处 = 这条键位)。
+                let owner = repeat_trigger
+                    .or_else(|| mac.repeat_while_held.then_some(RepeatKeys::Key(bind.key)));
+                // 松手后就**不再排下一轮**,但正在跑的这一轮照旧跑完 ——
+                // 设备端因此不会留下"只按不抬"的触点。
+                if owner.is_some_and(|keys| keys.still_held(held)) {
+                    repeat_end = Some(span.end);
+                    repeat_tail = bind.tail_delay_ms;
+                }
                 // 整条宏走完(它自己排程出来的总时长)再等 `tail`:宏的每一步
-                // 都不会被"下一次按下"打断。
-                hold_until = Some(now + Duration::from_millis(total) + Duration::from_millis(tail));
+                // 都不会被"下一次按下"打断。长按重复打开时照旧挂 —— 之后用户
+                // 松开再按时,这一次的「按后延迟」应当和没有循环时一模一样。
+                hold_until =
+                    Some(now + Duration::from_millis(span.total) + Duration::from_millis(tail));
             }
         }
+    }
+    // 组合键触发、动作不是宏(宏那一支在上面自己算好了结束时点):这一轮是
+    // "按下 → 自包含地跑完"的一次性动作,结束时刻就是按下那一刻 + 它的时长。
+    // 点按/滑动各自排了抬起,状态型(Hold/系统键)本来就要等松手 —— 这里给的是
+    // "这一轮排完"的时点,重跑一次与用户重新按一下同义。
+    if combo_repeat.is_some() && !matches!(bind.action, Action::Macro(_)) && fresh_press {
+        let dur = match &bind.action {
+            Action::Tap { duration_ms, .. } => (*duration_ms).max(MIN_TAP_MS as u32) as u64,
+            Action::Swipe(s) => (s.duration_ms as u64).max(MACRO_SWIPE_MIN_MS as u64),
+            // 长按/系统键按住期间一直生效,循环没有意义 —— 抬起仍按老规矩收尾。
+            Action::Hold { .. } | Action::AndroidKey { .. } => 0,
+            Action::Macro(_) => 0,
+        };
+        if dur > 0 {
+            repeat_end = Some(now + Duration::from_millis(dur));
+        }
+    }
+    if let Some(end) = repeat_end {
+        repeat_at = Some(repeat_next_round_at(
+            end,
+            repeat_gap_ms(profile, repeat_tail),
+        ));
+    }
+    // 长按重复的下一轮:排在"这一轮最后一个动作之后 + 间隔"。
+    // 用 [`SchedAct::ComboRedispatch`] 到点**重新走一遍触发路径**(组合键那一份),
+    // 键位/宏那一份走 [`SchedAct::RepeatRedispatch`] —— 两者都由同一条
+    // `handle_bind_event` 重新判定"还按着没有",所以幂等天然成立:
+    // 一个下标同一时刻只有一个待跑循环。两者都与 [`SchedAct::Redispatch`] 分开,
+    // 是为了让"关映射/断连"能只作废循环、不吞掉被扣住的真实按下
+    // (见 [`cancel_repeat_scheduled`])。
+    if let Some(at) = repeat_at {
+        let act = match repeat_trigger {
+            Some(_) => SchedAct::ComboRedispatch {
+                idx,
+                lane,
+                code: bind.key,
+            },
+            None => SchedAct::RepeatRedispatch {
+                idx,
+                lane,
+                code: bind.key,
+            },
+        };
+        schedule_repeat_after(scheduled, at, act);
     }
     // `tail == 0`(功能没开、或这一条自己填 0)时**根本不往表里写**:写一个"此刻"
     // 进去虽然也拦不住任何东西(`now < now` 恒假),但会让 `bind_gate()` 谎报
@@ -5103,6 +6563,11 @@ fn handle_bind_event(
 /// 补发走的是与正常按下**完全相同**的那条路径(同一个 `handle_bind_event` /
 /// `handle_combo_event`,同样 `fresh_press = true`),所以触点池预算、宏排程、
 /// 以及"下一次冷却"全部按正常规则重新算一遍。
+///
+/// 入口处**先取走闩锁**(用户 2026-10-11 第 1 条):无论后面两道守卫是否放行,
+/// 那一格都必须空出来 —— 否则"到点时用户已经松手"这种最常见的情形会把闩锁
+/// 永久留在表里,之后同一条键位再被冷却挡下时就会被误判成"已经扣着一次了"
+/// 而永远排不上补发(等于这条键位的「按后延迟」彻底失效)。
 #[allow(clippy::too_many_arguments)]
 fn redispatch_press(
     ctl: &ControlClient,
@@ -5124,6 +6589,9 @@ fn redispatch_press(
     live: &mut EngineLive,
     gates: &mut PressGates,
 ) {
+    // 先清闩锁(见函数头的说明):后面每一条 `return` 都是一条"这次不补"的出路,
+    // 它们绝不能把闩锁留在表里。
+    let _ = gates.take_latch(lane, idx);
     match lane {
         BindLane::Combo => {
             let Some(combo) = profile.combos.get(idx).cloned() else {
@@ -5134,6 +6602,7 @@ fn redispatch_press(
                 m,
                 &combo,
                 profile,
+                held,
                 macro_exec,
                 idx,
                 true,
@@ -5174,6 +6643,8 @@ fn redispatch_press(
                 idx,
                 pid,
                 lane,
+                held,
+                None,
                 macro_exec,
                 true,
                 &CaptureKey {
@@ -5281,6 +6752,27 @@ impl MacroEmit<'_> {
     }
 }
 
+/// 下一轮最早可以在哪一刻开始:`end + gap` 再让出 [`REPEAT_ROUND_MARGIN_MS`],
+/// 因此**严格晚于** `end`(即使 gap = 0 也一样)。
+///
+/// 多让的这一毫秒是必要的:同刻动作按入队顺序执行,而下一轮是**后**追加进去的,
+/// 真让它在同一刻跑就会排到收尾的"兜底抬起"**后面** —— 于是那一抬会把下一轮的
+/// 按下一并抬掉(设备端看到的是"按了一下立刻松")。
+fn repeat_next_round_at(end: Instant, gap_ms: u64) -> Instant {
+    end + Duration::from_millis(gap_ms) + Duration::from_millis(REPEAT_ROUND_MARGIN_MS)
+}
+
+/// 一次宏展开占用的时间与"最后一个动作"的位置(「长按重复」要用它接下一轮)。
+///
+///   * `total` = 宏相对 `start` 占用的时长(与旧返回值同一口径:intrinsic,不是墙钟)。
+///   * `end` = 排出去的**最后一个动作**发生的墙钟时刻。宏的收尾"兜底抬起"
+///     就排在这里,所以它就是"这一轮跑完"的时点。
+#[derive(Clone, Copy)]
+struct MacroSpan {
+    total: u64,
+    end: Instant,
+}
+
 /// 把一条宏展开为定时动作(W2-8 重建 —— "录制什么、释放什么")。
 ///
 /// 录制步骤 = 照录制时间轴逐条重放:按下分配触点号落指、抬起抬指,时间差
@@ -5297,15 +6789,18 @@ fn schedule_macro(
     start: Instant,
     scheduled: &mut Vec<(Instant, SchedAct)>,
     plan: &mut MacroPlan,
-) -> u64 {
+) -> MacroSpan {
     let mut emit = MacroEmit {
         scheduled,
         pending: Vec::new(),
         seq: 0,
     };
-    let total = schedule_macro_into(mac, live_profile, None, m, start, &mut emit, plan);
+    // 只展开**一轮**。「长按重复」的"下一轮"由触发处(见 `handle_bind_event`)按
+    // "跑完 + 间隔"再排 —— 只有那里知道触发键此刻还按着没有,也就只有那里能
+    // 停下循环;`scheduled` 因此一次最多多出一格。
+    let span = schedule_macro_into(mac, live_profile, None, m, start, &mut emit, plan);
     emit.flush();
-    total
+    span
 }
 
 /// [`schedule_macro`] 的递归主体;返回宏相对 `start` 占用的时长(嵌套宏用)。
@@ -5320,13 +6815,15 @@ fn schedule_macro_into(
     start: Instant,
     emit: &mut MacroEmit,
     plan: &mut MacroPlan,
-) -> u64 {
+) -> MacroSpan {
     let virtual_ctx = mac.virtual_profile.as_deref().or(inherited_virtual);
     let vp = virtual_ctx.unwrap_or(live_profile);
     // 只有当前配置里的"活轮盘"才能被按下/抬起持续驱动;虚拟层的轮盘在设备上
     // 并不存在,按方向展开成一次推离手势。
     let live_wheels = virtual_ctx.is_none();
     let mut cursor = 0u64;
+    // 收尾"兜底抬起"的时点(只在这一轮真排了抬起时才记)。
+    let mut last_act_at: Option<Instant> = None;
 
     // 预扫描:每次按下对应的录制抬起时刻 —— 自包含手势(虚拟层/滑动绑定)
     // 用它当手势时长;录制里没等到抬起的按下,在宏结尾兜底抬起。
@@ -5557,9 +7054,12 @@ fn schedule_macro_into(
                 cursor = cursor.saturating_add(dur);
             }
             MacroInstruction::Macro { action, .. } => {
+                // 嵌套宏只按**自身时长**接着排,不带"长按重复"的语义:循环是
+                // 触发处的概念(见 `schedule_macro` 的说明),子宏开没开那一项
+                // 都不该在这里多排第二轮 —— 否则一条宏能把自己变成无限循环。
                 let nested =
                     schedule_macro_into(action, live_profile, virtual_ctx, m, at, emit, plan);
-                cursor = cursor.saturating_add(nested);
+                cursor = cursor.saturating_add(nested.total);
             }
         }
     }
@@ -5570,10 +7070,24 @@ fn schedule_macro_into(
     let at_end = start + Duration::from_millis(cursor);
     let mut leftovers: Vec<(u16, MacroPending)> = pending.drain().collect();
     leftovers.sort_by_key(|(code, _)| *code); // 固定顺序,便于日志与测试复现
+    if !leftovers.is_empty() {
+        // 最后一个动作就是这一抬(下面的 `emit.pending` 里记的正是它)。
+        last_act_at = Some(at_end);
+    }
     for (_, p) in leftovers {
         release_pending(p, at_end, emit);
     }
-    cursor
+    // 宏的最后一个动作 = `emit` 里序号最大的那一个。**不直接用** `at_end`:
+    // 一个动作都没排的宏(空宏 / 纯 `Delay`)里它只是算术结果;这时"这一轮跑完"
+    // 就是展开结束的此刻,循环据此接着排。
+    let end = emit
+        .pending
+        .iter()
+        .max_by_key(|(t, s, _)| (*t, *s))
+        .map(|(t, _, _)| *t)
+        .or(last_act_at)
+        .unwrap_or(at_end);
+    MacroSpan { total: cursor, end }
 }
 
 /// 宏回放"按下"一步:按真实事件路径的优先级解析并排程(见 [`MacroResolve`])。
@@ -6316,6 +7830,8 @@ fn update_custom_wheel(
             ctl.touch_up(pid, cx, cy);
             st.down = false;
             st.sent_at = None;
+            // 释放点必须清补按标志(见 [`arm_down_unconfirmed`] 的说明)。
+            st.down_unconfirmed = false;
         }
         return false;
     }
@@ -6334,6 +7850,7 @@ fn update_custom_wheel(
             ctl.touch_up(pid, cx, cy);
             st.down = false;
             st.sent_at = None;
+            st.down_unconfirmed = false;
         }
         return false;
     };
@@ -6346,6 +7863,7 @@ fn update_custom_wheel(
     if !st.down {
         ctl.touch_down(pid, cx, cy);
         st.down = true;
+        arm_down_unconfirmed(st, reserved);
     }
     ctl.touch_move(pid, tx, ty);
     st.last = (tx, ty);
@@ -6476,6 +7994,9 @@ fn update_wheel(
             ctl.touch_up(pid, wx, wy);
             st.down = false;
             st.sent_at = None;
+            // 已经抬起来了,补按标志必须一起清 —— 否则下一步保活会"落指后立刻补按",
+            // 在设备上留下一根没有方向、也没人会抬的手指(DF-13)。
+            st.down_unconfirmed = false;
         }
         return false;
     }
@@ -6499,12 +8020,44 @@ fn update_wheel(
         ctl.touch_move(pid, tx, ty);
         st.down = true;
         st.sent_at = Some(Instant::now());
+        arm_down_unconfirmed(st, reserved);
     } else if st.last != (tx, ty) {
         ctl.touch_move(pid, tx, ty);
         st.sent_at = Some(Instant::now());
     }
     st.last = (tx, ty);
     false
+}
+
+/// 落指成功后按**本地预算**决定要不要挂上"未确认"标记(DF-13)。
+///
+/// 判据是"这一次落指之后,本地账上正好占满设备端十指池"(`reserved` 不含本触点,
+/// 所以是 `reserved + 1`):**只有这种情况**设备端有可能把那条 DOWN 丢掉。
+/// 正常情况(池子还有富余)恒为 `false` —— 行为与修复前逐字一致,零代价。
+///
+/// 被"池满"直接拒掉的那次落指**不走这里**(调用方在 `touch_down` 之前就返回了),
+/// 那种情况本地没有记成"按着",不需要补按。
+fn arm_down_unconfirmed(st: &mut WheelState, reserved: usize) {
+    st.down_unconfirmed = reserved + 1 >= DEVICE_MAX_POINTERS;
+    st.down_retries = 0;
+}
+
+/// 补一次"落指确认"(DF-13):`UP(上次落点) → DOWN(圆心) → MOVE(落点)`。
+///
+/// 为什么先抬:设备端十指池满时那条 DOWN 被丢了,但本地已经乐观地记成"按着"
+/// —— 若设备端其实**真的**按着(丢的不是 DOWN,而是别的指针),直接用同一个 pid
+/// 再 DOWN 一次会把老手指顶掉、留下位置错乱(见 `control.rs` 里"同 pid 不重复
+/// DOWN"的警告)。先抬一次既收掉可能存在的"幽灵槽位",也让后面的 DOWN 一定是
+/// 新的落指。圆心按落指时的同一口径重算(标准轮盘 = 几何中心,自定义/执行轮盘
+/// = 配置圆心),两者都钳屏 —— 就是 [`wheel_center_px`]。
+fn confirm_wheel_down(ctl: &ControlClient, m: &Mapper, j: usize, w: &Wheel, st: &mut WheelState) {
+    let pid = wheel_pid(j);
+    let (cx, cy) = wheel_center_px(m, w);
+    let (lx, ly) = st.last;
+    ctl.touch_up(pid, lx, ly);
+    ctl.touch_down(pid, cx, cy);
+    ctl.touch_move(pid, lx, ly);
+    st.sent_at = Some(Instant::now());
 }
 
 /// 轮盘保活周期(见 [`wheel_keepalive`])。
@@ -6549,6 +8102,16 @@ fn wheel_keepalive(
             if !keepalive_due(wheels[j].sent_at, now) {
                 continue;
             }
+            // ---- 落指没得到确认:补一套 UP → DOWN → MOVE(DF-13) ----
+            // 本地预算在落指时就告诉我们"这次很可能被设备端丢了"(见
+            // [`arm_down_unconfirmed`])。不补的话手指永远停在圆心:用户推了没反应,
+            // 换个方向又"好"了(那次方向变化会走去重后的 update_wheel,重新按)。
+            // 补过一次就清标志 —— 同一次落指最多补一次,100ms 的节拍天然限流。
+            if std::mem::take(&mut wheels[j].down_unconfirmed) {
+                confirm_wheel_down(ctl, m, j, w, &mut wheels[j]);
+                wheels[j].down_retries += 1;
+                continue;
+            }
             let (x, y) = wheels[j].last;
             ctl.touch_move(wheel_pid(j), x, y);
             wheels[j].sent_at = Some(now);
@@ -6580,6 +8143,125 @@ fn keepalive_due(last: Option<Instant>, now: Instant) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// **B21-C：正/反向循环在勾选集合里轮换**（用户 2026-10-18 第 2 条）。
+    ///
+    /// 三条硬口径逐条钉住：① 空集合 = 全部参与（与旧行为逐字节一致）；
+    /// ② 越界/重复下标被忽略，不许 panic、不许跳出不存在的组合；
+    /// ③ 当前组合不在集合里时，Next/Prev 仍**单向可预期**（不是原地打转）。
+    #[test]
+    fn rotate_set_controls_which_schemes_take_part_in_cycling() {
+        use super::rotate_target;
+        // ① None（字段缺失）= 不限制：与旧的模运算逐字节一致（5 套组合逐个起点验证）
+        for active in 0..5usize {
+            assert_eq!(rotate_target(None, active, 5, 1), Some((active + 1) % 5));
+            assert_eq!(
+                rotate_target(None, active, 5, -1),
+                Some((active + 5 - 1) % 5)
+            );
+        }
+        // ② 只勾 {1,3}：从 0 正向 ⇒ 1；从 1 正向 ⇒ 3；从 3 正向 ⇒ 绕回 1
+        let set = [1usize, 3];
+        assert_eq!(
+            rotate_target(Some(&set), 0, 5, 1),
+            Some(1),
+            "从 0 正向应到 1"
+        );
+        assert_eq!(
+            rotate_target(Some(&set), 1, 5, 1),
+            Some(3),
+            "从 1 正向应到 3（跳过 2）"
+        );
+        assert_eq!(
+            rotate_target(Some(&set), 3, 5, 1),
+            Some(1),
+            "到尾部应绕回 1"
+        );
+        assert_eq!(
+            rotate_target(Some(&set), 1, 5, -1),
+            Some(3),
+            "从 1 反向：集合里没有更小的 ⇒ 绕回最大 3"
+        );
+        assert_eq!(
+            rotate_target(Some(&set), 3, 5, -1),
+            Some(1),
+            "从 3 反向应到 1"
+        );
+        // ③ 当前不在集合里（0 不参与）：Next/Prev 仍单向可预期
+        assert_eq!(
+            rotate_target(Some(&set), 0, 5, 1),
+            Some(1),
+            "当前不在集合 ⇒ 取大于它的最小"
+        );
+        assert_eq!(
+            rotate_target(Some(&set), 4, 5, -1),
+            Some(3),
+            "当前不在集合且大于所有 ⇒ 反向取小于它的最大"
+        );
+        // ④ 越界与重复被忽略（手改配置的容忍）
+        assert_eq!(
+            rotate_target(Some(&[9, 1, 1, 3]), 0, 5, 1),
+            Some(1),
+            "越界/重复下标必须被忽略"
+        );
+        // 下标**全是**越界 ⇒ 有效集合为空 ⇒ 没有可切的目标。
+        // 注意这里与旧版不同：旧版把"空集合"当"全部参与"，于是会跳到 3；现在
+        // "越界退化成不限制"那条兜底只发生在 keymap::normalize 里（配置装载时
+        // 就把这种集合修成 None），引擎不再替坏配置猜意图 —— 见 keymap 侧单测。
+        assert_eq!(
+            rotate_target(Some(&[9, 99]), 2, 5, 1),
+            None,
+            "全是越界 ⇒ 有效集合为空 ⇒ 无可切目标"
+        );
+        // ⑤ Some([]) = 用户点了"全不选"（用户 2026-10-23 第 3 条要求"一键取消"）：
+        // 必须明确地"不换组合"，绝不能退回"全部参与"。
+        for active in 0..5usize {
+            assert_eq!(
+                rotate_target(Some(&[]), active, 5, 1),
+                None,
+                "全不选 ⇒ 正向不换"
+            );
+            assert_eq!(
+                rotate_target(Some(&[]), active, 5, -1),
+                None,
+                "全不选 ⇒ 反向不换"
+            );
+        }
+        // ⑥ 边界：0 套 / 只有 1 套 / 单元素集合
+        assert_eq!(rotate_target(None, 0, 0, 1), None, "没有组合时必须 None");
+        assert_eq!(
+            rotate_target(Some(&[]), 0, 0, 1),
+            None,
+            "0 套 + 全不选 ⇒ None"
+        );
+        assert_eq!(
+            rotate_target(Some(&[2]), 2, 5, 1),
+            Some(2),
+            "只勾当前这一套 ⇒ 停在原地"
+        );
+        assert_eq!(
+            rotate_target(Some(&[2]), 0, 5, 1),
+            Some(2),
+            "单元素集合 ⇒ 只剩它"
+        );
+        // 阴性对照（§3.3）：
+        // (a) None 与"显式全选"必须等价 —— 两种写法是同一个状态；
+        // (b) Some([]) 与 None **必须不同** —— 这正是"全不选"能被表达的前提，
+        //     哪天有人把两者合并，这条会红。
+        let all: Vec<usize> = (0..5).collect();
+        for active in 0..5usize {
+            assert_eq!(
+                rotate_target(None, active, 5, 1),
+                rotate_target(Some(&all), active, 5, 1),
+                "None 与显式全选必须给出同一个下一套"
+            );
+            assert_ne!(
+                rotate_target(Some(&[]), active, 5, 1),
+                rotate_target(None, active, 5, 1),
+                "全不选与不限制必须是两个状态"
+            );
+        }
+    }
+
     use super::*;
 
     /// 相对坐标的锚点(0.1 => 1000x1000 屏幕上的 (100,100))
@@ -6621,6 +8303,7 @@ mod tests {
                     y: 0.2,
                     duration_ms: 50,
                     radius: 0.03,
+                    repeat_interval_ms: 0,
                 },
                 fps_only: false,
                 tail_delay_ms: 0,
@@ -6632,6 +8315,7 @@ mod tests {
                     y: 0.3,
                     duration_ms: 50,
                     radius: 0.03,
+                    repeat_interval_ms: 0,
                 },
                 fps_only: false,
                 tail_delay_ms: 0,
@@ -6928,6 +8612,195 @@ mod tests {
         assert_eq!(wheel_zoom_dir(&profile, false, BTN_WHEEL_DOWN), None);
     }
 
+    /// 2026-10-11(用户口径纠正):**勾选[滚轮换档]就由它接管滚轮** ——
+    /// 不再要求"触发键/挡位切换键按住期间"(用户原话:勾了框却以为滚轮坏了)。
+    ///
+    /// 锁五件事:
+    /// ① 不按任何键,一齿滚轮就换档,并且**不注入**缩放双指手势;
+    /// ② 换档只在"参与"的档位之间跳(`gear_wheel`),上滚向后、下滚向前、环绕;
+    /// ③ 一个都没勾选 / 只勾一个 / 压枪未启用 / 档位为空 → 滚轮**退回缩放**;
+    /// ④ 不在 FPS 模式 → 既不换档也不缩放(事件放行给普通绑定);
+    /// ⑤ 没勾[滚轮换档] → 与从前一样是缩放(既有行为不变)。
+    #[test]
+    fn recoil_wheel_switch_takes_over_gears_without_holding_keys() {
+        use crate::control::ControlCmd;
+
+        /// 派发测试台:一次喂一个按键事件,记录"是否被消费 / 可见通知 / 注入的触摸"。
+        struct Rig {
+            ctl: ControlClient,
+            m: Mapper,
+            profile: Profile,
+            held: Held,
+            wheels: Vec<WheelState>,
+            fingers: Fingers,
+            fps_fingers: Fingers,
+            combo_fingers: Fingers,
+            macro_down: HashMap<u64, (i32, i32)>,
+            macro_exec_seq: u64,
+            scheduled: Vec<(Instant, SchedAct)>,
+            live: EngineLive,
+            gates: PressGates,
+            active_android_keys: HashSet<u16>,
+            last_refuse_note: Option<Instant>,
+            notice: Option<String>,
+            zoom_sep: f32,
+            aim: AimState,
+        }
+
+        impl Rig {
+            fn new() -> Self {
+                let mut profile = Profile::default();
+                profile.aim = aim_at(0.5, 0.5);
+                Self {
+                    ctl: ControlClient::for_test(1000, 1000),
+                    m: mapper(),
+                    profile,
+                    held: Held::default(),
+                    wheels: Vec::new(),
+                    fingers: Fingers::default(),
+                    fps_fingers: Fingers::default(),
+                    combo_fingers: Fingers::default(),
+                    macro_down: HashMap::new(),
+                    macro_exec_seq: 0,
+                    scheduled: Vec::new(),
+                    live: EngineLive::default(),
+                    gates: PressGates::default(),
+                    active_android_keys: HashSet::new(),
+                    last_refuse_note: None,
+                    notice: None,
+                    zoom_sep: ZOOM_BASE_SEP,
+                    aim: AimState::default(),
+                }
+            }
+
+            /// 喂一个事件;返回"是否被派发主干消费"。
+            fn drive(&mut self, code: u16, pressed: bool, fps_active: bool) -> bool {
+                let fresh = pressed && !self.held.has(code);
+                self.held.set(code, pressed);
+                self.notice = None;
+                dispatch_input(&mut Dispatch {
+                    ctl: &self.ctl,
+                    m: &self.m,
+                    profile: &self.profile,
+                    held: &self.held,
+                    ev: CaptureKey { code, pressed },
+                    fresh_press: fresh,
+                    fps_running: false,
+                    fps_active,
+                    aim_down: false,
+                    zoom_sep: &mut self.zoom_sep,
+                    wheels: &mut self.wheels,
+                    fingers: &mut self.fingers,
+                    fps_fingers: &self.fps_fingers,
+                    combo_fingers: &self.combo_fingers,
+                    macro_down: &self.macro_down,
+                    macro_exec_seq: &mut self.macro_exec_seq,
+                    scheduled: &mut self.scheduled,
+                    live: &mut self.live,
+                    active_android_keys: &mut self.active_android_keys,
+                    last_refuse_note: &mut self.last_refuse_note,
+                    pending_notice: &mut self.notice,
+                    aim_st: &mut self.aim,
+                    gates: &mut self.gates,
+                })
+            }
+
+            /// 滚一齿(按下 + 抬起);返回(按下是否被消费, 按下那一帧的通知)。
+            fn wheel(&mut self, up: bool, fps_active: bool) -> (bool, Option<String>) {
+                let code = if up { BTN_WHEEL_UP } else { BTN_WHEEL_DOWN };
+                let consumed = self.drive(code, true, fps_active);
+                let notice = self.notice.take();
+                self.drive(code, false, fps_active);
+                (consumed, notice)
+            }
+
+            /// 取走并统计本轮注入的触摸指令(缩放会注入一整段双指序列;换档零条)。
+            fn touches(&self) -> usize {
+                self.ctl
+                    .take_cmds()
+                    .iter()
+                    .filter(|c| matches!(c, ControlCmd::Touch { .. }))
+                    .count()
+            }
+        }
+
+        let mut rig = Rig::new();
+        // 4 档,只有第 1 / 第 3 档(下标 0 / 2)参与滚轮换档;勾了[滚轮换档]、压枪开启。
+        rig.profile.aim.recoil = crate::keymap::Recoil {
+            enabled: true,
+            trigger_key: KeySet::single(crate::keymap::BTN_LEFT),
+            strengths: vec![1.0, 2.0, 3.0, 4.0],
+            gear_names: vec!["近".into(), String::new(), "中".into(), String::new()],
+            gear_wheel: vec![true, false, true, false],
+            wheel_switch: true,
+            ..crate::keymap::Recoil::default()
+        };
+
+        // ① 关键回归:**不按任何键**,上滚一齿就该换档(旧口径下这里会去缩放)
+        let (consumed, notice) = rig.wheel(true, true);
+        assert!(consumed, "接管期的滚轮必须被消费");
+        assert_eq!(rig.aim.recoil_index, 2, "上滚跳到下一个参与档(跳过第 2 档)");
+        assert_eq!(rig.touches(), 0, "换档期间不得注入缩放双指手势");
+        assert_eq!(
+            notice.as_deref(),
+            Some("后坐力补偿:已切到第 3 档「中」(3)"),
+            "换档要有可见反馈,并带上档位名字"
+        );
+
+        // ② 继续上滚:环绕回第 1 档
+        let (_, notice) = rig.wheel(true, true);
+        assert_eq!(rig.aim.recoil_index, 0, "参与档之间环绕");
+        assert_eq!(notice.as_deref(), Some("后坐力补偿:已切到第 1 档「近」(1)"));
+        // 下滚是反向的:回到第 3 档
+        rig.wheel(false, true);
+        assert_eq!(rig.aim.recoil_index, 2);
+
+        // ③ 一个参与档都不勾 → 不换档,滚轮退回缩放
+        rig.profile.aim.recoil.gear_wheel = vec![false, false, false, false];
+        assert!(rig.profile.aim.wheel_zoom, "缩放默认开启");
+        let before = rig.aim.recoil_index;
+        rig.wheel(true, true);
+        assert_eq!(rig.aim.recoil_index, before, "没有参与档时必须原地不动");
+        assert!(rig.touches() > 0, "退回缩放:必须注入双指手势");
+
+        // 只勾一个档 = 换档没有落点 → 同样退回缩放
+        rig.profile.aim.recoil.gear_wheel = vec![true, false, false, false];
+        let before = rig.aim.recoil_index;
+        rig.wheel(true, true);
+        assert_eq!(rig.aim.recoil_index, before, "只有一个参与档时不该换档");
+        assert!(rig.touches() > 0, "只有一个参与档时同样退回缩放");
+
+        // 压枪没启用 → 退回缩放(即使勾了滚轮换档)
+        rig.profile.aim.recoil.gear_wheel = vec![true, false, true, false];
+        rig.profile.aim.recoil.enabled = false;
+        let before = rig.aim.recoil_index;
+        rig.wheel(true, true);
+        assert_eq!(rig.aim.recoil_index, before);
+        assert!(rig.touches() > 0, "压枪未启用时滚轮仍是缩放");
+
+        // ④ 不在 FPS 模式 → 既不换档也不缩放(事件放行给普通绑定)
+        rig.profile.aim.recoil.enabled = true;
+        let before = rig.aim.recoil_index;
+        let (consumed, _) = rig.wheel(true, false);
+        assert!(!consumed, "非 FPS 模式滚轮照旧放行");
+        assert_eq!(rig.aim.recoil_index, before);
+        assert_eq!(rig.touches(), 0, "非 FPS 模式不注入任何手势");
+
+        // ⑤ 没勾[滚轮换档] → 与从前一样是缩放
+        rig.profile.aim.recoil.wheel_switch = false;
+        let before = rig.aim.recoil_index;
+        rig.wheel(true, true);
+        assert_eq!(rig.aim.recoil_index, before);
+        assert!(rig.touches() > 0, "没勾滚轮换档时滚轮照旧缩放");
+
+        // ⑥ 档位为空 → 不接管、也不卡死(退回缩放)
+        rig.profile.aim.recoil.wheel_switch = true;
+        rig.profile.aim.recoil.strengths.clear();
+        let (consumed, _) = rig.wheel(true, true);
+        assert!(consumed, "空档位表也不能把滚轮吞掉后什么都不做");
+        assert!(rig.touches() > 0, "空档位表:退回缩放");
+    }
+
     /// 落点必须始终落在屏幕内,并正确报告"触到边界"
     #[test]
     fn aim_target_clamps_to_screen() {
@@ -7005,6 +8878,149 @@ mod tests {
         assert_eq!(recoil_step_plan(1000.0, 0.0, 0.25).1, 60.0);
     }
 
+    /// 用户 2026-10-11(问题 2)核对:**开放世界模式 + 压枪**必须真的生效。
+    ///
+    /// 旧实现把 `!aim.open_world` 写在生效条件里,于是「开放世界」方案里勾了
+    /// 后坐力补偿、绑了触发键也一点补偿都没有(用户的「三角洲」方案正是
+    /// `open_world=true` + `recoil.enabled=true`);而 `recoil_tick` 原先又直接
+    /// 走 `aim_flush`(无边界跑步机的几何),与开放世界的 `open_world_radius`
+    /// 几何不是一回事,两条路各写一遍 `st.ox/oy`。现在压枪走
+    /// [`open_world_on_motion`] 这条**同一路**。
+    #[test]
+    fn recoil_compensates_in_open_world_mode() {
+        use crate::control::{ACTION_MOVE, ControlCmd};
+        let m = mapper();
+        let mut aim = Aim {
+            open_world: true,
+            boundary: false,
+            ..aim_at(0.5, 0.5)
+        };
+        aim.recoil = crate::keymap::Recoil {
+            enabled: true,
+            trigger_key: KeySet::single(crate::keymap::BTN_LEFT),
+            rate_hz: 60.0,
+            strengths: vec![9.0],
+            ..crate::keymap::Recoil::default()
+        };
+        let (ax, ay) = aim_anchor(&m, &aim);
+        let mut held = Held::default();
+        held.set(crate::keymap::BTN_LEFT, true);
+        let ctl = ControlClient::for_test(1000, 1000);
+        let mut st = AimState::default();
+        st.mode_active = true;
+        // 稳态:已经落过指(锚点记录已对账)。首拍永远会先付一次"抬指重按"
+        // (锚点记录不符 ⇒ `aim_lift`),那是所有注入路径共有的起手动作。
+        st.anchor_used = (ax, ay);
+        st.down = true;
+        st.cur = (ax, ay);
+        let now = Instant::now();
+        // 距上一次结算 100ms:60Hz ⇒ 攒够 6 拍(6 × 9px = 54px)
+        st.recoil_last = Some(now - Duration::from_millis(100));
+        recoil_tick(&ctl, &m, &aim, &mut st, &held, now);
+        assert!(st.recoil_active, "开放世界模式下压枪必须判定为生效");
+        let cmds = ctl.take_cmds();
+        let moved_down = cmds.iter().any(|c| {
+            matches!(c, ControlCmd::Touch { action, y, .. }
+                if *action == ACTION_MOVE && *y as i32 > ay)
+        });
+        assert!(moved_down, "压枪必须把落点向下推:{cmds:?}");
+        let lowest = cmds
+            .iter()
+            .filter_map(|c| match c {
+                ControlCmd::Touch { y, .. } => Some(*y as i32),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            lowest > ay && lowest <= ay + 54,
+            "补偿量应是 54px 以内({ax}, {ay} -> y={lowest})"
+        );
+    }
+
+    /// 开放世界的纵向偏移必须留在屏幕内:落点 = 锚点 + 偏移,而 `control.rs`
+    /// 只做下界钳制(`max(0)`)—— 越出边缘的触摸会被设备端**整条丢弃**,
+    /// 连触点一起丢。压枪开启后这条路会持续往下推,钳制必须成立。
+    #[test]
+    fn open_world_keeps_vertical_offset_on_screen() {
+        use crate::control::ControlCmd;
+        let m = mapper();
+        let aim = Aim {
+            open_world: true,
+            boundary: false,
+            ..aim_at(0.5, 0.9)
+        };
+        let (ax, ay) = aim_anchor(&m, &aim);
+        let ctl = ControlClient::for_test(1000, 1000);
+        let mut st = AimState::default();
+        st.mode_active = true;
+        st.anchor_used = (ax, ay);
+        st.down = true;
+        st.cur = (ax, ay);
+        st.oy = 5000.0; // 猛推到底:远超屏幕
+        open_world_on_motion(&ctl, &m, &aim, &mut st, 0.0, 0.0, Instant::now(), 0);
+        assert!(
+            st.oy <= (m.h - 1.0 - ay as f32) + 1e-3,
+            "纵向累计偏移必须钳在屏幕内:{:?}",
+            st.oy
+        );
+        for c in ctl.take_cmds() {
+            if let ControlCmd::Touch { y, .. } = c {
+                assert!((y as i32) < m.h as i32, "落点越出屏幕:y={y}");
+                assert!(y as i32 >= 0, "落点为负:y={y}");
+            }
+        }
+    }
+
+    /// 上限**不许吃掉压枪的累计量**:一次结算的补偿量超过 [`AIM_MAX_STEP_PX`] 时,
+    /// 余量必须留在 `st.oy` 里、由余量推进路径送完(总量精确)。
+    #[test]
+    fn treadmill_cap_does_not_eat_recoil_offset() {
+        let m = mapper();
+        let mut aim = Aim {
+            boundary: false,
+            ..aim_at(0.5, 0.5)
+        };
+        aim.recoil = crate::keymap::Recoil {
+            enabled: true,
+            trigger_key: KeySet::single(crate::keymap::BTN_LEFT),
+            rate_hz: 60.0,
+            strengths: vec![300.0], // 100ms ⇒ 6 拍 ⇒ 1800px,远超单次上限
+            ..crate::keymap::Recoil::default()
+        };
+        let (ax, ay) = aim_anchor(&m, &aim);
+        let mut held = Held::default();
+        held.set(crate::keymap::BTN_LEFT, true);
+        let ctl = ControlClient::for_test(1000, 1000);
+        let mut st = AimState::default();
+        st.mode_active = true;
+        st.anchor_used = (ax, ay);
+        let now = Instant::now();
+        st.recoil_last = Some(now - Duration::from_millis(100));
+        recoil_tick(&ctl, &m, &aim, &mut st, &held, now);
+        let mut rot = Rotation::default();
+        let first = rot.feed(&ctl.take_cmds());
+        assert!(
+            first > 0.0 && first <= AIM_MAX_STEP_PX + 1.5,
+            "首轮受上限约束"
+        );
+        let pending = |st: &AimState| st.oy - (st.cur.1 as f32 - ay as f32);
+        assert!(pending(&st) > 0.0, "余量必须留在累计偏移里:{:?}", st.oy);
+        // 余量推进路径接着送完(不再有新的压枪节拍)
+        let mut rounds = 1;
+        while pending(&st) > 0.5 && rounds < 2000 {
+            aim_drain_pending(&ctl, &m, &aim, &mut st);
+            let _ = rot.feed(&ctl.take_cmds());
+            rounds += 1;
+        }
+        assert!(rounds < 2000, "余量必须在有限轮内送完");
+        assert!(
+            (rot.total - 1800.0).abs() < 3.0,
+            "压枪累计量必须精确送达:{} vs 1800",
+            rot.total
+        );
+    }
+
     /// V2-1:"摇晃"随机数有界(±1)且同种子可复现。
     #[test]
     fn recoil_shake_is_bounded_and_reproducible() {
@@ -7021,6 +9037,1092 @@ mod tests {
             seq_a.iter().any(|v| (*v - seq_a[0]).abs() > 1e-3),
             "不能是常数序列"
         );
+    }
+
+    /// H①:两种波形都要从 `phase = 0` 的 0 点向上出发(于是"每次按下触发键都从
+    /// 同一点开始"),且处处有界在 ±1 内;三角 = 幅值线性往返。
+    #[test]
+    fn recoil_horizontal_wave_shapes_agree_at_zero_and_are_bounded() {
+        use std::f32::consts::TAU;
+        for w in [HorizontalWave::Sine, HorizontalWave::Triangle] {
+            assert!(
+                recoil_horizontal_wave(w, 0.0).abs() < 1e-6,
+                "{w:?} 必须从 0 出发"
+            );
+            assert!(
+                (recoil_horizontal_wave(w, TAU * 0.25) - 1.0).abs() < 1e-6,
+                "{w:?} 四分之一周期到正向顶点"
+            );
+            assert!(
+                recoil_horizontal_wave(w, TAU * 0.5).abs() < 1e-6,
+                "{w:?} 半周期回到 0"
+            );
+            assert!(
+                (recoil_horizontal_wave(w, TAU * 0.75) + 1.0).abs() < 1e-6,
+                "{w:?} 四分之三周期到负向顶点"
+            );
+            // 扫一个完整周期:处处在 ±1 内(有界性是 H⑤2 的前提)
+            for k in 0..1000 {
+                let p = TAU * (k as f32) / 1000.0 - TAU;
+                let v = recoil_horizontal_wave(w, p);
+                assert!(v.abs() <= 1.0 + 1e-6, "{w:?} 在 {p} 处越界:{v}");
+            }
+        }
+        // 三角是直线段:八分之一周期 = 半个顶点(正弦那边是 √2/2)
+        assert!((recoil_horizontal_wave(HorizontalWave::Triangle, TAU * 0.125) - 0.5).abs() < 1e-6);
+        assert!((recoil_horizontal_wave(HorizontalWave::Sine, TAU * 0.125) - 0.7071).abs() < 1e-3);
+    }
+
+    /// H①(用户 2026-10-11:"消除抖动除了上下消除抖动,有些枪械还有左右的抖动。
+    /// 你要想办法消除掉。"):水平交替补偿必须是**有界振荡**而不是单向斜坡,
+    /// 且相位从"按下触发键的那一刻"起算(松开再开火,逐拍序列完全相同)。
+    #[test]
+    fn recoil_horizontal_wave_is_bounded_and_reproducible() {
+        use crate::keymap::{HorizontalWave, Recoil};
+        let m = mapper();
+        let mut aim = Aim {
+            boundary: true,
+            recenter: RecenterMode::Never,
+            ..aim_at(0.5, 0.5)
+        };
+        const AMP: f32 = 40.0;
+        aim.recoil = Recoil {
+            enabled: true,
+            trigger_key: KeySet::single(crate::keymap::BTN_LEFT),
+            rate_hz: 60.0,
+            // 只看水平:垂直强度置 0(水平补偿不该被"垂直强度为 0"连坐)
+            strengths: vec![0.0],
+            // H① 现在**每档一套**(用户 2026-10-11 第 3 轮):单档就写在第 0 档
+            gear_horizontal_px: vec![AMP],
+            gear_horizontal_period_ms: vec![600],
+            gear_horizontal_wave: vec![HorizontalWave::Sine],
+            ..Recoil::default()
+        };
+        let (ax, ay) = aim_anchor(&m, &aim);
+        let mut held = Held::default();
+        held.set(crate::keymap::BTN_LEFT, true);
+        let ctl = ControlClient::for_test(1000, 1000);
+        let mut st = AimState {
+            mode_active: true,
+            anchor_used: (ax, ay),
+            down: true,
+            cur: (ax, ay),
+            ..AimState::default()
+        };
+        // 每"拍"固定 1/60s:与 `recoil_step_plan` 的 60Hz 控制频率对齐
+        let step = Duration::from_micros(16_667);
+        let mut peak: f32 = 0.0;
+        let mut trough: f32 = 0.0;
+        let mut now = Instant::now();
+        for _ in 0..200 {
+            now += step;
+            st.recoil_last = Some(now - step);
+            recoil_tick(&ctl, &m, &aim, &mut st, &held, now);
+            let _ = ctl.take_cmds(); // 队列别积压:本用例只看累计偏移
+            assert!(
+                st.ox.abs() <= AMP + 1e-3,
+                "水平补偿必须有界(振荡而不是斜坡):ox={}",
+                st.ox
+            );
+            peak = peak.max(st.ox);
+            trough = trough.min(st.ox);
+        }
+        assert!(peak > AMP * 0.9, "必须真的摆到正向幅度:peak={peak}");
+        assert!(trough < -AMP * 0.9, "必须真的摆到负向幅度:trough={trough}");
+
+        // 相位复位:同一次开火(50 拍)的 `st.ox` 序列,松开触发键后再开火必须逐拍相同。
+        let run = |st: &mut AimState, held: &Held| -> Vec<f32> {
+            let mut out = Vec::new();
+            let mut t = Instant::now();
+            for _ in 0..50 {
+                t += step;
+                st.recoil_last = Some(t - step);
+                recoil_tick(&ctl, &m, &aim, st, held, t);
+                out.push(st.ox);
+            }
+            out
+        };
+        // 失活一次(松手)= 相位/波形/节拍余量全部复位到"刚按下"的状态
+        let released = Held::default();
+        let reset = |st: &mut AimState| {
+            st.ox = 0.0;
+            st.down = true;
+            st.cur = (ax, ay);
+            recoil_tick(&ctl, &m, &aim, st, &released, Instant::now());
+        };
+        reset(&mut st);
+        let first = run(&mut st, &held);
+        reset(&mut st);
+        assert_eq!(st.recoil_h_t, 0.0, "松开触发键必须把相位清零");
+        assert_eq!(st.recoil_h_prev, 0.0, "波形值回到起点");
+        let second = run(&mut st, &held);
+        assert_eq!(first, second, "两次开火必须从同一点开始(逐拍相同)");
+    }
+
+    /// H②(用户 2026-10-11:"有些枪械总往一边偏"):每档水平偏置按拍叠加,
+    /// 位移 = 偏置 × 拍数;正 = 向右,负 = 向左;越界档按 0 处理。
+    #[test]
+    fn recoil_gear_horizontal_bias_stacks_per_step() {
+        use crate::keymap::Recoil;
+        let m = mapper();
+        let mut aim = Aim {
+            boundary: true,
+            recenter: RecenterMode::Never,
+            ..aim_at(0.5, 0.5)
+        };
+        aim.recoil = Recoil {
+            enabled: true,
+            trigger_key: KeySet::single(crate::keymap::BTN_LEFT),
+            rate_hz: 60.0,
+            strengths: vec![0.0, 0.0],
+            gear_horizontal: vec![-3.0, 4.0],
+            ..Recoil::default()
+        };
+        let (ax, ay) = aim_anchor(&m, &aim);
+        let mut held = Held::default();
+        held.set(crate::keymap::BTN_LEFT, true);
+        let ctl = ControlClient::for_test(1000, 1000);
+        let mut st = AimState {
+            mode_active: true,
+            anchor_used: (ax, ay),
+            down: true,
+            cur: (ax, ay),
+            recoil_index: 1,
+            ..AimState::default()
+        };
+        let now = Instant::now();
+        // 100ms × 60Hz = 6 拍:第 1 档偏置 4px/拍 ⇒ +24px(向右)
+        st.recoil_last = Some(now - Duration::from_millis(100));
+        recoil_tick(&ctl, &m, &aim, &mut st, &held, now);
+        assert!(
+            (st.ox - 24.0).abs() < 1e-3,
+            "第 1 档必须按 4px/拍 × 6 拍 = 24px 叠加:ox={}",
+            st.ox
+        );
+        // 换到第 0 档(负偏置 = 向左),同样 6 拍
+        st.recoil_index = 0;
+        st.ox = 0.0;
+        st.recoil_last = Some(now - Duration::from_millis(100));
+        recoil_tick(&ctl, &m, &aim, &mut st, &held, now);
+        assert!(
+            (st.ox + 18.0).abs() < 1e-3,
+            "第 0 档的 -3px/拍 × 6 拍 = -18px(向左):ox={}",
+            st.ox
+        );
+        // 越界档 = 没有这一档 = 0 偏置(与 `gear_wheel_at` 的缺省口径不同:
+        // 水平偏置是每档各自的量,越界只能当 0)
+        assert_eq!(aim.recoil.gear_horizontal_at(9), 0.0);
+    }
+
+    /// H⑥(用户 2026-10-11 第 3 轮:水平补偿并入档位表):引擎里
+    /// **幅度 / 周期 / 波形三项都按当前档取** —— 换档就换一整套水平参数,
+    /// 与垂直强度用同一个档位下标(切档时"水平和垂直一起切")。
+    ///
+    /// 三件事一起锁:
+    /// ① 第 0 档幅度 10px → 振荡有界在 ±10 内、且真的摆到接近 +10;
+    /// ② 第 1 档幅度 40px 但周期 0 = 这一档不振荡 → 换过去之后水平一动不动
+    ///    (证明周期也读的是当前档,不是全局那个 600);
+    /// ③ 把第 1 档周期改成 200ms 后(同一份配置、全新运行状态)它按 40px 摆。
+    #[test]
+    fn recoil_horizontal_wave_follows_the_current_gear() {
+        use crate::keymap::{HorizontalWave, Recoil};
+        let m = mapper();
+        let mut aim = Aim {
+            boundary: true,
+            recenter: RecenterMode::Never,
+            ..aim_at(0.5, 0.5)
+        };
+        aim.recoil = Recoil {
+            enabled: true,
+            trigger_key: KeySet::single(crate::keymap::BTN_LEFT),
+            rate_hz: 60.0,
+            // 只看水平:垂直强度全 0(水平补偿不该被"垂直强度为 0"连坐)
+            strengths: vec![0.0, 0.0],
+            gear_horizontal_px: vec![10.0, 40.0],
+            gear_horizontal_period_ms: vec![600, 0],
+            gear_horizontal_wave: vec![HorizontalWave::Sine, HorizontalWave::Triangle],
+            ..Recoil::default()
+        };
+        assert_eq!(
+            aim.recoil.horizontal_px_at(1),
+            40.0,
+            "第 1 档幅度取的是每档值"
+        );
+        assert_eq!(aim.recoil.horizontal_period_ms_at(1), 0, "第 1 档周期 0");
+        assert_eq!(
+            aim.recoil.horizontal_wave_at(1),
+            HorizontalWave::Triangle,
+            "第 1 档波形也取每档值"
+        );
+        let (ax, ay) = aim_anchor(&m, &aim);
+        let mut held = Held::default();
+        held.set(crate::keymap::BTN_LEFT, true);
+        let ctl = ControlClient::for_test(1000, 1000);
+        let mut st = AimState {
+            mode_active: true,
+            anchor_used: (ax, ay),
+            down: true,
+            cur: (ax, ay),
+            ..AimState::default()
+        };
+        // 每"拍"固定 1/60s:与 `recoil_step_plan` 的 60Hz 控制频率对齐
+        let step = Duration::from_micros(16_667);
+        let mut now = Instant::now();
+        let mut peak: f32 = 0.0;
+        for _ in 0..120 {
+            now += step;
+            st.recoil_last = Some(now - step);
+            recoil_tick(&ctl, &m, &aim, &mut st, &held, now);
+            let _ = ctl.take_cmds();
+            assert!(
+                st.ox.abs() <= 10.0 + 1e-3,
+                "第 0 档幅度 10px,振荡必须有界在它以内:ox={}",
+                st.ox
+            );
+            peak = peak.max(st.ox);
+        }
+        assert!(peak > 9.0, "第 0 档必须真的摆到接近 +10px:peak={peak}");
+
+        // 换到第 1 档:周期 0 = 这一档不振荡 —— 相位与累计位移都不许动
+        st.recoil_index = 1;
+        st.ox = 0.0;
+        st.recoil_h_t = 0.0;
+        st.recoil_h_prev = 0.0;
+        for _ in 0..120 {
+            now += step;
+            st.recoil_last = Some(now - step);
+            recoil_tick(&ctl, &m, &aim, &mut st, &held, now);
+            let _ = ctl.take_cmds();
+        }
+        assert_eq!(st.recoil_h_t, 0.0, "周期为 0 的档不许推进 H① 相位");
+        assert_eq!(st.ox, 0.0, "第 1 档周期 0 = 不振荡,水平位移必须恒为 0");
+
+        // 把第 1 档的周期改成 200ms:同一份配置,全新运行状态按 40px 摆
+        aim.recoil.gear_horizontal_period_ms[1] = 200;
+        let mut st2 = AimState {
+            mode_active: true,
+            anchor_used: (ax, ay),
+            down: true,
+            cur: (ax, ay),
+            recoil_index: 1,
+            ..AimState::default()
+        };
+        let mut peak2: f32 = 0.0;
+        for _ in 0..120 {
+            now += step;
+            st2.recoil_last = Some(now - step);
+            recoil_tick(&ctl, &m, &aim, &mut st2, &held, now);
+            let _ = ctl.take_cmds();
+            assert!(
+                st2.ox.abs() <= 40.0 + 1e-3,
+                "第 1 档改成 200ms 后按 40px 有界振荡:ox={}",
+                st2.ox
+            );
+            peak2 = peak2.max(st2.ox);
+        }
+        assert!(peak2 > 30.0, "第 1 档 40px 幅度必须真的摆上去:peak={peak2}");
+    }
+
+    /// H⑥ 兼容回落:平行向量为空(老配置刚读进来、`normalize` 之前)时,
+    /// 引擎按**全局种子**跑 H① —— 与迁移后的每档值完全一致(手感不变)。
+    #[test]
+    fn recoil_horizontal_legacy_globals_drive_the_wave_when_vectors_are_empty() {
+        use crate::keymap::{HorizontalWave, Recoil};
+        let m = mapper();
+        let mut aim = Aim {
+            boundary: true,
+            recenter: RecenterMode::Never,
+            ..aim_at(0.5, 0.5)
+        };
+        const AMP: f32 = 25.0;
+        aim.recoil = Recoil {
+            enabled: true,
+            trigger_key: KeySet::single(crate::keymap::BTN_LEFT),
+            rate_hz: 60.0,
+            strengths: vec![0.0],
+            // 老配置形状:三个 per-gear 向量为空,只有全局字段
+            gear_horizontal_px: Vec::new(),
+            gear_horizontal_period_ms: Vec::new(),
+            gear_horizontal_wave: Vec::new(),
+            horizontal_px: AMP,
+            horizontal_period_ms: 600,
+            horizontal_wave: HorizontalWave::Sine,
+            ..Recoil::default()
+        };
+        assert_eq!(
+            aim.recoil.horizontal_px_at(0),
+            AMP,
+            "向量为空时读值回落到全局种子"
+        );
+        assert!(
+            aim.recoil.horizontal_wave_armed_at(0),
+            "回落之后照样是开着的"
+        );
+        let (ax, ay) = aim_anchor(&m, &aim);
+        let mut held = Held::default();
+        held.set(crate::keymap::BTN_LEFT, true);
+        let ctl = ControlClient::for_test(1000, 1000);
+        let mut st = AimState {
+            mode_active: true,
+            anchor_used: (ax, ay),
+            down: true,
+            cur: (ax, ay),
+            ..AimState::default()
+        };
+        let step = Duration::from_micros(16_667);
+        let mut now = Instant::now();
+        let mut peak: f32 = 0.0;
+        for _ in 0..120 {
+            now += step;
+            st.recoil_last = Some(now - step);
+            recoil_tick(&ctl, &m, &aim, &mut st, &held, now);
+            let _ = ctl.take_cmds();
+            assert!(
+                st.ox.abs() <= AMP + 1e-3,
+                "回落全局种子同样有界:ox={}",
+                st.ox
+            );
+            peak = peak.max(st.ox);
+        }
+        assert!(peak > AMP * 0.9, "老配置照样真的摆到幅度:peak={peak}");
+    }
+
+    /// H③ 的**实测依据**:开放世界的回转带会把"持续水平振荡"钳掉 ——
+    /// 幅度越过带半径就抬指重按(用户点名过的"换手那一下视角跳变"),
+    /// 而且振荡本身被钳掉一截(补偿量 ≠ 配置幅度)。
+    ///
+    /// 这就是"开放世界模式下停用 H①、只保留 H②"的依据;本用例直接按
+    /// **H① 的增量公式**驱动 [`open_world_on_motion`],不依赖 H① 是否启用。
+    #[test]
+    fn open_world_band_clips_the_horizontal_wave() {
+        let m = mapper();
+        let aim = Aim {
+            open_world: true,
+            boundary: false,
+            open_world_radius: 0.05, // ⇒ 回转半径 = 1000 × 0.05 = 50px
+            ..aim_at(0.5, 0.5)
+        };
+        let (ax, ay) = aim_anchor(&m, &aim);
+        let ctl = ControlClient::for_test(1000, 1000);
+        let mut st = AimState {
+            mode_active: true,
+            anchor_used: (ax, ay),
+            down: true,
+            cur: (ax, ay),
+            ..AimState::default()
+        };
+        let radius = 50.0f32;
+        const AMP: f32 = 80.0; // > 半径:立刻撞带
+        let mut prev = 0.0f32;
+        let mut t = 0.0f32;
+        let mut clipped = false;
+        for _ in 0..90 {
+            t += 0.02;
+            let w = (std::f32::consts::TAU * t / 0.6).sin();
+            st.ox += AMP * (w - prev);
+            prev = w;
+            open_world_on_motion(&ctl, &m, &aim, &mut st, 0.0, 0.0, Instant::now(), 0);
+            // 带边的钳制:振荡被压回带内(幅度不再等于 AMP)
+            if st.ox.abs() >= radius - 0.5 {
+                clipped = true;
+            }
+            assert!(
+                st.ox.abs() <= radius + 1e-3,
+                "开放世界不允许水平偏移越过回转带:ox={}",
+                st.ox
+            );
+        }
+        assert!(clipped, "振幅 80px > 半径 50px,必然顶到带边");
+        assert!(
+            st.handoffs > 0,
+            "持续振荡顶到带边 = 抬指重按换手(与 H① 打架的证据)"
+        );
+    }
+
+    /// H③ 结论的锁:开放世界模式下 H①(振荡)停用、H②(常量偏置)保留。
+    #[test]
+    fn open_world_keeps_h2_bias_but_drops_the_h1_wave() {
+        use crate::keymap::Recoil;
+        let m = mapper();
+        let mut aim = Aim {
+            open_world: true,
+            boundary: false,
+            ..aim_at(0.5, 0.5)
+        };
+        aim.recoil = Recoil {
+            enabled: true,
+            trigger_key: KeySet::single(crate::keymap::BTN_LEFT),
+            rate_hz: 60.0,
+            strengths: vec![0.0],
+            // H① 必须**真的开着**才谈得上"开放世界把它停用"(每档一套)
+            gear_horizontal_px: vec![50.0],
+            gear_horizontal_period_ms: vec![600],
+            gear_horizontal_wave: vec![HorizontalWave::Sine],
+            gear_horizontal: vec![2.0],
+            ..Recoil::default()
+        };
+        assert!(
+            !recoil_horizontal_wave_allowed(aim.open_world),
+            "开放世界必须停用 H①"
+        );
+        assert!(recoil_horizontal_wave_allowed(false), "非开放世界照常启用");
+        let (ax, ay) = aim_anchor(&m, &aim);
+        let mut held = Held::default();
+        held.set(crate::keymap::BTN_LEFT, true);
+        let ctl = ControlClient::for_test(1000, 1000);
+        let mut st = AimState {
+            mode_active: true,
+            anchor_used: (ax, ay),
+            down: true,
+            cur: (ax, ay),
+            ..AimState::default()
+        };
+        let step = Duration::from_micros(16_667);
+        let mut now = Instant::now();
+        for _ in 0..10 {
+            now += step;
+            st.recoil_last = Some(now - step);
+            recoil_tick(&ctl, &m, &aim, &mut st, &held, now);
+        }
+        assert_eq!(st.recoil_h_t, 0.0, "开放世界不许推进 H① 相位(不静默半开)");
+        assert!(
+            (st.ox - 20.0).abs() < 1e-3,
+            "只该剩 H② 的 2px/拍 × 10 拍 = 20px:ox={}",
+            st.ox
+        );
+        assert_eq!(st.handoffs, 0, "H② 常量偏置远小于回转半径,不该换手");
+    }
+
+    /// S④:鼠标独占的手动开关**只认"物理 + 集合按着 + 上升沿"** ——
+    /// Windows 自动重复的第二次 KEYDOWN 与宏回放都不许连翻。
+    #[test]
+    fn shield_manual_toggles_once_per_physical_press() {
+        let keys = KeySet::single(88);
+        let mut held = Held::default();
+        let mut manual = false;
+        let press = |held: &mut Held, manual: &mut bool, code: u16, down: bool, source: Source| {
+            let ev = CaptureKey {
+                code,
+                pressed: down,
+            };
+            let fresh = note_physical(held, ev, source);
+            *manual =
+                shield_manual_next(*manual, functional_key_hit(source, ev, &keys, held), fresh);
+        };
+        // ① 物理按下 → 打开
+        press(&mut held, &mut manual, 88, true, Source::Physical);
+        assert!(manual, "第一次物理按下必须打开手动独占");
+        // ② Windows 自动重复(同一个键再来一次 KEYDOWN)→ 不许翻
+        press(&mut held, &mut manual, 88, true, Source::Physical);
+        assert!(manual, "自动重复不许连翻");
+        press(&mut held, &mut manual, 88, true, Source::Physical);
+        assert!(manual, "连发多少次都只算一次按下");
+        // ③ 宏回放(合成事件)→ 不许翻
+        press(&mut held, &mut manual, 88, true, Source::Macro);
+        assert!(manual, "宏事件不能替你开关鼠标独占");
+        // ④ 真抬起(不翻)后 ⑤ 再按下 → 关闭
+        press(&mut held, &mut manual, 88, false, Source::Physical);
+        assert!(manual, "抬起本身不翻");
+        press(&mut held, &mut manual, 88, true, Source::Physical);
+        assert!(!manual, "再按一次必须关闭");
+        // 没绑键(空集合)时恒不命中
+        let empty = KeySet::new();
+        let ev = CaptureKey {
+            code: 88,
+            pressed: true,
+        };
+        assert!(
+            !functional_key_hit(Source::Physical, ev, &empty, &held),
+            "空绑定不许命中"
+        );
+    }
+
+    /// S④:手动独占的三条复位路径里有两条在引擎 —— 关映射与断连都必须清掉它
+    /// (**绝不允许出现"鼠标被永久锁死"**)。
+    #[test]
+    fn shield_manual_is_cleared_on_mapping_off_and_disconnect() {
+        let mut st = AimState {
+            shield_manual: true,
+            down: true,
+            ox: 12.0,
+            ..AimState::default()
+        };
+        // 复位路径①:映射关闭(引擎 `!enabled` 分支)
+        shield_manual_reset(&mut st);
+        assert!(!st.shield_manual, "关映射必须清掉手动独占");
+        // 复位路径②:断连(`aim_release_local`,与"抬起触点"同一条路)
+        st.shield_manual = true;
+        aim_release_local(&mut st);
+        assert!(!st.shield_manual, "断连必须清掉手动独占");
+        assert!(!st.down, "断连照旧抬指");
+        assert_eq!((st.ox, st.oy), (0.0, 0.0));
+        // 复位是幂等的
+        shield_manual_reset(&mut st);
+        assert!(!st.shield_manual);
+    }
+
+    /// A(2026-10-11):测试用最小 `Shared` —— 只放"唤醒视角"要看的两样:
+    /// 已连接的控制通道 + 一份配置。字段与 `sim::Harness` 里那份一一对应
+    /// (`Shared` 没有 `Default`,只能逐个给)。
+    fn shared_with_control(ctl: ControlClient) -> SharedState {
+        Arc::new(Mutex::new(Shared {
+            profile: Profile::default(),
+            enabled: true,
+            control: Some(ctl),
+            aim_live: Default::default(),
+            live: Default::default(),
+            notices: Vec::new(),
+            space_recheck: false,
+            space_changed_release: false,
+            toolbar_release: false,
+            recoil_gear_req: None,
+            schemes: Vec::new(),
+            switch_keys: Vec::new(),
+            fast_switch_enabled: false,
+            active_scheme: 0,
+        }))
+    }
+
+    /// A:按下「唤醒视角」热键(物理 + 上升沿 + 集合成员)⇒ **瞄准指被抬起**,
+    /// 并且**没有**关映射、没有退出 FPS、没有碰任何配置 ——
+    /// 只做"抬指"这一件事(与 F8"关映射 → 抬全部触点"的区别就在这)。
+    #[test]
+    fn wake_key_lifts_the_aim_finger_without_touching_mapping() {
+        use crate::control::{ACTION_UP, ControlCmd};
+
+        let keys = KeySet::single(90);
+        let ctl = ControlClient::for_test(1000, 1000);
+        let shared = shared_with_control(ctl);
+        let mut st = AimState {
+            mode_active: true,
+            down: true,
+            cur: (500, 500),
+            ox: 12.0,
+            oy: -8.0,
+            ..AimState::default()
+        };
+        let pid = st.active_pid();
+        let before_enabled = lock_shared(&shared).enabled;
+        let before_aim = lock_shared(&shared).profile.aim.clone();
+        let mut held = Held::default();
+
+        // 与 `run()` 里那两行**同一写法**:先落物理镜像拿上升沿,再判定功能键。
+        let press = |shared: &SharedState,
+                     st: &mut AimState,
+                     held: &mut Held,
+                     code: u16,
+                     down: bool,
+                     source: Source|
+         -> bool {
+            let ev = CaptureKey {
+                code,
+                pressed: down,
+            };
+            let fresh = note_physical(held, ev, source);
+            functional_key_hit(source, ev, &keys, held) && fresh && wake_key_action(shared, st)
+        };
+
+        assert!(
+            press(&shared, &mut st, &mut held, 90, true, Source::Physical),
+            "物理按下必须抬指"
+        );
+        assert!(!st.down, "瞄准指必须被抬起");
+        assert_eq!((st.ox, st.oy), (0.0, 0.0), "偏移同时清零(下次位移重新落指)");
+        assert!(st.mode_active, "唤醒键不许退出 FPS 模式");
+        assert!(!st.suspended, "唤醒键不许改挂起状态");
+        // 抬起指令真的发往设备,且指的就是原来那根指。
+        // ⚠ 判据必须写进**独立作用域**:`lock_shared` 不可重入(见它的注释),
+        // 把 guard 留到下面第二个 `lock_shared` 之前就等于自己把自己锁死。
+        let cmds = {
+            let g = lock_shared(&shared);
+            g.control.as_ref().unwrap().take_cmds()
+        };
+        assert_eq!(cmds.len(), 1, "一次唤醒只该发一条指令(抬起),实测 {cmds:?}");
+        assert!(
+            matches!(
+                cmds[0],
+                ControlCmd::Touch {
+                    action: ACTION_UP,
+                    pointer_id,
+                    ..
+                } if pointer_id == pid
+            ),
+            "必须是 UP 且落在原指上:{cmds:?}"
+        );
+        // 只抬指:映射开关与整份配置一字未动
+        let g = lock_shared(&shared);
+        assert_eq!(g.enabled, before_enabled, "唤醒键绝不能关映射");
+        assert!(g.enabled, "锁死时映射本来是开着的,唤醒后还得是开着");
+        assert_eq!(g.profile.aim, before_aim, "唤醒键不许改任何配置");
+        drop(g);
+
+        // 幂等:指已经抬起来了,再按不产生任何指令
+        assert!(
+            !press(&shared, &mut st, &mut held, 90, true, Source::Physical),
+            "没有按着的指时不应有动作"
+        );
+        let g = lock_shared(&shared);
+        assert!(
+            g.control.as_ref().unwrap().take_cmds().is_empty(),
+            "空按不许发指令"
+        );
+        drop(g);
+
+        // Windows 自动重复(同一个键再来一次 KEYDOWN)不许重复抬指
+        st.down = true;
+        st.cur = (520, 480);
+        let repeat = {
+            let ev = CaptureKey {
+                code: 90,
+                pressed: true,
+            };
+            let fresh = note_physical(&mut held, ev, Source::Physical);
+            functional_key_hit(Source::Physical, ev, &keys, &held)
+                && fresh
+                && wake_key_action(&shared, &mut st)
+        };
+        assert!(!repeat, "自动重复不是上升沿,不许再抬一次");
+        assert!(st.down, "自动重复时那根指必须保持按着");
+
+        // 宏回放(合成事件)不许替你抬指:先真的把物理键松开(松开本身不抬指),
+        // 再让宏按一次 —— 宏事件给上升沿,但不落物理镜像,功能键判定必须不认它。
+        note_physical(
+            &mut held,
+            CaptureKey {
+                code: 90,
+                pressed: false,
+            },
+            Source::Physical,
+        );
+        assert!(st.down, "物理松开本身不许抬指(只有热键/收手路径才抬)");
+        let macro_hit = {
+            let ev = CaptureKey {
+                code: 90,
+                pressed: true,
+            };
+            let fresh = note_physical(&mut held, ev, Source::Macro);
+            functional_key_hit(Source::Macro, ev, &keys, &held)
+                && fresh
+                && wake_key_action(&shared, &mut st)
+        };
+        assert!(!macro_hit, "宏事件不是物理输入,不许替你抬指");
+        assert!(st.down, "宏事件之后那根指还在");
+    }
+
+    /// A:对照 —— `wake_key` **未绑定**(空集合)时,按同一个键什么都不发生:
+    /// 指不抬、指令不发、映射开关不变。默认不绑 = 行为与从前逐位一致。
+    #[test]
+    fn wake_key_unbound_does_nothing() {
+        let empty = KeySet::new();
+        let ctl = ControlClient::for_test(1000, 1000);
+        let shared = shared_with_control(ctl);
+        let mut st = AimState {
+            mode_active: true,
+            down: true,
+            cur: (500, 500),
+            ox: 30.0,
+            oy: 30.0,
+            ..AimState::default()
+        };
+        let mut held = Held::default();
+        let ev = CaptureKey {
+            code: 90,
+            pressed: true,
+        };
+        let fresh = note_physical(&mut held, ev, Source::Physical);
+        let acted = functional_key_hit(Source::Physical, ev, &empty, &held)
+            && fresh
+            && wake_key_action(&shared, &mut st);
+        assert!(!acted, "没绑键就不该命中");
+        assert!(st.down, "未绑定时那根指必须保持按着");
+        assert_eq!((st.ox, st.oy), (30.0, 30.0), "未绑定时偏移不许被动");
+        assert!(st.mode_active, "未绑定时模式状态不许被动");
+        let g = lock_shared(&shared);
+        assert!(g.enabled, "未绑定时映射开关不许被动");
+        assert!(
+            g.control.as_ref().unwrap().take_cmds().is_empty(),
+            "未绑定时不许发任何指令"
+        );
+        assert!(g.profile.aim.wake_key.is_empty(), "配置里仍是未绑定");
+    }
+
+    /// D(2026-10-12):自愈开关开着的配置(其余字段与缺省一致)。
+    fn self_heal_cfg(on: bool) -> Aim {
+        Aim {
+            self_heal: on,
+            ..Aim::default()
+        }
+    }
+
+    /// ①②④:自愈**触发** ⇒ 瞄准指被抬起(与「唤醒视角」同一个动作,下一次位移
+    /// 重新落指),而**没有**关映射、没有退出 FPS、没有碰任何配置;限流 300ms。
+    ///
+    /// 触发源走的是界面请求那条(手机被手触摸的 Up 边沿),动作落在 [`self_heal_tick`]
+    /// —— 与 `run()` 维护块里那一行**同一个函数**,不是另写一份。
+    #[test]
+    fn self_heal_on_touch_up_lifts_aim_finger_without_touching_mapping() {
+        use crate::control::{ACTION_UP, ControlCmd};
+
+        let ctl = ControlClient::for_test(1000, 1000);
+        let shared = shared_with_control(ctl);
+        let cfg = self_heal_cfg(true);
+        let before_aim = lock_shared(&shared).profile.aim.clone();
+        let mut st = AimState {
+            mode_active: true,
+            down: true,
+            cur: (500, 500),
+            ox: 12.0,
+            oy: -8.0,
+            ..AimState::default()
+        };
+        let pid = st.active_pid();
+        let mut live = AimLive {
+            self_heal_req: Some(SELF_HEAL_REASON_TOUCH_UP),
+            ..AimLive::default()
+        };
+        let now = Instant::now();
+
+        // 维护块已经持锁 ⇒ 走 `self_heal_tick`(不能调 `lock_shared` 那个版本)。
+        let reason = {
+            let g = lock_shared(&shared);
+            let ctl = g.control.as_ref().expect("测试用控制通道");
+            self_heal_tick(ctl, true, &cfg, &mut st, &mut live, 1, now)
+        };
+        assert_eq!(
+            reason,
+            Some(SELF_HEAL_REASON_TOUCH_UP),
+            "「手离开手机」必须触发自愈"
+        );
+        assert!(!st.down, "瞄准指必须被抬起");
+        assert_eq!((st.ox, st.oy), (0.0, 0.0), "偏移同时清零(下次位移重新落指)");
+        assert!(st.mode_active, "自愈不许退出 FPS 模式");
+        assert!(!st.suspended, "自愈不许改挂起状态");
+        assert_eq!(st.self_heals, 1, "真的抬了指才算一次自愈");
+        assert_eq!(
+            st.self_heal_reason, SELF_HEAL_REASON_TOUCH_UP,
+            "最近原因要留给悬浮窗"
+        );
+        assert_eq!(live.self_heal_req, None, "请求取走即消费,不留到下次");
+
+        // 抬起指令真的发往设备,且指的就是原来那根指。
+        // ⚠ 判据必须写进**独立作用域**:`lock_shared` 不可重入(见它的注释)。
+        let cmds = {
+            let g = lock_shared(&shared);
+            g.control.as_ref().unwrap().take_cmds()
+        };
+        assert_eq!(cmds.len(), 1, "一次自愈只该发一条指令(抬起),实测 {cmds:?}");
+        assert!(
+            matches!(
+                cmds[0],
+                ControlCmd::Touch {
+                    action: ACTION_UP,
+                    pointer_id,
+                    ..
+                } if pointer_id == pid
+            ),
+            "必须是 UP 且落在原指上:{cmds:?}"
+        );
+        // 只抬指:映射开关与整份配置一字未动
+        let g = lock_shared(&shared);
+        assert!(g.enabled, "自愈绝不能关映射");
+        assert_eq!(g.profile.aim, before_aim, "自愈不许改任何配置");
+        drop(g);
+
+        // ④ 限流:没按着时不动作;重新按上之后 300ms 内不许第二次。
+        assert!(
+            self_heal_tick(
+                lock_shared(&shared).control.as_ref().unwrap(),
+                true,
+                &cfg,
+                &mut st,
+                &mut live,
+                1,
+                now
+            )
+            .is_none(),
+            "指已经抬起来了,再触发也不该有动作"
+        );
+        st.down = true;
+        st.cur = (520, 480);
+        live.self_heal_req = Some(SELF_HEAL_REASON_TOUCH_UP);
+        {
+            let g = lock_shared(&shared);
+            let ctl = g.control.as_ref().unwrap();
+            assert!(
+                self_heal_tick(
+                    ctl,
+                    true,
+                    &cfg,
+                    &mut st,
+                    &mut live,
+                    1,
+                    now + Duration::from_millis(299)
+                )
+                .is_none(),
+                "299ms 还在限流窗口内,不许再抬一次"
+            );
+        }
+        assert!(st.down, "限流期间那根指必须保持按着");
+        assert_eq!(st.self_heals, 1, "被限流的一次不算自愈");
+        live.self_heal_req = Some(SELF_HEAL_REASON_TOUCH_UP);
+        {
+            let g = lock_shared(&shared);
+            let ctl = g.control.as_ref().unwrap();
+            assert_eq!(
+                self_heal_tick(
+                    ctl,
+                    true,
+                    &cfg,
+                    &mut st,
+                    &mut live,
+                    1,
+                    now + SELF_HEAL_MIN_GAP
+                ),
+                Some(SELF_HEAL_REASON_TOUCH_UP),
+                "满 300ms 后允许第二次自愈"
+            );
+            assert_eq!(st.self_heals, 2);
+        }
+    }
+
+    /// ②:关掉 `Aim::self_heal` ⇒ **什么都不发生**(指不抬、指令不发、计数不涨);
+    /// 界面请求照样被取走(不留到以后开关打开时凭空抬一次指)。
+    #[test]
+    fn self_heal_off_does_nothing() {
+        let ctl = ControlClient::for_test(1000, 1000);
+        let shared = shared_with_control(ctl);
+        let cfg = self_heal_cfg(false);
+        let mut st = AimState {
+            mode_active: true,
+            down: true,
+            cur: (500, 500),
+            ox: 12.0,
+            ..AimState::default()
+        };
+        // 两个触发条件**同时**成立也不许动:Up 边沿请求 + 账本 0 而本地按着。
+        let mut live = AimLive {
+            self_heal_req: Some(SELF_HEAL_REASON_TOUCH_UP),
+            device_pointers: Some(0),
+            device_input_seen_at: Some(Instant::now()),
+            ..AimLive::default()
+        };
+        let reason = {
+            let g = lock_shared(&shared);
+            let ctl = g.control.as_ref().unwrap();
+            // 先让"账本看得见我们"这条护栏成立,证明不是靠护栏挡住的
+            self_heal_tick(ctl, true, &cfg, &mut st, &mut live, 0, Instant::now())
+        };
+        assert_eq!(reason, None, "关掉自愈后不许有任何动作");
+        assert!(st.down, "关掉自愈后那根指必须保持按着");
+        assert_eq!(st.self_heals, 0);
+        assert_eq!(st.self_heal_reason, "");
+        assert_eq!(
+            live.self_heal_req, None,
+            "请求仍被取走,避免以后开关打开时补一次"
+        );
+        let cmds = {
+            let g = lock_shared(&shared);
+            g.control.as_ref().unwrap().take_cmds()
+        };
+        assert!(cmds.is_empty(), "关掉自愈后不许发任何指令:{cmds:?}");
+
+        // 纯判定那层的三个前提:总映射关 / 自愈关 / 界面交互中,任一成立都返回 None
+        assert_eq!(
+            self_heal_decision(false, true, false, Some("x"), None),
+            None,
+            "总映射关着时不自愈"
+        );
+        assert_eq!(
+            self_heal_decision(true, false, false, Some("x"), None),
+            None,
+            "自愈开关关着时不自愈"
+        );
+        assert_eq!(
+            self_heal_decision(true, true, true, Some("x"), None),
+            None,
+            "宏步进/绑定捕获/取点期间不自愈"
+        );
+        assert_eq!(
+            self_heal_decision(true, true, false, Some("x"), Some("y")),
+            Some("x"),
+            "两个原因同时成立时报界面请求(手离开手机)"
+        );
+        assert_eq!(
+            self_heal_decision(true, true, false, None, Some("y")),
+            Some("y"),
+            "没有界面请求时按账本对不上"
+        );
+    }
+
+    /// ③:账本对账的**纯函数**级判定 —— 账本 0 vs 本地 down / 账本更多,
+    /// 以及三条护栏(None = 未知、未被证实、手正摸着手机)。
+    #[test]
+    fn ledger_mismatch_rules_and_guards() {
+        // ① 账本 0,而本地认为瞄准指按着(+ 账本已被证实看得见我们)⇒ 对不上
+        assert_eq!(
+            ledger_mismatch(Some(0), 1, true, false, true),
+            Some(LedgerMismatch::ZeroWhileDown)
+        );
+        // 本地还有别的触点(移动键等)也一样:关键是"本地按着"而账本是 0
+        assert!(ledger_mismatch(Some(0), 3, true, false, true).is_some());
+
+        // 护栏一:没读到 / 解析不出(None)一律当"没有证据" —— 绝不当 0
+        assert_eq!(ledger_mismatch(None, 1, true, false, true), None);
+        assert_eq!(ledger_mismatch(None, 0, false, false, true), None);
+
+        // 护栏二:账本还**没被证实**看得见我们(注入可能根本不进账本)⇒ 裸判 0
+        // 会把正常滑动变成"每 300ms 抬一次指",所以这条规则先不生效。
+        assert_eq!(ledger_mismatch(Some(0), 1, true, false, false), None);
+        // 本地没按着时,账本 0 本来就不算对不上
+        assert_eq!(ledger_mismatch(Some(0), 0, false, false, true), None);
+
+        // ② 账本比本地多 ⇒ 说明我们发出的 UP 没到设备端 / 手势被丢
+        assert_eq!(
+            ledger_mismatch(Some(3), 1, true, false, true),
+            Some(LedgerMismatch::MoreThanLocal)
+        );
+        assert!(ledger_mismatch(Some(1), 0, false, false, false).is_some());
+        // 账本比本地**少**但不是 0(设备端丢了我们的 DOWN)不在本轮判据里:
+        // 那种情况重叠换手就能救回来,不必抬指重建。
+        assert_eq!(ledger_mismatch(Some(1), 2, true, false, true), None);
+        // 相同 ⇒ 账本与本地一致,什么都不做
+        assert_eq!(ledger_mismatch(Some(2), 2, true, false, true), None);
+
+        // 护栏三:手机正被手摸 ⇒ 账本里多的那一个触点是物理手指,不是我们丢的 UP
+        assert_eq!(ledger_mismatch(Some(2), 1, true, true, true), None);
+        // 但"账本 0 而本地按着"与手摸不矛盾(手在屏上账本不可能是 0),照样判
+        assert!(ledger_mismatch(Some(0), 1, true, true, true).is_some());
+
+        // 两种形态各自有可读文案(日志/悬浮窗直接用)
+        assert!(!LedgerMismatch::ZeroWhileDown.label().is_empty());
+        assert!(!LedgerMismatch::MoreThanLocal.label().is_empty());
+    }
+
+    /// ③b:"账本 0 而本地按着"这条**不许**被单份账本骗出来 —— 必须连续两份
+    /// **新采样**都成立(账本 1/s + adb 往返,单份可能采在"手指刚落下之前")。
+    ///
+    /// 这是"默认开也不改手感"的关键护栏:正常起手(按下鼠标 → 开始推)随时可能
+    /// 撞上"设备端还没见到这根指"的那一份账本。
+    #[test]
+    fn ledger_zero_needs_two_consecutive_samples() {
+        let ctl = ControlClient::for_test(1000, 1000);
+        let shared = shared_with_control(ctl);
+        let cfg = self_heal_cfg(true);
+        let t0 = Instant::now();
+        let mut st = AimState {
+            down: true,
+            cur: (500, 500),
+            // 账本已被证实看得见我们(否则第①条护栏就先挡住了,测不到这里)
+            ledger_reflects_injection: true,
+            ..AimState::default()
+        };
+        let mut live = AimLive {
+            device_pointers: Some(0),
+            device_input_seen_at: Some(t0),
+            ..AimLive::default()
+        };
+        // 第一份账本(0 而本地按着):只记账,不动手
+        let first = {
+            let g = lock_shared(&shared);
+            let ctl = g.control.as_ref().unwrap();
+            self_heal_tick(ctl, true, &cfg, &mut st, &mut live, 1, t0)
+        };
+        assert_eq!(first, None, "单份账本不许触发自愈");
+        assert!(st.down, "指必须还按着");
+        assert_eq!(st.ledger_zero_streak, 1, "第一份记下 streak");
+
+        // 引擎每 4~16ms 一轮:同一个读数时刻**不算新的一份**,不许靠轮数凑数
+        for _ in 0..50 {
+            let again = {
+                let g = lock_shared(&shared);
+                let ctl = g.control.as_ref().unwrap();
+                self_heal_tick(ctl, true, &cfg, &mut st, &mut live, 1, t0)
+            };
+            assert_eq!(again, None, "同一份账本重复判定不许触发");
+        }
+        assert_eq!(st.ledger_zero_streak, 1, "同一份账本只算一份");
+
+        // 第二份**新**账本(1s 后仍是 0 而本地还按着)⇒ 认账,抬指重建
+        live.device_input_seen_at = Some(t0 + Duration::from_secs(1));
+        let second = {
+            let g = lock_shared(&shared);
+            let ctl = g.control.as_ref().unwrap();
+            self_heal_tick(
+                ctl,
+                true,
+                &cfg,
+                &mut st,
+                &mut live,
+                1,
+                t0 + Duration::from_secs(1),
+            )
+        };
+        assert_eq!(
+            second,
+            Some(LedgerMismatch::ZeroWhileDown.label()),
+            "连续两份账本都是 0 而本地按着 ⇒ 必须自愈"
+        );
+        assert!(!st.down, "自愈动作仍然是抬指");
+        assert_eq!(st.self_heals, 1);
+    }
+
+    /// ④:300ms 限流的**动作**级测试(不管是哪条触发源,都不能比这个更密)。
+    ///
+    /// 走的是 [`self_heal_action`](与「唤醒视角」的 `wake_key_action` 同一写法:
+    /// 自己去 `Shared` 取控制通道),所以"没按着 / 被限流 / 真抬了"三种结果都能
+    /// 直接断言,而且发出去的指令也真的能被数出来。
+    #[test]
+    fn self_heal_throttles_to_one_lift_per_300ms() {
+        use crate::control::{ACTION_UP, ControlCmd};
+
+        let ctl = ControlClient::for_test(1000, 1000);
+        let shared = shared_with_control(ctl);
+        let mut st = AimState {
+            down: true,
+            cur: (500, 500),
+            ..AimState::default()
+        };
+        let t0 = Instant::now();
+        assert!(self_heal_action(&shared, &mut st, t0), "第一次必须抬指");
+        assert!(!st.down);
+        assert_eq!(st.self_heals, 1);
+
+        st.down = true;
+        st.cur = (510, 500);
+        assert!(
+            !self_heal_action(&shared, &mut st, t0 + Duration::from_millis(299)),
+            "299ms 内必须被限流"
+        );
+        assert!(st.down, "被限流时那根指必须保持按着");
+        assert_eq!(st.self_heals, 1, "被限流的不算一次自愈");
+
+        assert!(
+            self_heal_action(&shared, &mut st, t0 + Duration::from_millis(300)),
+            "满 300ms 后允许第二次"
+        );
+        assert_eq!(st.self_heals, 2);
+        assert_eq!(st.last_self_heal, Some(t0 + Duration::from_millis(300)));
+
+        // 真的发了两条 UP(每次抬指一条),且都落在当前那根指上
+        let cmds = {
+            let g = lock_shared(&shared);
+            g.control.as_ref().unwrap().take_cmds()
+        };
+        assert_eq!(cmds.len(), 2, "两次自愈两条 UP:{cmds:?}");
+        assert!(cmds.iter().all(|c| matches!(
+            c,
+            ControlCmd::Touch {
+                action: ACTION_UP,
+                ..
+            }
+        )));
+        // 没按着时:既不抬指也不记账
+        assert!(!self_heal_action(
+            &shared,
+            &mut st,
+            t0 + Duration::from_secs(1)
+        ));
+        assert_eq!(st.self_heals, 2);
     }
 
     /// 未设锚点不生效;设了门控键则必须先按住
@@ -7073,25 +10175,6 @@ mod tests {
         open_world.hold_key = KeySet::single(273);
         st.gate_down = false;
         assert!(aim_active(&open_world, &st), "开放世界模式不依赖射击门控键");
-    }
-
-    /// Ctrl+Alt:一次组合只切换一次,松开后再按才会再次触发
-    #[test]
-    fn ctrl_alt_chord_fires_once_per_press() {
-        // 只按 Ctrl:不触发
-        assert!(!ctrl_alt_chord(KEY_LEFTCTRL, true, true, false));
-        // 在按住 Ctrl 的基础上按下 Alt:触发
-        assert!(ctrl_alt_chord(KEY_LEFTALT, true, true, true));
-        // Alt 保持按住时的重复按下事件:仍然算一次触发(由调用方取反,不会连发)
-        assert!(ctrl_alt_chord(KEY_LEFTALT, true, true, true));
-        // 松开 Alt:不触发
-        assert!(!ctrl_alt_chord(KEY_LEFTALT, false, true, false));
-
-        // 同时按住 Ctrl+Alt 时按其它键:不触发
-        assert!(!ctrl_alt_chord(30, true, true, true)); // KEY_A
-        // 右键的 Ctrl / Alt 同样识别
-        assert!(ctrl_alt_chord(KEY_RIGHTCTRL, true, true, true));
-        assert!(ctrl_alt_chord(KEY_RIGHTALT, true, true, true));
     }
 
     #[test]
@@ -7265,7 +10348,11 @@ mod tests {
             (-3000.0, 1234.0),
         ] {
             let (segs, next) = plan_aim_treadmill(ox, oy, lim, AIM_TREADMILL_MAX_HOPS);
-            assert!(!segs.is_empty());
+            // 零进展不造段(见 [`plan_aim_treadmill`] 的"零进展即停"):期望偏移为 0
+            // 时段表为空,含义就是"这一段什么都不用推"。有偏移时必须是实打实的段。
+            if ox != 0.0 || oy != 0.0 {
+                assert!(!segs.is_empty(), "有偏移就必须产出段:{segs:?}");
+            }
             let sum = segs
                 .iter()
                 .fold((0.0f32, 0.0f32), |a, (x, y)| (a.0 + x, a.1 + y));
@@ -7343,6 +10430,708 @@ mod tests {
         }
     }
 
+    /// DF-2:锚点贴边(某方向可用量为 0)时,跑步机不再空转 32 段。
+    ///
+    /// 旧实现在这种情况下每一段都产出 `(0, 0)`,调用方于是为每一段发一对
+    /// UP/DOWN —— 单次鼠标位移最多 31 对,既灌满写队列,又把推不动的累计位移
+    /// 静默丢掉。现在零进展直接返回空段表,注入层一条触摸消息都不发。
+    #[test]
+    fn unbounded_treadmill_does_not_spin_on_a_zero_room_direction() {
+        use crate::control::{ACTION_DOWN, ACTION_MOVE, ControlCmd};
+        let m = mapper();
+        // 锚点贴在左上角:向左、向上两个方向可用量都是 0
+        let aim = Aim {
+            boundary: false,
+            recenter_threshold: 400,
+            ..aim_at(0.0, 0.0)
+        };
+        let (ax, ay) = aim_anchor(&m, &aim);
+        let lim = aim_band_limits(&m, &aim, ax, ay);
+        assert_eq!((lim.0, lim.2), (0.0, 0.0), "贴边方向可用量必须为 0:{lim:?}");
+
+        // 几何:推不动的方向 ⇒ 空段表,且累计偏移仍被钳回可用矩形(不积压)
+        let (segs, next) = plan_aim_treadmill(-50.0, 0.0, lim, AIM_TREADMILL_MAX_HOPS);
+        assert!(segs.is_empty(), "零进展方向不该产出任何段:{segs:?}");
+        assert_eq!(next, (0.0, 0.0), "推不动的位移不积压到下一帧");
+
+        // 命令级:一条触摸消息都不发(旧实现是 1 个 DOWN + 31 对 UP/DOWN)
+        let ctl = ControlClient::for_test(1000, 1000);
+        let mut st = AimState::default();
+        st.ox = -50.0;
+        st.oy = 0.0;
+        st.dead_paid = true; // 死区已扣过:直接看这一段
+        aim_flush_unbounded(&ctl, &m, &aim, &mut st);
+        let cmds = ctl.take_cmds();
+        assert!(cmds.is_empty(), "零可用方向时不许发任何触摸消息:{cmds:?}");
+        assert!(!st.down, "更不该在锚点上按下一根手指");
+        assert_eq!((st.ox, st.oy), (0.0, 0.0), "推不动的位移不积压");
+
+        // 回归:正常的可用方向照旧 —— 段表精确送达,命令是 DOWN + MOVE
+        let good = (100.0, 120.0, 90.0, 80.0);
+        let (segs, _) = plan_aim_treadmill(250.0, -430.0, good, AIM_TREADMILL_MAX_HOPS);
+        let sum = segs
+            .iter()
+            .fold((0.0f32, 0.0f32), |a, (x, y)| (a.0 + x, a.1 + y));
+        assert!(
+            (sum.0 - 250.0).abs() < 0.5 && (sum.1 + 430.0).abs() < 0.5,
+            "有可用方向时总量必须精确:{sum:?}"
+        );
+        let ctl = ControlClient::for_test(1000, 1000);
+        let mut st = AimState::default();
+        st.ox = 50.0;
+        st.oy = 0.0;
+        st.dead_paid = true;
+        aim_flush_unbounded(&ctl, &m, &aim, &mut st);
+        let actions: Vec<u8> = ctl
+            .take_cmds()
+            .into_iter()
+            .filter_map(|c| match c {
+                ControlCmd::Touch { action, .. } => Some(action),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            actions,
+            vec![ACTION_DOWN, ACTION_MOVE],
+            "一段 = 按下 + 移到落点"
+        );
+        assert!(st.down, "正常方向照旧落指");
+    }
+
+    /// 拖动总量 = 落指期间所有 Move 的位移之和(抬指/重按本身不产生转动,
+    /// 所以换手不计入)。这就是设备端实际收到的"视角转动量"。
+    ///
+    /// 命令是**分批** `take_cmds` 取走的,所以"上一笔落点"这个游标必须跨批次保留 ——
+    /// 否则每一批的第一条 MOVE 都没有配对的 DOWN,位移会被整段漏掉。
+    ///
+    /// **按 pid 记**(2026-10-11 重叠换手之后必须如此):一次换手里"新指落下"与
+    /// "旧指抬起"之间两根瞄准指同时按着,所以游标要记住"每根指最后停在哪",
+    /// UP 只在"抬的正是游标那根指"时把游标交给另一根还在按着的指。
+    /// 旧写法(UP 无条件清游标)会把新指在锚点上的那次 DOWN 之后的第一段位移
+    /// 整段漏掉 —— 那不是"总量口径放宽",而是把重叠换手的位移算错了。
+    #[derive(Default)]
+    struct Rotation {
+        /// 游标:当前"正在产生转动"的那根指 + 它最后停在哪
+        last: Option<(u64, (i32, i32))>,
+        /// 此刻还按着的触点(按落下的先后顺序,与设备端 PointersState 同序)
+        down: Vec<u64>,
+        total: f32,
+    }
+
+    impl Rotation {
+        /// 喂入一批命令,返回这一批新增的转动量
+        fn feed(&mut self, cmds: &[crate::control::ControlCmd]) -> f32 {
+            use crate::control::{ACTION_DOWN, ACTION_MOVE, ACTION_UP, ControlCmd};
+            let before = self.total;
+            for c in cmds {
+                if let ControlCmd::Touch {
+                    action,
+                    pointer_id,
+                    x,
+                    y,
+                } = c
+                {
+                    let (x, y) = (*x as i32, *y as i32);
+                    match *action {
+                        ACTION_DOWN => {
+                            self.down.push(*pointer_id);
+                            self.last = Some((*pointer_id, (x, y)));
+                        }
+                        ACTION_MOVE => {
+                            // 只有游标那根指的位移才算转动(换手之后游标换到新指)
+                            if let Some((pid, (px, py))) = self.last {
+                                if pid == *pointer_id {
+                                    self.total += (((x - px) as f32).powi(2)
+                                        + ((y - py) as f32).powi(2))
+                                    .sqrt();
+                                }
+                            }
+                            self.last = Some((*pointer_id, (x, y)));
+                        }
+                        ACTION_UP => {
+                            self.down.retain(|p| *p != *pointer_id);
+                            if self.last.map(|(pid, _)| pid) == Some(*pointer_id) {
+                                // 抬的正是游标那根:交给另一根还在按着的指
+                                // (重叠换手时就是刚在锚点落下的新指)。
+                                self.last = self.down.last().map(|p| (*p, (x, y)));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            self.total - before
+        }
+    }
+
+    /// 用户 2026-10-11(问题 1):无边界跑步机必须**跨帧摊开**交付。
+    ///
+    /// 旧实现把一次累计偏移(可达一个回转半径,用户是 200px)在同一帧里全部注入,
+    /// 游戏端只要对"每帧位移/速度"有任何增益或钳制,就会被放大成一次突兀的加速。
+    /// 新口径:单次调用最多交付 [`AIM_MAX_STEP_PX`],余量留在 `st.ox/oy`,由下一次
+    /// 调用接着推 —— **跨调用累计之和仍然精确等于期望偏移**(§4.14 任务2 的承诺
+    /// 由"单次调用内段之和"重述为"跨调用累计之和",语义不弱化)。
+    #[test]
+    fn unbounded_treadmill_spreads_a_huge_step_across_frames() {
+        use crate::control::ControlCmd;
+        let m = mapper();
+        let aim = Aim {
+            boundary: false,
+            recenter_threshold: 200,
+            ..aim_at(0.5, 0.5)
+        };
+        let (ax, ay) = aim_anchor(&m, &aim);
+        let lim = aim_band_limits(&m, &aim, ax, ay);
+        assert!(lim.1 > 100.0, "这个锚点向右应有充足空间:{lim:?}");
+
+        let ctl = ControlClient::for_test(1000, 1000);
+        let mut st = AimState::default();
+        st.anchor_used = (ax, ay);
+        st.dead_paid = true;
+        // 一次"巨量"累计偏移:相当于一帧里夹带了 3000px(卡顿后的合并位移 / 甩枪)
+        let want = 3000.0f32;
+        st.ox = want;
+
+        // 第一次调用:交付量必须被上限压住,余量留在累计偏移里
+        let mut rot = Rotation::default();
+        aim_flush_unbounded(&ctl, &m, &aim, &mut st);
+        let first = rot.feed(&ctl.take_cmds());
+        assert!(first > 0.0, "有余量就必须真的推出去");
+        assert!(
+            first <= AIM_MAX_STEP_PX + 1.5,
+            "单次交付必须受上限约束(实际 {first},上限 {AIM_MAX_STEP_PX})"
+        );
+        let finger = st.cur.0 as f32 - ax as f32;
+        assert!(
+            st.ox - finger > 0.0,
+            "余量必须留在累计偏移里(累计 {}/手指 {finger})",
+            st.ox
+        );
+
+        // 继续推:每轮都受上限约束,直到余量送完
+        let mut rounds = 1;
+        while st.ox - (st.cur.0 as f32 - ax as f32) >= 0.5 && rounds < 2000 {
+            aim_flush_unbounded(&ctl, &m, &aim, &mut st);
+            let d = rot.feed(&ctl.take_cmds());
+            assert!(
+                d <= AIM_MAX_STEP_PX + 1.5,
+                "第 {rounds} 轮超上限:{d}(上限 {AIM_MAX_STEP_PX})"
+            );
+            rounds += 1;
+        }
+        assert!(rounds < 2000, "余量必须在有限轮内送完");
+        assert!(
+            (rot.total - want).abs() < 3.0,
+            "跨帧累计总量必须精确等于期望偏移:{} vs {want}",
+            rot.total
+        );
+
+        // 余量为 0:一条命令都不许再发(也不许再落指/抬指)
+        let sent = st.sent;
+        aim_flush_unbounded(&ctl, &m, &aim, &mut st);
+        let cmds: Vec<ControlCmd> = ctl.take_cmds();
+        assert!(cmds.is_empty(), "没有余量时不得再注入:{cmds:?}");
+        assert_eq!(st.sent, sent, "没有余量时不许再发触摸消息");
+    }
+
+    /// 余量推进的闭环([`aim_drain_pending`]):没有新的鼠标位移时,
+    /// 也要把上一轮没送完的余量推出去 —— 但**只在拖动进行中**、
+    /// 且**不刷新 `last_motion`**(否则静止归中会被无限推迟)。
+    #[test]
+    fn drain_pending_pushes_the_leftover_without_touching_last_motion() {
+        let m = mapper();
+        let aim = Aim {
+            boundary: false,
+            recenter_threshold: 200,
+            ..aim_at(0.5, 0.5)
+        };
+        let (ax, ay) = aim_anchor(&m, &aim);
+        let ctl = ControlClient::for_test(1000, 1000);
+        let mut st = AimState::default();
+        st.mode_active = true;
+        st.anchor_used = (ax, ay);
+        st.dead_paid = true;
+        st.ox = 500.0;
+        st.oy = 0.0;
+        st.down = true;
+        st.cur = (ax, ay);
+        let motion = Instant::now() - Duration::from_millis(500);
+        st.last_motion = Some(motion);
+
+        // 手指此刻就在锚点上(手动接上的状态):游标从锚点起步
+        let mut rot = Rotation {
+            last: Some((st.active_pid(), (ax, ay))),
+            down: vec![st.active_pid()],
+            total: 0.0,
+        };
+        aim_drain_pending(&ctl, &m, &aim, &mut st);
+        let pushed = rot.feed(&ctl.take_cmds());
+        assert!(pushed > 0.0, "有落指 + 有余量时必须继续推");
+        assert!(pushed <= AIM_MAX_STEP_PX + 1.5, "单轮仍然受上限约束");
+        assert_eq!(st.last_motion, Some(motion), "余量推进不得刷新 last_motion");
+
+        // 余量送完后:静止不动,一条消息都不发
+        while (st.ox - (st.cur.0 as f32 - ax as f32)).abs() >= 0.5 {
+            aim_drain_pending(&ctl, &m, &aim, &mut st);
+            let _ = rot.feed(&ctl.take_cmds());
+        }
+        assert!(rot.total > 400.0, "余量必须真的被推完:{}", rot.total);
+        aim_drain_pending(&ctl, &m, &aim, &mut st);
+        assert!(ctl.take_cmds().is_empty(), "余量送完后必须彻底安静");
+
+        // 没有落指(抬指状态)时什么都不做
+        st.down = false;
+        st.ox = 400.0;
+        aim_drain_pending(&ctl, &m, &aim, &mut st);
+        assert!(ctl.take_cmds().is_empty(), "没落指时不得注入");
+    }
+
+    // ---------------- 重叠换手(2026-10-11) ----------------
+
+    /// 这个 pid 是不是瞄准触点(审计/断言用)。
+    fn is_aim_pid(pid: u64) -> bool {
+        pid == AIM_PID || pid == AIM_PID_ALT
+    }
+
+    /// 取走队列里的触摸指令,规约成 `(action, pid, x, y)`。
+    fn touch_cmds(ctl: &ControlClient) -> Vec<(u8, u64, i32, i32)> {
+        ctl.take_cmds()
+            .into_iter()
+            .filter_map(|c| match c {
+                crate::control::ControlCmd::Touch {
+                    action,
+                    pointer_id,
+                    x,
+                    y,
+                } => Some((action, pointer_id, x as i32, y as i32)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 瞄准触点流的审计结果(重叠换手的三条硬性质)。
+    #[derive(Default, Debug)]
+    struct AimAudit {
+        /// `DOWN(新 pid)` 紧跟 `UP(旧 pid)` 且两个 pid 不同 = 一次重叠换手
+        handoffs: usize,
+        /// 拖动过程中出现过"零瞄准触点"的瞬间(结尾那次抬指不算)
+        zero_gap: bool,
+        /// 抬过一根从没按下的 pid(在按数减到负数)
+        illegal_up: bool,
+        /// 抬旧指之后才按新指的窗口数(旧形态的指纹,必须是 0)
+        up_then_down: usize,
+        down: usize,
+        up: usize,
+    }
+
+    /// `single_run` = "这一串命令属于**同一次拖动**":从落指到抬指之间不许出现
+    /// 零瞄准触点。显式抬指(`aim_lift` / 关映射)之后重新落指的流天然会归零,
+    /// 那不是换手的锅,传 `false` 跳过这一项。
+    fn audit_aim_touches(cmds: &[(u8, u64, i32, i32)], single_run: bool) -> AimAudit {
+        use crate::control::{ACTION_DOWN, ACTION_UP};
+        let mut out = AimAudit::default();
+        let aim: Vec<&(u8, u64, i32, i32)> = cmds.iter().filter(|c| is_aim_pid(c.1)).collect();
+        let mut live: i64 = 0;
+        for (i, c) in aim.iter().enumerate() {
+            match c.0 {
+                ACTION_DOWN => {
+                    live += 1;
+                    out.down += 1;
+                }
+                ACTION_UP => {
+                    live -= 1;
+                    out.up += 1;
+                    if live < 0 {
+                        out.illegal_up = true;
+                    }
+                }
+                _ => {}
+            }
+            // 拖动途中出现"一根瞄准指都没按"= 设备端会发真 ACTION_UP;只要后面
+            // 还有瞄准命令,这一次归零就在拖动中间(结尾的抬指不算)。
+            if single_run && live == 0 && i + 1 < aim.len() {
+                out.zero_gap = true;
+            }
+        }
+        for w in cmds.windows(2) {
+            let (a0, p0, ..) = w[0];
+            let (a1, p1, ..) = w[1];
+            if !is_aim_pid(p0) || !is_aim_pid(p1) {
+                continue;
+            }
+            if a0 == ACTION_DOWN && a1 == ACTION_UP && p0 != p1 {
+                out.handoffs += 1;
+            }
+            if a0 == ACTION_UP && a1 == ACTION_DOWN {
+                out.up_then_down += 1;
+            }
+        }
+        out
+    }
+
+    /// 用户 2026-10-11:换手的**事件序列**锁。
+    ///
+    /// 旧形态是 `UP(旧指)` → `DOWN(新指)`,设备端会在同一批里看到瞄准触点归零;
+    /// 新形态必须是 `DOWN(新 pid, 锚点)` → `UP(旧 pid, 落点)`,全程序列里:
+    /// ①`DOWN→UP` 的换手窗口存在、两个 pid 不同、DOWN 在前;
+    /// ②一次 `UP→DOWN` 的窗口都没有;
+    /// ③拖动途中从不出现"零瞄准触点";④全程 DOWN 数 == UP 数 + 1(结尾仍按着)。
+    #[test]
+    fn aim_treadmill_hands_over_with_the_new_pointer_down_first() {
+        use crate::control::{ACTION_DOWN, ACTION_MOVE, ACTION_UP};
+        let m = mapper();
+        let aim = Aim {
+            boundary: false,
+            recenter_threshold: 200,
+            ..aim_at(0.5, 0.5)
+        };
+        let (ax, ay) = aim_anchor(&m, &aim);
+        let ctl = ControlClient::for_test(1000, 1000);
+        let mut st = AimState::default();
+        st.mode_active = true;
+        st.anchor_used = (ax, ay);
+        st.dead_paid = true;
+        st.ox = 900.0;
+
+        // 与引擎同口径:每轮最多交付 AIM_MAX_STEP_PX,余量由后续轮次接着推。
+        let mut guard = 0;
+        aim_flush_unbounded(&ctl, &m, &aim, &mut st);
+        while st.ox - (st.cur.0 as f32 - ax as f32) >= 0.5 && guard < 500 {
+            aim_flush_unbounded(&ctl, &m, &aim, &mut st);
+            guard += 1;
+        }
+        let cmds = touch_cmds(&ctl);
+        let audit = audit_aim_touches(&cmds, true);
+
+        assert!(st.handoffs > 0, "这段位移必须真的换过手");
+        assert_eq!(
+            audit.handoffs as u64, st.handoffs,
+            "每一次换手都必须是 DOWN(新 pid)→ UP(旧 pid):{cmds:?}"
+        );
+        assert_eq!(audit.up_then_down, 0, "不许再出现 UP→DOWN 的旧形态");
+        assert!(!audit.zero_gap, "拖动途中不许出现零瞄准触点:{cmds:?}");
+        assert!(!audit.illegal_up, "不许抬一根从没按下的 pid");
+        assert_eq!(
+            audit.down,
+            audit.up + 1,
+            "落指状态必须收得住(DOWN == UP + 1):{cmds:?}"
+        );
+        assert_eq!(
+            cmds[0],
+            (ACTION_DOWN, AIM_PID, ax, ay),
+            "第一笔是主 pid 落指"
+        );
+        assert!(st.down, "结尾仍按着(换手不抬干净)");
+
+        // 每一处换手的具体形态:DOWN(新 pid, 锚点) 紧接 UP(旧 pid, 上一处落点)
+        for w in cmds.windows(2) {
+            let (a0, p0, x0, y0) = w[0];
+            let (a1, p1, x1, y1) = w[1];
+            if !(is_aim_pid(p0) && is_aim_pid(p1) && a0 == ACTION_DOWN && a1 == ACTION_UP) {
+                continue;
+            }
+            assert_ne!(p0, p1, "重叠换手必须换一个 pid(同一个 pid 重复 DOWN 非法)");
+            assert_eq!((x0, y0), (ax, ay), "新指必须落在锚点上");
+            assert!(
+                (x1 - ax).abs() <= 200 && (y1 - ay).abs() <= 200,
+                "旧指必须抬在它自己的落点上(可用矩形内):({x1}, {y1})"
+            );
+        }
+        // 换手之后接着推的那一段必须走在**新** pid 上
+        let first_handoff = cmds
+            .windows(2)
+            .position(|w| {
+                w[0].0 == ACTION_DOWN
+                    && w[1].0 == ACTION_UP
+                    && is_aim_pid(w[0].1)
+                    && is_aim_pid(w[1].1)
+            })
+            .expect("必须有一次换手");
+        let after = cmds[first_handoff + 2..]
+            .iter()
+            .find(|c| c.0 == ACTION_MOVE);
+        if let Some(c) = after {
+            assert_eq!(c.1, cmds[first_handoff].1, "换手之后的 MOVE 必须在新指上");
+        }
+    }
+
+    /// 用户 2026-10-11:归中必须与换手同一形态(否则换个归中策略又跳)。
+    ///
+    /// 锁:①`DOWN(新 pid, 锚点)` 在 `UP(旧 pid, 落点)` **之前**;②两次归中
+    /// pid 交替(3000 → 3001 → 3000);③抬的是"当前按着的那根",抬完本地仍是落指态。
+    #[test]
+    fn aim_recenter_hands_over_with_overlap_and_alternating_pids() {
+        use crate::control::{ACTION_DOWN, ACTION_MOVE, ACTION_UP};
+        let m = mapper();
+        let aim = Aim {
+            recenter_threshold: 100,
+            ..aim_at(0.5, 0.5)
+        };
+        let (ax, ay) = aim_anchor(&m, &aim);
+        let ctl = ControlClient::for_test(1000, 1000);
+        let mut st = AimState::default();
+        st.mode_active = true;
+        st.down = true;
+        st.anchor_used = (ax, ay);
+        st.cur = (ax + 150, ay + 40);
+        st.ox = 150.0;
+        st.oy = 40.0;
+        assert_eq!(st.active_pid(), AIM_PID);
+
+        aim_recenter(&ctl, &m, &aim, &mut st);
+        assert_eq!(
+            touch_cmds(&ctl),
+            vec![
+                (ACTION_DOWN, AIM_PID_ALT, ax, ay),
+                (ACTION_UP, AIM_PID, ax + 150, ay + 40),
+            ],
+            "归中必须先在锚点按下新指,再抬旧指"
+        );
+        assert_eq!(st.active_pid(), AIM_PID_ALT, "归中之后按着的是新指");
+        assert!(st.down, "归中不是收手");
+        assert_eq!(st.cur, (ax, ay));
+        assert_eq!((st.ox, st.oy), (0.0, 0.0), "归中仍然清零累计偏移");
+        assert_eq!(st.handoffs, 1);
+
+        // 第二次归中:pid 交替回主号,顺序不变
+        st.cur = (ax - 60, ay + 10);
+        st.ox = -60.0;
+        st.oy = 10.0;
+        aim_recenter(&ctl, &m, &aim, &mut st);
+        assert_eq!(
+            touch_cmds(&ctl),
+            vec![
+                (ACTION_DOWN, AIM_PID, ax, ay),
+                (ACTION_UP, AIM_PID_ALT, ax - 60, ay + 10),
+            ],
+            "第二次归中必须交替回主 pid,且顺序仍是 DOWN 先、UP 后"
+        );
+        assert_eq!(st.active_pid(), AIM_PID);
+        assert_eq!(st.handoffs, 2);
+
+        // 归中也是"无缝"的:一次归中 = 1 DOWN + 1 UP,pid 交替。把"先落指 →
+        // 拖一段 → 归中 → 再拖一段 → 再归中"的完整流拼出来(与真实序列逐条一致,
+        // 两次归中之间必须夹着那段 MOVE,否则相邻关系是假的)。
+        let full = vec![
+            (ACTION_DOWN, AIM_PID, ax, ay),
+            (ACTION_MOVE, AIM_PID, ax + 150, ay + 40),
+            (ACTION_DOWN, AIM_PID_ALT, ax, ay),
+            (ACTION_UP, AIM_PID, ax + 150, ay + 40),
+            (ACTION_MOVE, AIM_PID_ALT, ax - 60, ay + 10),
+            (ACTION_DOWN, AIM_PID, ax, ay),
+            (ACTION_UP, AIM_PID_ALT, ax - 60, ay + 10),
+        ];
+        let audit = audit_aim_touches(&full, true);
+        assert_eq!(
+            (audit.down, audit.up),
+            (3, 2),
+            "整段拖动 DOWN == UP + 1(结尾仍按着)"
+        );
+        assert_eq!(audit.handoffs, 2, "两次归中 = 两次重叠换手");
+        assert!(!audit.zero_gap, "归中途中也有瞄准指按着(不归零)");
+        assert!(!audit.illegal_up);
+        assert_eq!(audit.up_then_down, 0, "归中不许是 UP→DOWN 的旧形态");
+    }
+
+    /// 触点预算的边角:重叠要多占**一个**触点,只有在池子还塞得下时才重叠。
+    ///
+    /// 其它触点已经 9 个(瞄准自己在按 = 10 = 池满)时,新指的 DOWN 会被
+    /// scrcpy-server 直接丢掉,而本地会以为它按下了 —— 之后所有 MOVE 都发给一根
+    /// 设备端不存在的指。所以这种边角必须退回旧形态(先抬后按),并且**不翻 pid**
+    /// (抬完腾出的位子正好给同一根指再按下,状态不会脱节)。
+    #[test]
+    fn aim_handoff_falls_back_to_lift_then_press_when_the_pool_is_full() {
+        use crate::control::{ACTION_DOWN, ACTION_UP};
+        let m = mapper();
+        let aim = Aim {
+            recenter_threshold: 100,
+            ..aim_at(0.5, 0.5)
+        };
+        let (ax, ay) = aim_anchor(&m, &aim);
+        let ctl = ControlClient::for_test(1000, 1000);
+        let mut st = AimState::default();
+        st.mode_active = true;
+        st.down = true;
+        st.anchor_used = (ax, ay);
+        st.cur = (ax + 150, ay);
+        st.ox = 150.0;
+
+        // 池子刚好只剩"瞄准自己"这一个位子:退回先抬后按
+        st.others = DEVICE_MAX_POINTERS - 1;
+        aim_recenter(&ctl, &m, &aim, &mut st);
+        assert_eq!(
+            touch_cmds(&ctl),
+            vec![
+                (ACTION_UP, AIM_PID, ax + 150, ay),
+                (ACTION_DOWN, AIM_PID, ax, ay),
+            ],
+            "池满时必须先抬后按(否则那一次 DOWN 会被设备端丢掉)"
+        );
+        assert_eq!(st.active_pid(), AIM_PID, "退化路径不翻 pid");
+        assert!(st.down);
+        assert_eq!(st.handoffs, 1, "退化路径也记一次换手(日志里 form=fallback)");
+
+        // 池子有富余(其它触点 8 个,加上瞄准自己正好 9 ≤ 10):照常重叠
+        st.others = DEVICE_MAX_POINTERS - 2;
+        st.cur = (ax + 80, ay);
+        st.ox = 80.0;
+        aim_recenter(&ctl, &m, &aim, &mut st);
+        assert_eq!(
+            touch_cmds(&ctl),
+            vec![
+                (ACTION_DOWN, AIM_PID_ALT, ax, ay),
+                (ACTION_UP, AIM_PID, ax + 80, ay),
+            ],
+            "还塞得下就必须重叠"
+        );
+        assert_eq!(st.active_pid(), AIM_PID_ALT);
+    }
+
+    /// 用户 2026-10-11:重叠换手**不得增减注入位移**,且**换手次数不增加**。
+    ///
+    /// 总量口径沿用既有承诺:跨调用累计交付的拖动量 == 鼠标累计位移
+    /// (死区预先扣过)。换手次数按几何下界锁:每换一次手至少推进一个回转半径,
+    /// 所以 `换手次数 × band` 不会超过总量太多 —— 重叠换手本身不额外换手。
+    #[test]
+    fn aim_handoffs_conserve_the_total_and_do_not_multiply() {
+        let m = mapper();
+        let band = 200;
+        let aim = Aim {
+            boundary: false,
+            recenter_threshold: band,
+            ..aim_at(0.5, 0.5)
+        };
+        let (ax, ay) = aim_anchor(&m, &aim);
+        let ctl = ControlClient::for_test(1000, 1000);
+        let mut st = AimState::default();
+        st.mode_active = true;
+        st.anchor_used = (ax, ay);
+        st.dead_paid = true; // 死区已扣过:只看增量
+
+        let mut rot = Rotation::default();
+        let mut want = 0.0f32;
+        // 20 帧 × 400px:每帧都跨过回转半径两次,换手必然发生;余量按引擎口径
+        // (每轮最多 AIM_MAX_STEP_PX)逐轮推完。
+        for _ in 0..20 {
+            st.ox += 400.0;
+            want += 400.0;
+            let mut guard = 0;
+            while st.ox - (st.cur.0 as f32 - ax as f32) >= 0.5 && guard < 500 {
+                aim_flush_unbounded(&ctl, &m, &aim, &mut st);
+                rot.feed(&ctl.take_cmds());
+                guard += 1;
+            }
+            assert!(guard < 500, "余量必须在有限轮内送完");
+        }
+        assert!(
+            (rot.total - want).abs() < 3.0,
+            "多次换手之后总量必须仍然精确:{} vs {want}",
+            rot.total
+        );
+        let handoffs = st.handoffs;
+        assert!(handoffs > 0, "这段位移必须真的换过手");
+        // 换手次数不增加:每次换手至少推进一个 band,所以
+        // 换手次数 ≤ 总量 / band + 1(旧形态的段表与现在完全相同,
+        // 重叠只是把"UP→DOWN"换成"DOWN→UP",不产生额外的换手)。
+        let upper = (want / band as f32) as u64 + 1;
+        assert!(
+            handoffs <= upper,
+            "换手次数不该超过几何下界:{handoffs} > {upper}(总量 {want}, band {band})"
+        );
+        // 反向兜底:换手太少说明压根没换(那"无缝"就没被验证到)
+        assert!(
+            handoffs + 2 >= (want / band as f32) as u64,
+            "换手次数明显偏少:{handoffs}"
+        );
+        assert!(st.down, "结尾仍按着");
+    }
+
+    /// 用户 2026-10-11:`aim_lift` / 断连(`aim_release_local`)/ 关映射之后,
+    /// 下一次落指用的必须是**合法的那个 pid** —— 不变式是"只有当前按着的那根指
+    /// 才会被抬起来",因此绝不会出现"抬一根从没按下的 pid"或"抬错指"。
+    #[test]
+    fn aim_next_down_uses_the_pid_that_was_just_lifted() {
+        use crate::control::{ACTION_DOWN, ACTION_UP};
+        let m = mapper();
+        let aim = Aim {
+            boundary: false,
+            recenter_threshold: 400,
+            ..aim_at(0.5, 0.5)
+        };
+        let (ax, ay) = aim_anchor(&m, &aim);
+        let ctl = ControlClient::for_test(1000, 1000);
+        let mut st = AimState::default();
+        st.mode_active = true;
+        st.anchor_used = (ax, ay);
+        st.dead_paid = true;
+        st.ox = 900.0;
+
+        let mut all: Vec<(u8, u64, i32, i32)> = Vec::new();
+        // ① 正常拖动(会换手若干次,pid 可能停在 ALT 上)
+        aim_flush_unbounded(&ctl, &m, &aim, &mut st);
+        let mut guard = 0;
+        while st.ox - (st.cur.0 as f32 - ax as f32) >= 0.5 && guard < 500 {
+            aim_flush_unbounded(&ctl, &m, &aim, &mut st);
+            guard += 1;
+        }
+        let drag = touch_cmds(&ctl);
+        // 这一段是"同一次拖动":不许有零瞄准触点的瞬间,也不许有 UP→DOWN 的旧形态
+        let drag_audit = audit_aim_touches(&drag, true);
+        assert!(!drag_audit.zero_gap, "拖动途中不许出现零瞄准触点:{drag:?}");
+        assert_eq!(
+            drag_audit.up_then_down, 0,
+            "拖动途中不许有 UP→DOWN:{drag:?}"
+        );
+        assert_eq!(drag_audit.down, drag_audit.up + 1, "拖动结尾仍按着");
+        all.extend(drag);
+        assert!(st.handoffs > 0, "先要真的换过手,才谈得上抬哪根指");
+        let held_pid = st.active_pid();
+
+        // ② 关映射/松开门控 → `aim_lift`:抬的必须是当前按着的那根
+        aim_lift(&ctl, &mut st);
+        let lifted = touch_cmds(&ctl);
+        assert_eq!(lifted.len(), 1, "抬指只发一条:{lifted:?}");
+        assert_eq!(lifted[0].0, ACTION_UP);
+        assert_eq!(lifted[0].1, held_pid, "抬的必须是当前按着的那根指");
+        all.extend(lifted);
+        assert!(!st.down);
+        assert_eq!(st.active_pid(), held_pid, "抬指不翻 pid");
+
+        // ③ 下一次落指:用同一个(刚被合法抬起的)pid,且第一条命令是 DOWN
+        st.anchor_used = (ax, ay);
+        st.dead_paid = true;
+        st.ox = 60.0;
+        aim_flush_unbounded(&ctl, &m, &aim, &mut st);
+        let fresh = touch_cmds(&ctl);
+        assert_eq!(fresh[0].0, ACTION_DOWN, "重新开始拖动必须落指:{fresh:?}");
+        assert_eq!(fresh[0].1, held_pid, "落指用的就是刚抬起的那根指");
+        all.extend(fresh);
+
+        // ④ 断连路径:只清本地状态(通道没了,不发 UP),下一次落指仍然合法
+        aim_release_local(&mut st);
+        assert!(!st.down);
+        let next = st.active_pid();
+        assert!(is_aim_pid(next), "瞄准 pid 只能是主号或重叠号:{next}");
+        st.anchor_used = (ax, ay);
+        st.dead_paid = true;
+        st.ox = 40.0;
+        aim_flush_unbounded(&ctl, &m, &aim, &mut st);
+        let after_break = touch_cmds(&ctl);
+        assert_eq!(after_break[0].0, ACTION_DOWN);
+        assert_eq!(after_break[0].1, next);
+        all.extend(after_break);
+
+        // 整条流跨了"显式抬指 → 重新落指",所以不做"零瞄准触点"检查
+        // (那一次 ACTION_UP 是用户/映射开关要的,不是换手漏出来的):
+        // 只查"抬过没按下的 pid"与"重叠换手的次数对得上"。
+        let audit = audit_aim_touches(&all, false);
+        assert!(!audit.illegal_up, "不许抬一根从没按下的 pid:{all:?}");
+        assert_eq!(
+            audit.handoffs as u64, st.handoffs,
+            "每一次换手都是重叠形态,且 ③ 段的重新落指不算换手(pid 相同):{all:?}"
+        );
+    }
+
     #[test]
     fn macro_steps_are_serializable_and_change_bind_signature() {
         use crate::keymap::{MacroAction, MacroStep};
@@ -7361,6 +11150,8 @@ mod tests {
                     delay_ms: 40,
                 },
             ],
+
+            repeat_while_held: false,
         });
         let bind = KeyBind {
             key: 29,
@@ -7526,6 +11317,118 @@ mod tests {
         assert!(!keepalive_due(Some(now + Duration::from_secs(1)), now));
     }
 
+    /// DF-13:那次落指的 DOWN 可能被设备端悄悄丢掉(十指池满),手指于是永远停在
+    /// 圆心 —— 用户看到的是"轮盘推不动,换个方向又好了"。
+    ///
+    /// 锁五件事:①本地预算占满十指池时挂上"未确认"标记,节拍到期补一套
+    /// `UP(上次落点) → DOWN(圆心) → MOVE(落点)`;②同一次落指绝不补第二次;
+    /// ③池子有富余(正常情况)从不补;④`reserved` = 9 / 0 / 10 三种取值的行为;
+    /// ⑤释放点会清掉标志(否则会退化成"落指后立刻补按")。
+    #[test]
+    fn wheel_keepalive_refills_a_lost_down_exactly_once() {
+        use crate::control::{ACTION_DOWN, ACTION_MOVE, ACTION_UP, ControlCmd};
+        let m = Mapper::new(crate::keymap::CoordUnit::Rel, (1000, 1000));
+        let mut profile = Profile::default();
+        profile.wheels = vec![Wheel::new_default(&m, 0.5, 0.5)];
+        let w = profile.wheels[0].clone();
+        let ctl = ControlClient::for_test(1000, 1000);
+
+        fn touches(ctl: &ControlClient) -> Vec<(u8, i32, i32)> {
+            ctl.take_cmds()
+                .into_iter()
+                .filter_map(|c| match c {
+                    ControlCmd::Touch { action, x, y, .. } => Some((action, x as i32, y as i32)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        // ---- reserved = 10(池满):落指被拒,本地不记"按着",更不该武装补按 ----
+        let mut wheels = [WheelState::default()];
+        wheels[0].pressed[0] = true; // 方向"上"
+        assert!(
+            update_wheel(&ctl, &m, 0, &w, &mut wheels[0], DEVICE_MAX_POINTERS),
+            "池满必须如实报告拒绝"
+        );
+        assert!(!wheels[0].down, "被拒的落指不该记成本地按着");
+        assert!(!wheels[0].down_unconfirmed, "被拒的落指更不该武装补按");
+        assert!(touches(&ctl).is_empty());
+
+        // ---- reserved = 0(正常):落指不武装,保活只重发落点 ----
+        let mut wheels = [WheelState::default()];
+        wheels[0].pressed[0] = true;
+        assert!(!update_wheel(&ctl, &m, 0, &w, &mut wheels[0], 0));
+        assert!(wheels[0].down);
+        assert!(
+            !wheels[0].down_unconfirmed,
+            "池子有富余 = 正常情况,行为必须与修复前逐字一致"
+        );
+        let landed = touches(&ctl);
+        assert_eq!(landed.len(), 2, "落指 = DOWN(圆心) + MOVE(落点):{landed:?}");
+        assert_eq!(landed[0].0, ACTION_DOWN);
+        assert_eq!(landed[1].0, ACTION_MOVE);
+        wheels[0].sent_at = None; // 节拍到期
+        wheel_keepalive(&ctl, &m, &profile, &mut wheels, 0);
+        assert_eq!(
+            touches(&ctl),
+            vec![(ACTION_MOVE, landed[1].1, landed[1].2)],
+            "正常落指只重发落点,不许补按"
+        );
+        assert_eq!(wheels[0].down_retries, 0);
+
+        // ---- reserved = 9(落指后正好占满十指池):武装,节拍到期补一套 ----
+        let mut wheels = [WheelState::default()];
+        wheels[0].pressed[0] = true;
+        assert!(!update_wheel(
+            &ctl,
+            &m,
+            0,
+            &w,
+            &mut wheels[0],
+            DEVICE_MAX_POINTERS - 1
+        ));
+        assert!(
+            wheels[0].down && wheels[0].down_unconfirmed,
+            "落指后正好占满池子:必须挂上未确认标记"
+        );
+        touches(&ctl);
+        let (lx, ly) = wheels[0].last;
+        assert_eq!(wheels[0].down_retries, 0);
+        wheels[0].sent_at = None;
+        wheel_keepalive(&ctl, &m, &profile, &mut wheels, DEVICE_MAX_POINTERS - 1);
+        assert_eq!(
+            touches(&ctl),
+            vec![
+                (ACTION_UP, lx, ly),
+                (ACTION_DOWN, 500, 500),
+                (ACTION_MOVE, lx, ly)
+            ],
+            "补按序列必须恰好是 UP(上次落点) → DOWN(圆心) → MOVE(落点)"
+        );
+        assert!(!wheels[0].down_unconfirmed, "补过一次就清标志");
+        assert_eq!(wheels[0].down_retries, 1);
+
+        // 同一次落指绝不补第二次
+        wheels[0].sent_at = None;
+        wheel_keepalive(&ctl, &m, &profile, &mut wheels, DEVICE_MAX_POINTERS - 1);
+        assert_eq!(
+            touches(&ctl),
+            vec![(ACTION_MOVE, lx, ly)],
+            "同一次落指只补一次"
+        );
+        assert_eq!(wheels[0].down_retries, 1);
+
+        // ---- 释放(方向全松)会清标志:不许退化成"落指后立刻补按" ----
+        wheels[0].pressed[0] = false;
+        assert!(
+            !update_wheel(&ctl, &m, 0, &w, &mut wheels[0], 0),
+            "回中要抬起,不是拒绝"
+        );
+        touches(&ctl);
+        assert!(!wheels[0].down);
+        assert!(!wheels[0].down_unconfirmed, "释放点必须清补按标志");
+    }
+
     /// W0-7 回归(P0-7):执行轮盘"正在响应上一次方向"不是触点池满。
     ///
     /// 验收场景:连按执行轮盘两个方向 —— 第二次被忽略是设计内行为,
@@ -7625,6 +11528,7 @@ mod tests {
                     y: 0.5,
                     duration_ms: 40,
                     radius: 0.03,
+                    repeat_interval_ms: 0,
                 },
                 fps_only: false,
                 tail_delay_ms: 0,
@@ -7636,6 +11540,7 @@ mod tests {
                     y: 0.5,
                     duration_ms: 40,
                     radius: 0.03,
+                    repeat_interval_ms: 0,
                 },
                 fps_only: true,
                 tail_delay_ms: 0,
@@ -7646,7 +11551,7 @@ mod tests {
         assert!(!key_owned_by_fps(&profile, true, 273));
     }
 
-    /// 指针消隐默认开启,并在“按住才退出”或手动交还时恢复显示。
+    /// 指针消隐默认开启,并在“按住才退出”时恢复显示。
     #[test]
     fn fps_pointer_is_hidden_only_while_fps_is_running() {
         let aim = aim_at(0.1, 0.1);
@@ -7665,9 +11570,6 @@ mod tests {
         st.suspended = true;
         assert!(!pointer_should_be_hidden(true, &aim, &st));
         st.suspended = false;
-        st.released = true;
-        assert!(!pointer_should_be_hidden(true, &aim, &st));
-        st.released = false;
         let mut visible = aim.clone();
         visible.capture_mouse = false;
         assert!(!pointer_should_be_hidden(true, &visible, &st));
@@ -7723,17 +11625,6 @@ mod tests {
             }
         ));
         assert!(matches!(scheduled[1].1, SchedAct::Move { pid: 1000, .. }));
-    }
-
-    /// 交还鼠标后瞄准不生效
-    #[test]
-    fn released_blocks_aim() {
-        let aim = aim_at(0.1, 0.1);
-        let mut st = AimState::default();
-        st.mode_active = true;
-        assert!(aim_active(&aim, &st));
-        st.released = true;
-        assert!(!aim_active(&aim, &st));
     }
 
     /// 折线取点(滑动轨迹与缓动的基础):
@@ -8299,9 +12190,12 @@ mod tests {
                 y: 0.5,
                 duration_ms: 40,
                 radius: 0.03,
+                repeat_interval_ms: 0,
             },
             fps_only: false,
             tail_delay_ms: 0,
+
+            repeat_while_held: false,
         });
         let mut gate = ComboGate::default();
         let ev = CaptureKey {
@@ -8323,6 +12217,74 @@ mod tests {
         );
     }
 
+    /// A:「唤醒视角」必须是**系统键名单的成员** —— 否则它会被组合键判定窗口
+    /// (45/120ms)扣住,而锁死时用户按它就指望"按一下就好",延迟/吞掉等于
+    /// 按了没反应(与 S② 的鼠标独占手动开关同一个理由)。
+    /// 这里连"这个键同时在某条组合键里"这种最坏情形一起锁:`key_has_single_action`
+    /// 按快速窗口判定,事件本身**立刻**放行。
+    #[test]
+    fn wake_key_bypasses_chord_gate() {
+        let mut profile = Profile::default();
+        profile.combos_enabled = true;
+        profile.aim.wake_key = KeySet::single(90);
+        profile.combos.push(crate::keymap::KeyCombo {
+            keys: vec![90, 19],
+            action: Action::Tap {
+                x: 0.5,
+                y: 0.5,
+                duration_ms: 40,
+                radius: 0.03,
+                repeat_interval_ms: 0,
+            },
+            fps_only: false,
+            tail_delay_ms: 0,
+            repeat_while_held: false,
+        });
+        assert!(
+            key_has_single_action(&profile, 90),
+            "有单个系统键动作 ⇒ 组合键窗口按快速档判定"
+        );
+        let mut gate = ComboGate::default();
+        assert!(
+            matches!(
+                gate.ingest_button(
+                    CaptureKey {
+                        code: 90,
+                        pressed: true,
+                    },
+                    &profile,
+                    &[]
+                ),
+                Some(EngineInput::Button(
+                    CaptureKey {
+                        code: 90,
+                        pressed: true,
+                    },
+                    Source::Physical
+                ))
+            ),
+            "「唤醒视角」热键不能被组合键判定延迟或吞掉"
+        );
+        // 对照:没绑这个键时它就只是普通组合键的前缀,该被判定窗口扣住
+        let mut unbound = Profile::default();
+        unbound.combos_enabled = true;
+        unbound.combos = profile.combos.clone();
+        assert!(!key_has_single_action(&unbound, 90), "没绑就不算系统键");
+        let mut gate = ComboGate::default();
+        assert!(
+            gate.ingest_button(
+                CaptureKey {
+                    code: 90,
+                    pressed: true,
+                },
+                &unbound,
+                &[]
+            )
+            .is_none(),
+            "未绑定时它仍是普通组合键前缀,必须等判定窗口"
+        );
+    }
+
     #[test]
     fn chord_gate_waits_for_prefix_then_completes_and_suppresses_singles() {
         let mut profile = Profile::default();
@@ -8334,9 +12296,12 @@ mod tests {
                 y: 0.5,
                 duration_ms: 40,
                 radius: 0.03,
+                repeat_interval_ms: 0,
             },
             fps_only: false,
             tail_delay_ms: 0,
+
+            repeat_while_held: false,
         });
         let mut gate = ComboGate::default();
 
@@ -8411,9 +12376,12 @@ mod tests {
                 y: 0.5,
                 duration_ms: 40,
                 radius: 0.03,
+                repeat_interval_ms: 0,
             },
             fps_only: false,
             tail_delay_ms: 0,
+
+            repeat_while_held: false,
         });
         let mut gate = ComboGate::default();
         assert!(
@@ -8452,9 +12420,12 @@ mod tests {
                 y: 0.5,
                 duration_ms: 40,
                 radius: 0.03,
+                repeat_interval_ms: 0,
             },
             fps_only: false,
             tail_delay_ms: 0,
+
+            repeat_while_held: false,
         });
         let mut gate = ComboGate::default();
         assert!(
@@ -8501,6 +12472,8 @@ mod tests {
             },
             fps_only: false,
             tail_delay_ms: 0,
+
+            repeat_while_held: false,
         });
         let c0 = combos_signature(&p.combos);
         // 只改坐标/半径:不是结构变化,不该触发抬手重建
@@ -8519,6 +12492,7 @@ mod tests {
             y: 0.5,
             duration_ms: 40,
             radius: 0.03,
+            repeat_interval_ms: 0,
         };
         assert_ne!(combos_signature(&p.combos), c1, "换动作类型必须触发重建");
         let c2 = combos_signature(&p.combos);
@@ -8527,6 +12501,8 @@ mod tests {
             action: Action::AndroidKey { keycode: 4 },
             fps_only: false,
             tail_delay_ms: 0,
+
+            repeat_while_held: false,
         });
         assert_ne!(combos_signature(&p.combos), c2, "增删组合必须触发重建");
         p.combos.pop();
@@ -8549,6 +12525,8 @@ mod tests {
             },
             fps_only: false,
             tail_delay_ms: 0,
+
+            repeat_while_held: false,
         });
         let mut gate = ComboGate::default();
         assert!(
@@ -8611,6 +12589,8 @@ mod tests {
             },
             fps_only: false,
             tail_delay_ms: 0,
+
+            repeat_while_held: false,
         });
         let mut gate = ComboGate::default();
         let _ = gate.ingest_button(
@@ -8705,6 +12685,7 @@ mod tests {
                 y: 0.3,
                 duration_ms: 40,
                 radius: DEFAULT_RADIUS,
+                repeat_interval_ms: 0,
             },
             fps_only: false,
             tail_delay_ms: 0,
@@ -8717,6 +12698,7 @@ mod tests {
                 y: 0.5,
                 duration_ms: 40,
                 radius: DEFAULT_RADIUS,
+                repeat_interval_ms: 0,
             },
             fps_only: false,
             tail_delay_ms: 0,
@@ -8754,6 +12736,8 @@ mod tests {
                     delay_ms: 0,
                 },
             ],
+
+            repeat_while_held: false,
         };
         let start = Instant::now();
         let mut scheduled = Vec::new();
@@ -8765,7 +12749,10 @@ mod tests {
             &mut scheduled,
             &mut MacroPlan::new(0),
         );
-        assert_eq!(duration, 80 + 10 + 100 + 20 + 50 + 40);
+        // 「长按重复」认的是同一份时长:总时长仍是各步之和,结束时点落在最后一个
+        // 动作(这一例是最后的点击抬起)上。
+        assert_eq!(duration.total, 80 + 10 + 100 + 20 + 50 + 40);
+        assert_eq!(duration.end, start + Duration::from_millis(300));
 
         let clicks: Vec<(Instant, bool, u64)> = scheduled
             .iter()
@@ -8842,6 +12829,8 @@ mod tests {
                 },
                 MacroInstruction::Delay { ms: 500 },
             ],
+
+            repeat_while_held: false,
         };
         let start = Instant::now();
         let mut scheduled = Vec::new();
@@ -8853,7 +12842,7 @@ mod tests {
             &mut scheduled,
             &mut MacroPlan::new(0),
         );
-        assert_eq!(total, 600);
+        assert_eq!(total.total, 600);
         let acts: Vec<(Instant, bool)> = scheduled
             .iter()
             .filter_map(|(t, a)| match a {
@@ -8884,6 +12873,7 @@ mod tests {
                 y: 0.5,
                 duration_ms: 40,
                 radius: DEFAULT_RADIUS,
+                repeat_interval_ms: 0,
             },
             fps_only: false,
             tail_delay_ms: 0,
@@ -8915,6 +12905,8 @@ mod tests {
                 },
             ],
             instructions: Vec::new(),
+
+            repeat_while_held: false,
         };
         let start = Instant::now();
         let mut scheduled = Vec::new();
@@ -8964,6 +12956,7 @@ mod tests {
                 y: 0.3,
                 duration_ms: 40,
                 radius: DEFAULT_RADIUS,
+                repeat_interval_ms: 0,
             },
             fps_only: false,
             tail_delay_ms: 0,
@@ -8983,6 +12976,8 @@ mod tests {
             ],
             instructions: Vec::new(),
             virtual_profile: Some(Box::new(virtual_profile)),
+
+            repeat_while_held: false,
         };
         let start = Instant::now();
         let mut scheduled = Vec::new();
@@ -9033,6 +13028,7 @@ mod tests {
                 y: 0.3,
                 duration_ms: 40,
                 radius: DEFAULT_RADIUS,
+                repeat_interval_ms: 0,
             },
             fps_only: false,
             tail_delay_ms: 0,
@@ -9045,6 +13041,8 @@ mod tests {
                 delay_ms: 0,
             }],
             instructions: Vec::new(),
+
+            repeat_while_held: false,
         };
         let start = Instant::now();
         let mut scheduled = Vec::new();
@@ -9098,6 +13096,8 @@ mod tests {
                 virtual_profile: None,
                 steps: steps.clone(),
                 instructions: Vec::new(),
+
+                repeat_while_held: false,
             },
             &live,
             &m,
@@ -9131,6 +13131,8 @@ mod tests {
                 virtual_profile: Some(Box::new(live.clone())),
                 steps,
                 instructions: Vec::new(),
+
+                repeat_while_held: false,
             },
             &live,
             &m,
@@ -9203,6 +13205,7 @@ mod tests {
                     y: 0.9,
                     duration_ms: 40,
                     radius: DEFAULT_RADIUS,
+                    repeat_interval_ms: 0,
                 },
                 fps_only: false,
                 tail_delay_ms: 0,
@@ -9247,6 +13250,8 @@ mod tests {
                 virtual_profile: None,
                 steps,
                 instructions: Vec::new(),
+
+                repeat_while_held: false,
             },
             &profile,
             &m,
@@ -9368,6 +13373,8 @@ mod tests {
                 virtual_profile: None,
                 steps,
                 instructions: Vec::new(),
+
+                repeat_while_held: false,
             },
             &profile,
             &m,
@@ -9475,6 +13482,8 @@ mod tests {
                 virtual_profile: None,
                 steps,
                 instructions: Vec::new(),
+
+                repeat_while_held: false,
             },
             &profile,
             &m,
@@ -9558,6 +13567,7 @@ mod tests {
                 y: 0.9,
                 duration_ms: 40,
                 radius: DEFAULT_RADIUS,
+                repeat_interval_ms: 0,
             },
             fps_only: false,
             tail_delay_ms: 0,
@@ -9611,6 +13621,8 @@ mod tests {
                 virtual_profile: None,
                 steps,
                 instructions: Vec::new(),
+
+                repeat_while_held: false,
             },
             &profile,
             &m,
@@ -9719,6 +13731,8 @@ mod tests {
                 virtual_profile: None,
                 steps,
                 instructions: Vec::new(),
+
+                repeat_while_held: false,
             },
             &profile,
             &m,
@@ -9778,6 +13792,54 @@ mod tests {
         assert_ne!(a1, b1);
         // 实例号取模循环复用:第 MACRO_EXEC_LANES 段回到第 0 段
         assert_eq!(MacroPlan::new(MACRO_EXEC_LANES).slot(), MACRO_PID_BASE);
+    }
+
+    /// #2 宏 lane 复用 · 特征测试(用户 2026-10-15 裁定:**不改分配逻辑**,
+    /// 把"撞车边界"显式写进测试)。
+    ///
+    /// `pid = MACRO_PID_BASE + (exec % MACRO_EXEC_LANES) * MACRO_EXEC_STRIDE + slot`
+    /// 只有 8 条 lane:第 0 次与第 8 次执行落在**同一条 lane**上(本测试第一条
+    /// 断言)。这是 0.1.5 撞车教训后 W2-8 刻意设计的号段(见 `MacroPlan` 注释),
+    /// 不是缺陷,但它是已知风险边界:真机实测最坏情况下同 lane 复用的时间余量只有
+    /// 703ms(9.645 秒内按了 8 次宏键 = lane 数,第 9 次就会顶到第 1 次还没抬起的触点)。
+    ///
+    /// 本测试锁三件事:
+    ///   * 撞车周期恰好为 8 —— 第 8、第 16 次与第 0 次同 lane,第 7 次不同;
+    ///   * 前 8 条 lane 的基址两两互不相同(同一次连点里最多 8 份执行互不干扰);
+    ///   * `MACRO_EXEC_LANES == 8` 这个事实本身(硬编码字面量,不引用常量)。
+    ///
+    /// ⚠ 将来任何人**改动 `MACRO_EXEC_LANES`**(增减 lane 数)本测试必红:那会同时
+    /// 改变撞车周期与最坏复用余量,必须重新做真机实测来评估余量,而不是把常量
+    /// 顺手改成"更好看"的值。不许改断言凑绿 —— 红就是"该重新决策"的信号。
+    #[test]
+    fn macro_lane_reuse_collides_every_eight_executions() {
+        // lane 数被钉死为 8:字面量,与常量独立,改常量必红。
+        assert_eq!(
+            MACRO_EXEC_LANES, 8,
+            "只有 8 条 lane = 连点宏键最多 8 份执行互不干扰;改这个数就是改撞车周期"
+        );
+        let lane_base = |exec: u64| MacroPlan::new(exec).slot();
+        // 已知风险边界:第 8 次执行与第 0 次**撞在同一条 lane** 上
+        assert_eq!(lane_base(8), lane_base(0));
+        assert_eq!(lane_base(8), MACRO_PID_BASE);
+        // 周期恰好是 8(第 7 次不撞、第 16 次又撞)—— 字面量,不随常量变动而自动跟着改
+        assert_ne!(
+            lane_base(7),
+            lane_base(0),
+            "第 7 次执行必须还在自己的新 lane 上"
+        );
+        assert_eq!(lane_base(16), lane_base(0), "撞车周期必须是 8 的整数倍");
+        // 前 8 条 lane 基址两两不同(同一次连点里 8 份执行互不顶掉对方的手指)
+        let lanes: Vec<u64> = (0..8).map(lane_base).collect();
+        for (i, a) in lanes.iter().enumerate() {
+            for b in lanes[i + 1..].iter() {
+                assert_ne!(a, b, "第 {i} 条 lane 与另一条撞了: {a} == {b}");
+            }
+        }
+        // 每条 lane 之间隔着整个 STRIDE,互不重叠(号段划分的现状)
+        for (i, a) in lanes.iter().enumerate() {
+            assert_eq!(a - MACRO_PID_BASE, i as u64 * MACRO_EXEC_STRIDE);
+        }
     }
 
     #[test]
@@ -10148,11 +14210,14 @@ mod tests {
             .collect()
     }
 
-    /// 造一条只含一个"长按"键位的配置 + 这一套引擎状态,专供「按后延迟」用。
+    /// 造一条只含一个"长按"键位的配置 + 这一套引擎状态,专供「按后延迟」与
+    /// 「长按重复」用。
     struct TailFixture {
         profile: Profile,
         m: Mapper,
         ctl: ControlClient,
+        /// 物理按键真值(长按重复按它判"触发键还按着没有")。
+        held: Held,
         fingers: Fingers,
         aks: HashSet<u16>,
         scheduled: Vec<(Instant, SchedAct)>,
@@ -10173,12 +14238,16 @@ mod tests {
                 fps_only: false,
                 tail_delay_ms: tail,
             }];
+            // 宏的录制步骤靠**普通绑定**产生动作:补两条自包含的点按绑定,
+            // 免得断言里混进轮盘/系统键那些旁路。
+            profile.binds.extend(repeat_macro_binds());
             let ctl = ControlClient::for_test(1080, 2400);
             let m = profile.mapper((1080, 2400));
             Self {
                 profile,
                 m,
                 ctl,
+                held: Held::default(),
                 fingers: Fingers::default(),
                 aks: HashSet::new(),
                 scheduled: Vec::new(),
@@ -10189,8 +14258,10 @@ mod tests {
         }
 
         /// 走一遍 [`handle_bind_event`](正常按下路径),`fresh` = 是不是上升沿。
+        /// 与 `run()` 同序:先按物理真值落进 [`Held`],再判是不是上升沿。
         fn fire(&mut self, pressed: bool, fresh: bool) -> Option<(u16, RefuseReason)> {
             let bind = self.profile.binds[0].clone();
+            self.held.set(bind.key, pressed);
             handle_bind_event(
                 &self.ctl,
                 &self.m,
@@ -10199,6 +14270,8 @@ mod tests {
                 0,
                 bind_pid(0),
                 BindLane::Normal,
+                &self.held,
+                None,
                 &mut self.macro_exec,
                 fresh,
                 &CaptureKey {
@@ -10212,6 +14285,22 @@ mod tests {
                 &mut self.live,
                 &mut self.gates,
             )
+        }
+
+        /// 这一串排程里「长按重复」排下的"下一轮"时刻(按时间先后)。
+        fn repeats(&self) -> Vec<Instant> {
+            self.scheduled
+                .iter()
+                .filter(|(_, a)| {
+                    matches!(
+                        a,
+                        SchedAct::Redispatch { .. }
+                            | SchedAct::ComboRedispatch { .. }
+                            | SchedAct::RepeatRedispatch { .. }
+                    )
+                })
+                .map(|(t, _)| *t)
+                .collect()
         }
     }
 
@@ -10510,5 +14599,763 @@ mod tests {
         );
         assert_eq!(gates.bind_gate(3), None);
         assert_eq!(gates.combo_gate(2), None);
+    }
+
+    /// 「按后延迟」+ Windows 自动重复(用户 2026-10-11 第 1 条)的行为锁。
+    ///
+    /// 用户口径:按住不放时系统会连发 `KEYDOWN`,程序**照收**这些消息 ——
+    /// 它们既不该被丢掉(旧实现:绕过冷却判定后又被 `if fresh_press` 守卫丢弃),
+    /// 也不该每一发都排一条补捉;正确做法是"扣住一次",到冷却结束再补捉执行。
+    #[test]
+    fn tail_delay_latches_auto_repeat_and_schedules_only_once() {
+        const KEY: u16 = 41;
+        let hold = Action::Hold {
+            x: 0.5,
+            y: 0.5,
+            radius: 0.03,
+        };
+        let mut f = TailFixture::new(KEY, 30, hold, true);
+        // 正常按下 + 抬起:挂上冷却
+        f.fire(true, true);
+        f.fire(false, false);
+        drain_touches(&f.ctl);
+        let cool_until = f.gates.bind_gate(0).expect("抬起后应当挂上冷却");
+
+        // 冷却里按住不放:自动重复(每一发都不是上升沿)既不许落点,
+        // 也不许每个事件各排一条补捉。
+        for _ in 0..8 {
+            f.fire(true, false);
+        }
+        assert!(
+            drain_touches(&f.ctl).is_empty(),
+            "冷却里的自动重复不许落点(要等到点再补捉)"
+        );
+        assert_eq!(
+            f.scheduled.len(),
+            1,
+            "扣住的按下只排一条补捉,不许每一发自动重复都排一条"
+        );
+        assert_eq!(f.scheduled[0].0, cool_until, "补捉时刻仍是冷却到期那一刻");
+        assert_eq!(
+            f.gates.take_latch(BindLane::Normal, 0),
+            Some(KEY),
+            "这一次按下必须被**扣着**,等着到点补捉"
+        );
+    }
+
+    /// 补捉到期,触发键**仍按着** ⇒ 补发一次,且闩锁被清空(不残留)。
+    #[test]
+    fn tail_delay_redispatch_fires_when_still_held_and_clears_latch() {
+        use crate::control::ACTION_DOWN;
+        const KEY: u16 = 41;
+        let hold = Action::Hold {
+            x: 0.5,
+            y: 0.5,
+            radius: 0.03,
+        };
+        let mut f = TailFixture::new(KEY, 1, hold, true);
+        f.fire(true, true);
+        f.fire(false, false);
+        drain_touches(&f.ctl);
+        // 冷却里按住不放(自动重复)⇒ 扣住一次
+        f.fire(true, false);
+        assert_eq!(f.scheduled.len(), 1);
+        // 真等过这一刻(不手改表里的时刻,测的是真实到期)
+        std::thread::sleep(Duration::from_millis(20));
+        let mut held = Held::default();
+        held.set(KEY, true);
+        redispatch_press(
+            &f.ctl,
+            &f.m,
+            &f.profile,
+            &held,
+            0,
+            BindLane::Normal,
+            KEY,
+            &mut f.macro_exec,
+            &mut f.fingers,
+            &mut Fingers::default(),
+            &mut Fingers::default(),
+            &mut f.aks,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &mut f.scheduled,
+            0,
+            &mut f.live,
+            &mut f.gates,
+        );
+        assert_eq!(
+            drain_touches(&f.ctl),
+            vec![(ACTION_DOWN, bind_pid(0))],
+            "到点时还按着:把那一次扣住的按下补上"
+        );
+        assert!(
+            f.gates.take_latch(BindLane::Normal, 0).is_none(),
+            "补捉之后闩锁必须清空"
+        );
+        // 仍按住不放:后续自动重复落进正常分支(Hold 已按着),不再排程、不再发触点
+        f.fire(true, false);
+        assert_eq!(
+            f.scheduled
+                .iter()
+                .filter(|(_, a)| matches!(a, SchedAct::Redispatch { .. }))
+                .count(),
+            1,
+            "一次扣住只对应一条补捉"
+        );
+        assert!(
+            drain_touches(&f.ctl).is_empty(),
+            "已经补捉落指了,重复事件不该再发触点"
+        );
+    }
+
+    /// 到点时触发键**已经松手**(Hold/系统键这类状态型动作)⇒ 不补发,
+    /// 但闩锁**必须清空** —— 残留会把这条键位的「按后延迟」永久锁死。
+    #[test]
+    fn tail_delay_redispatch_clears_latch_even_when_released() {
+        const KEY: u16 = 41;
+        let hold = Action::Hold {
+            x: 0.5,
+            y: 0.5,
+            radius: 0.03,
+        };
+        let mut f = TailFixture::new(KEY, 30, hold, true);
+        f.fire(true, true);
+        f.fire(false, false);
+        drain_touches(&f.ctl);
+        f.fire(true, false); // 冷却里按住不放 ⇒ 扣住
+        assert_eq!(f.scheduled.len(), 1);
+
+        // 到点时用户已经松手:`Held` 里没有它
+        let held = Held::default();
+        redispatch_press(
+            &f.ctl,
+            &f.m,
+            &f.profile,
+            &held,
+            0,
+            BindLane::Normal,
+            KEY,
+            &mut f.macro_exec,
+            &mut f.fingers,
+            &mut Fingers::default(),
+            &mut Fingers::default(),
+            &mut f.aks,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &mut f.scheduled,
+            0,
+            &mut f.live,
+            &mut f.gates,
+        );
+        assert!(
+            drain_touches(&f.ctl).is_empty(),
+            "已松手还补一次按下 = 在设备上留下没人抬的触点"
+        );
+        assert!(
+            f.gates.take_latch(BindLane::Normal, 0).is_none(),
+            "闩锁必须清空:残留会让这条键位再也排不上补捉"
+        );
+
+        // 松手后重新按(仍在冷却里):必须能重新扣住、重新排程
+        f.fire(true, true);
+        assert_eq!(
+            f.scheduled.len(),
+            2,
+            "上一格没清干净的话,这一次按下就再也排不上补捉了"
+        );
+    }
+
+    /// 闩锁:每条 lane 各一张表(与冷却表同构)、同一格只扣一次,`reset()` 一并清空。
+    #[test]
+    fn press_gates_latch_is_per_lane_and_reset_clears_it() {
+        let mut gates = PressGates::default();
+        assert!(gates.latch(BindLane::Normal, 0, 41), "空格子才排补捉");
+        assert!(
+            !gates.latch(BindLane::Normal, 0, 41),
+            "同一格已经扣着时不再排第二条"
+        );
+        assert!(
+            !gates.latch(BindLane::Fps, 0, 41),
+            "FPS 车道与普通车道共用 binds 表(与 bind_gate 同一口径)"
+        );
+        assert!(
+            gates.latch(BindLane::Combo, 0, 41),
+            "组合键车道是另一张表,同一下标互不影响"
+        );
+        assert!(
+            gates.latch(BindLane::Normal, 1, 42),
+            "换一格就是新的一次扣住"
+        );
+
+        // 取走即清空,之后又能重新扣住
+        assert_eq!(gates.take_latch(BindLane::Normal, 0), Some(41));
+        assert!(gates.latch(BindLane::Normal, 0, 41), "取走之后又能重新扣住");
+        // 没扣过的格子:取不到,而且"取"这个动作不该造出格子
+        assert_eq!(gates.take_latch(BindLane::Combo, 7), None);
+
+        gates.reset();
+        assert_eq!(gates.take_latch(BindLane::Normal, 0), None);
+        assert_eq!(gates.take_latch(BindLane::Normal, 1), None);
+        assert_eq!(gates.take_latch(BindLane::Combo, 0), None);
+        assert!(
+            gates.latch(BindLane::Normal, 0, 41),
+            "reset 之后是一张干净的表"
+        );
+    }
+
+    /// 坐标空间重查的"活动"口径(DF-5 的引擎侧):鼠标位移与按键共用同一份判定。
+    ///
+    /// `last` 每次调用都会被推进到 `now`,所以判的永远是"距上一次活动"。
+    #[test]
+    fn space_recheck_due_fires_only_after_an_idle_gap() {
+        let idle = SPACE_RECHECK_IDLE;
+        let t0 = Instant::now();
+        let mut last: Option<Instant> = None;
+        assert!(
+            !space_recheck_due(&mut last, t0, idle),
+            "没有参照(第一次输入)不算空闲"
+        );
+        assert_eq!(last, Some(t0), "调用即把活动时刻推进到现在");
+        assert!(
+            !space_recheck_due(&mut last, t0 + Duration::from_secs(2), idle),
+            "2 秒还不够"
+        );
+        assert!(
+            space_recheck_due(&mut last, t0 + Duration::from_secs(5), idle),
+            "距上一次活动 ≥3 秒就该请求重查"
+        );
+        assert!(
+            !space_recheck_due(
+                &mut last,
+                t0 + Duration::from_secs(5) + Duration::from_millis(1),
+                idle
+            ),
+            "刚查过就不再查(否则每次输入都要重查一遍)"
+        );
+
+        // 边界:恰好满 idle 就算到期(不得被取整拉长)
+        let mut edge = Some(t0);
+        assert!(space_recheck_due(&mut edge, t0 + idle, idle));
+        let mut edge = Some(t0);
+        assert!(!space_recheck_due(
+            &mut edge,
+            t0 + idle - Duration::from_millis(1),
+            idle
+        ));
+    }
+
+    /// 「长按重复」的**组合键**夹具:一组键 + 这套引擎状态。
+    ///
+    /// 与 [`TailFixture`] 的区别是走 [`handle_combo_event`](组合车道),
+    /// 并且自己维护 [`Held`] —— 长按重复判的就是"整组键此刻还按着没有"。
+    struct ComboRepeatFixture {
+        profile: Profile,
+        m: Mapper,
+        ctl: ControlClient,
+        held: Held,
+        fingers: Fingers,
+        aks: HashSet<u16>,
+        scheduled: Vec<(Instant, SchedAct)>,
+        live: EngineLive,
+        gates: PressGates,
+        macro_exec: u64,
+        /// 门控当前是否"整组按着"(用来只在下发边沿时给一次组合事件)。
+        chord_down: bool,
+    }
+
+    impl ComboRepeatFixture {
+        /// keys = 组合成员;tail = 组合自己的「按后延迟」(也是两轮之间的间隔);
+        /// `macro_repeat` = **动作那条宏**自己开没开长按重复(测"触发处唯一")。
+        fn new(keys: &[u16], action: Action, tail: u32, enabled: bool, macro_repeat: bool) -> Self {
+            let mut profile = Profile::default();
+            profile.combos_enabled = true;
+            profile.tail_delay_enabled = enabled;
+            profile.combos = vec![KeyCombo {
+                keys: keys.to_vec(),
+                action,
+                fps_only: false,
+                tail_delay_ms: tail,
+                repeat_while_held: true,
+            }];
+            // 动作那条宏自己那一份开关(测"触发处唯一"用)
+            if let Some(combo) = profile.combos.first_mut()
+                && let Action::Macro(mac) = &mut combo.action
+            {
+                mac.repeat_while_held = macro_repeat;
+            }
+            // 宏的录制步骤靠**普通绑定**产生动作:补两条自包含的点按绑定,
+            // 免得断言里混进轮盘/系统键那些旁路。
+            profile.binds = repeat_macro_binds();
+            let ctl = ControlClient::for_test(1080, 2400);
+            let m = profile.mapper((1080, 2400));
+            Self {
+                profile,
+                m,
+                ctl,
+                held: Held::default(),
+                fingers: Fingers::default(),
+                aks: HashSet::new(),
+                scheduled: Vec::new(),
+                live: EngineLive::default(),
+                gates: PressGates::default(),
+                macro_exec: 0,
+                chord_down: false,
+            }
+        }
+
+        /// 按/松一个成员键。**只落物理真值**;要不要给下游一条组合事件由
+        /// [`Self::sync_gate`] 按门控的规则决定。
+        fn key(&mut self, code: u16, pressed: bool) {
+            self.held.set(code, pressed);
+        }
+
+        /// 模拟 [`ComboGate`] 的下发规则:整组键**按着**时正好下发一次"组合按下",
+        /// 整组不再成立时正好下发一次"组合抬起"。真实路径里组合事件是**边沿**,
+        /// 不是"每个成员事件一条" —— 少了这条,宏会被展开两轮。
+        fn sync_gate(&mut self, member: u16, pressed: bool) {
+            let keys = self.profile.combos[0].keys.clone();
+            let down = !keys.is_empty() && keys.iter().all(|k| self.held.has(*k));
+            if down == self.chord_down {
+                return;
+            }
+            self.chord_down = down;
+            let combo = self.profile.combos[0].clone();
+            let _ = handle_combo_event(
+                &self.ctl,
+                &self.m,
+                &combo,
+                &self.profile,
+                &self.held,
+                &mut self.macro_exec,
+                0,
+                down,
+                &mut self.fingers,
+                &mut self.aks,
+                &mut self.scheduled,
+                0,
+                &mut self.live,
+                &mut self.gates,
+            );
+            let _ = (member, pressed);
+        }
+
+        fn combo_redispatches(&self) -> Vec<Instant> {
+            self.scheduled
+                .iter()
+                .filter(|(_, a)| matches!(a, SchedAct::ComboRedispatch { .. }))
+                .map(|(t, _)| *t)
+                .collect()
+        }
+    }
+
+    /// 「长按重复」(用户 2026-10-11 第 2 条)的**宏**行为锁。
+    ///
+    /// 用户口径:按住触发键 → 循环重放这条宏,直到抬起;两轮之间用**这一条**
+    /// 自己的「按后延迟」当间隔,总开关关着时不留间隔;松手后正在跑的那一轮
+    /// 跑完即停(不再排下一轮)。全程用排程时刻断言,不睡线程。
+    #[test]
+    fn macro_repeat_while_held_requeues_only_after_the_round_finishes() {
+        const KEY: u16 = 41;
+        /// 一轮的时长(见 [`repeat_macro`]):100ms 抬起 + 200ms 间隔 + 5ms 点按。
+        const ROUND_MS: u64 = 305;
+
+        // ---- ① 按住:先跑一轮,跑完那一刻再排下一轮 ----
+        let mut f = TailFixture::new(KEY, 0, repeat_macro(true), false);
+        assert!(f.fire(true, true).is_none(), "触发按下不该被拒绝");
+        let clicks = repeat_round_clicks(&f.scheduled);
+        assert_eq!(clicks.len(), 4, "一轮 = 两对自包含的点按");
+        let t0 = clicks[0].0;
+        assert_eq!(
+            clicks,
+            vec![
+                (t0, true),
+                (t0 + Duration::from_millis(100), false),
+                (t0 + Duration::from_millis(300), true),
+                (t0 + Duration::from_millis(305), false),
+            ],
+            "第 1 轮照录制时间轴(100ms 抬起、再等 200ms 按下 B、5ms 后抬起)"
+        );
+        assert_eq!(
+            f.repeats(),
+            vec![round_end(&f.scheduled) + Duration::from_millis(1)],
+            "下一轮排在'最后一个动作(这一轮跑完)之后 + 间隔(总开关关着 = 0)+ 让位 1ms'"
+        );
+        assert_eq!(
+            f.repeats()[0],
+            t0 + Duration::from_millis(ROUND_MS + 1),
+            "跑完才排下一轮"
+        );
+        assert_eq!(
+            macro_round_count(&f.scheduled),
+            4,
+            "只许排出一轮的动作(下一轮由 Redispatch 到点再排):{:?}",
+            f.scheduled
+        );
+
+        // ---- ② 松手:正在跑的那一轮跑完即停,不再排下一轮 ----
+        f.fire(false, false);
+        assert_eq!(f.repeats().len(), 1, "松手后不许再排下一轮");
+        assert_eq!(
+            macro_round_count(&f.scheduled),
+            4,
+            "已经排好的那一轮照旧跑完(设备端不会留下只按不抬的触点)"
+        );
+    }
+
+    /// 「长按重复」:两轮之间的间隔 = **这一条自己的**「按后延迟」,且受总开关管 ——
+    /// 关着时一轮接一轮不等待(只让出同刻排序必需的 1ms),打开时按那个数值等。
+    #[test]
+    fn macro_repeat_gap_follows_this_entrys_tail_delay_and_the_master_switch() {
+        const KEY: u16 = 41;
+        const TAIL: u32 = 250;
+
+        // ---- ① 总开关关着:数值再大也不留间隔 ----
+        let mut off = TailFixture::new(KEY, TAIL, repeat_macro(true), false);
+        off.fire(true, true);
+        assert_eq!(
+            off.repeats(),
+            vec![round_end(&off.scheduled) + Duration::from_millis(1)],
+            "总开关关着 = 一轮接一轮不等待(只让出 1ms 排序余量)"
+        );
+
+        // ---- ② 总开关打开:同一份数值立刻生效,间隔就是它 ----
+        let mut on = TailFixture::new(KEY, TAIL, repeat_macro(true), true);
+        on.fire(true, true);
+        assert_eq!(
+            on.repeats(),
+            vec![round_end(&on.scheduled) + Duration::from_millis(TAIL as u64 + 1)],
+            "打开总开关后:两轮之间按这一条的「按后延迟」等"
+        );
+    }
+
+    /// 「长按重复」:连按(含按住期间的自动重复)不会排成**多条**待跑循环。
+    ///
+    /// 这条锁的是"长按重复与 `PressGates`/`Redispatch` 的关系":长按重复自己就会
+    /// 一轮接一轮地排,若按住期间连发的 `KEYDOWN` 再被"扣住一次、到点补捉",
+    /// 同一个下标就会同时挂两条循环。实现里的闸门让这些自动重复整条放行、
+    /// 又被各分支的 `fresh_press` 守卫丢掉,于是一个时刻最多一个待跑循环。
+    #[test]
+    fn macro_repeat_is_idempotent_under_auto_repeat_and_repress() {
+        const KEY: u16 = 41;
+        let mut f = TailFixture::new(KEY, 30, repeat_macro(true), true);
+
+        f.fire(true, true);
+        assert_eq!(f.repeats().len(), 1, "第一次按下排一轮循环");
+        // 按住期间 Windows 连发 KEYDOWN(`fresh = false`)
+        for _ in 0..5 {
+            f.fire(true, false);
+        }
+        assert_eq!(
+            f.repeats().len(),
+            1,
+            "自动重复不许再排第二条循环(也不许排队补捉):{:?}",
+            f.scheduled
+        );
+        assert_eq!(
+            f.scheduled
+                .iter()
+                .filter(|(_, a)| matches!(a, SchedAct::Redispatch { .. }))
+                .count(),
+            0,
+            "自动重复的发数一条都不许被扣住补捉(扣住就等于第二份循环)"
+        );
+        assert_eq!(
+            f.scheduled
+                .iter()
+                .filter(|(_, a)| matches!(a, SchedAct::RepeatRedispatch { .. }))
+                .count(),
+            1,
+            "循环只排一条"
+        );
+
+        // 冷却里再按一次(同一根键仍按着、但不是上升沿)也一样只有一条
+        f.fire(true, false);
+        assert_eq!(f.repeats().len(), 1, "连按也不许堆成两条");
+    }
+
+    /// 「长按重复」与关映射/断连的关系:循环的**下一轮**必须能被作废 ——
+    /// 判据是"触发键此刻仍按着"([`Held`]),而关映射时用户的手往往还按着,
+    /// 不作废的话到点仍会重跑一条宏。作废只针对循环那一格,**不碰**
+    /// 「按后延迟」扣住的那次真实按下(那是用户的输入,丢了就是吞键)。
+    #[test]
+    fn cancel_repeat_scheduled_drops_the_next_round_only() {
+        const KEY: u16 = 41;
+        let mut f = TailFixture::new(KEY, 0, repeat_macro(true), false);
+        f.fire(true, true);
+        let round_actions = macro_round_count(&f.scheduled);
+        assert_eq!(f.repeats().len(), 1, "先真的排了一条待跑循环");
+
+        // 混进一条「按后延迟」扣住的真实按下(与循环同一张表)
+        f.gates
+            .hold_bind(0, Instant::now() + Duration::from_secs(60));
+        f.scheduled.push((
+            Instant::now() + Duration::from_secs(60),
+            SchedAct::Redispatch {
+                idx: 0,
+                lane: BindLane::Normal,
+                code: KEY,
+            },
+        ));
+
+        cancel_repeat_scheduled(&mut f.scheduled);
+        assert!(
+            !f.scheduled.iter().any(|(_, a)| matches!(
+                a,
+                SchedAct::RepeatRedispatch { .. } | SchedAct::ComboRedispatch { .. }
+            )),
+            "循环的下一轮已作废:{:?}",
+            f.scheduled
+        );
+        assert_eq!(
+            f.scheduled
+                .iter()
+                .filter(|(_, a)| matches!(a, SchedAct::Redispatch { .. }))
+                .count(),
+            1,
+            "被「按后延迟」扣住的那次真实按下**不许**跟着被吞掉"
+        );
+        assert_eq!(
+            macro_round_count(&f.scheduled),
+            round_actions,
+            "已经排好的这一轮动作留给 cancel_macro_scheduled 按运行表收尾,这里不动它"
+        );
+    }
+
+    /// 「长按重复」的**组合键**行为锁:整组键按着 → 循环;松开任一成员 → 不再排;
+    /// 动作是宏、且宏**自己**也开了长按重复时,只认触发处(组合键)那一份。
+    #[test]
+    fn combo_repeat_while_held_needs_the_whole_chord_and_owns_the_loop() {
+        // 动作 = 自己没开长按重复的宏(循环只可能来自组合那一份)
+        let mut f = ComboRepeatFixture::new(&[29, 19], repeat_macro(false), 0, false, false);
+        f.key(29, true);
+        f.sync_gate(29, true);
+        assert!(
+            f.combo_redispatches().is_empty(),
+            "只按下一个成员不算整组按着,不排循环"
+        );
+        f.key(19, true);
+        f.sync_gate(19, true);
+        assert_eq!(
+            f.combo_redispatches(),
+            vec![round_end(&f.scheduled) + Duration::from_millis(1)],
+            "整组键按着:这一轮跑完就排下一轮(总开关关着 = 不留间隔)"
+        );
+        assert_eq!(
+            macro_round_count(&f.scheduled),
+            4,
+            "宏只展开**一轮**:触发处是组合,不许再排第二份循环"
+        );
+
+        // 松开**任一**成员:不再排下一轮(正在跑的那一轮照旧跑完)
+        f.key(19, false);
+        f.sync_gate(19, false);
+        assert_eq!(f.combo_redispatches().len(), 1, "少一个成员就不再排下一轮");
+        assert_eq!(
+            macro_round_count(&f.scheduled),
+            4,
+            "已经排好的那一轮照旧跑完"
+        );
+
+        // 组合自己的「按后延迟」打开时,它就是两轮的间隔
+        let mut g = ComboRepeatFixture::new(&[29, 19], repeat_macro(false), 250, true, false);
+        g.key(29, true);
+        g.sync_gate(29, true);
+        g.key(19, true);
+        g.sync_gate(19, true);
+        assert_eq!(
+            g.combo_redispatches(),
+            vec![round_end(&g.scheduled) + Duration::from_millis(251)],
+            "间隔用组合自己的「按后延迟」(总开关开着才生效)"
+        );
+    }
+
+    /// 「长按重复」的**触发处唯一**:组合键的动作是宏、而这条宏**自己也开了**
+    /// 长按重复时,循环只认触发处(组合键)那一份 —— 一次触发只展开一轮。
+    #[test]
+    fn combo_trigger_owns_the_only_repeat_loop_when_the_macro_also_wants_it() {
+        let mut f = ComboRepeatFixture::new(&[29, 19], repeat_macro(true), 0, false, true);
+        f.key(29, true);
+        f.sync_gate(29, true);
+        f.key(19, true);
+        f.sync_gate(19, true);
+        let clicks = repeat_round_clicks(&f.scheduled);
+        assert_eq!(
+            clicks.len(),
+            4,
+            "一份开关只能展开一轮:组合与宏各排一份就成了 8 个动作 {clicks:?}"
+        );
+        assert_eq!(f.combo_redispatches().len(), 1, "待跑的循环也只有一条");
+
+        // 反过来:组合**没开**这一项时,循环改由**宏自己那一份**接管 —— 判据仍是
+        // "整组键还按着"(宏在组合车道里看到的是虚拟码,`Held` 里从来没有它)。
+        let mut g = ComboRepeatFixture::new(&[29, 19], repeat_macro(true), 0, false, true);
+        g.profile.combos[0].repeat_while_held = false;
+        g.key(29, true);
+        g.sync_gate(29, true);
+        g.key(19, true);
+        g.sync_gate(19, true);
+        assert_eq!(repeat_round_clicks(&g.scheduled).len(), 4, "仍然照常跑一轮");
+        assert_eq!(
+            g.combo_redispatches().len(),
+            1,
+            "循环改由宏自己那一份接管(也只有一条)"
+        );
+        g.key(29, false);
+        g.sync_gate(29, false);
+        assert_eq!(
+            g.combo_redispatches().len(),
+            1,
+            "整组键不再成立时,宏那一份循环同样停下"
+        );
+    }
+
+    /// 回归:长按重复模式下,宏**内部步骤的 `delay_ms` 依然生效** ——
+    /// 循环只是把"同一轮"再排一次,不改变一轮内部的时间轴。
+    #[test]
+    fn macro_repeat_keeps_inner_step_delays() {
+        const KEY: u16 = 41;
+        let mut f = TailFixture::new(KEY, 0, repeat_macro(true), false);
+        f.fire(true, true);
+        let clicks = repeat_round_clicks(&f.scheduled);
+        let t0 = clicks[0].0;
+        assert_eq!(
+            clicks,
+            vec![
+                (t0, true),
+                (t0 + Duration::from_millis(100), false),
+                (t0 + Duration::from_millis(300), true),
+                (t0 + Duration::from_millis(305), false),
+            ],
+            "一轮内部照录制时间轴:100ms 抬起、再等 200ms 才按下第二根键"
+        );
+    }
+
+    /// 一条"有长按重复意义的"宏:只碰普通绑定,一轮 = 300ms,最后一个动作落在
+    /// t=300(收尾兜底抬起)。
+    ///
+    ///   ① t=0 按下 [`MACRO_REPEAT_KEY_A`];② 等 100ms 抬起;③ 等 200ms 的
+    ///   「间隔」指令;④ t=300 按下 [`MACRO_REPEAT_KEY_B`] —— 录制里没等到抬起,
+    ///   由收尾在同一刻(t=300)兜底抬起。
+    fn repeat_macro(repeat: bool) -> Action {
+        use crate::keymap::MacroStep;
+        Action::Macro(MacroAction {
+            steps: vec![
+                MacroStep {
+                    code: MACRO_REPEAT_KEY_A,
+                    pressed: true,
+                    delay_ms: 0,
+                },
+                MacroStep {
+                    code: MACRO_REPEAT_KEY_A,
+                    pressed: false,
+                    delay_ms: 100,
+                },
+            ],
+            instructions: vec![
+                MacroInstruction::Delay { ms: 200 },
+                MacroInstruction::Key {
+                    code: MACRO_REPEAT_KEY_B,
+                    duration_ms: 0,
+                    delay_ms: 0,
+                },
+            ],
+            virtual_profile: None,
+            repeat_while_held: repeat,
+        })
+    }
+
+    /// 这两个键在**默认配置**里既没有普通绑定、也不是任何轮盘方向键:宏里的
+    /// 动作因此只会是普通绑定的触点,断言不会混进轮盘动作。
+    const MACRO_REPEAT_KEY_A: u16 = 96; // 小键盘 Enter
+    const MACRO_REPEAT_KEY_B: u16 = 110; // Insert
+
+    /// 给上面那两个键配两条**自包含**的点按绑定(宏的录制步骤靠它们产生动作)。
+    /// 点按时长 [`MIN_TAP_MS`]:一轮里它的按下/抬起都落在同一毫秒,时间轴干净。
+    fn repeat_macro_binds() -> Vec<KeyBind> {
+        use crate::keymap::DEFAULT_RADIUS;
+        [MACRO_REPEAT_KEY_A, MACRO_REPEAT_KEY_B]
+            .into_iter()
+            .map(|key| KeyBind {
+                key,
+                action: Action::Tap {
+                    x: 0.5,
+                    y: 0.5,
+                    duration_ms: MIN_TAP_MS as u32,
+                    radius: DEFAULT_RADIUS,
+                    repeat_interval_ms: 0,
+                },
+                fps_only: false,
+                tail_delay_ms: 0,
+            })
+            .collect()
+    }
+
+    /// 一轮宏排出的**普通绑定触点**时刻(按下/抬起成对)。
+    fn repeat_round_clicks(scheduled: &[(Instant, SchedAct)]) -> Vec<(Instant, bool)> {
+        scheduled
+            .iter()
+            .filter_map(|(t, a)| match a {
+                SchedAct::MacroClick { down, .. } => Some((*t, *down)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 一轮宏的"跑完"时点 = 这一轮排出的动作里最晚的那个时刻。
+    /// 断言里用它当基准,免得依赖 `handle_bind_event` 内部 `Instant::now()` 的取值。
+    fn round_end(scheduled: &[(Instant, SchedAct)]) -> Instant {
+        scheduled
+            .iter()
+            .filter(|(_, a)| {
+                matches!(
+                    a,
+                    SchedAct::MacroClick { .. }
+                        | SchedAct::MacroMove { .. }
+                        | SchedAct::MacroAndroidKey { .. }
+                        | SchedAct::MacroWheel { .. }
+                        | SchedAct::MacroFps { .. }
+                )
+            })
+            .map(|(t, _)| *t)
+            .max()
+            .expect("这一轮必须真排了动作")
+    }
+
+    /// 排程里属于"这一轮宏"的动作数(触点 + 系统键 + 轮盘 + FPS)。
+    /// 用来断言"一次只排一轮、不预排 N 轮"。
+    fn macro_round_count(scheduled: &[(Instant, SchedAct)]) -> usize {
+        scheduled
+            .iter()
+            .filter(|(_, a)| {
+                matches!(
+                    a,
+                    SchedAct::MacroClick { .. }
+                        | SchedAct::MacroMove { .. }
+                        | SchedAct::MacroAndroidKey { .. }
+                        | SchedAct::MacroWheel { .. }
+                        | SchedAct::MacroFps { .. }
+                )
+            })
+            .count()
+    }
+
+    /// 坐标空间变更:锚点记录必须失效为哨兵,下一次位移才会重新对锚(DF-5)。
+    #[test]
+    fn aim_invalidate_anchor_forces_a_fresh_anchor() {
+        let mut st = AimState::default();
+        st.anchor_used = (500, 500);
+        st.down = true;
+        st.ox = 12.0;
+        aim_invalidate_anchor(&mut st);
+        assert_eq!(st.anchor_used, (-1, -1), "必须失效成哨兵");
+        // 真锚点恒为非负(aim_anchor 钳在屏内),哨兵不可能误撞
+        let m = mapper();
+        let (ax, ay) = aim_anchor(&m, &aim_at(0.0, 0.0));
+        assert_eq!((ax, ay), (0, 0));
+        assert_ne!(st.anchor_used, (ax, ay));
+        // 这个助手只负责"忘掉旧锚点":其余状态原样不动
+        assert!(st.down);
+        assert_eq!(st.ox, 12.0);
     }
 }

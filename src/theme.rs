@@ -351,6 +351,70 @@ pub struct Look {
     pub overlay_auto: bool,
 }
 
+/// 鼠标接管的实现方式(用户 2026-10-13 指定:入口在「外观」,支持热切换)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MouseCaptureMode {
+    /// **默认**:钩子层隔膜 —— 与从前逐位一致,不改变任何既有体验。
+    #[default]
+    Shield,
+    /// 窗口层遮板:一块透明置顶窗贴在投屏区域上,鼠标事件落在它身上,
+    /// 底下的投屏窗口收不到;画上去的圈与字照常显示,其余像素完全透明。
+    Mask,
+}
+
+impl MouseCaptureMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            MouseCaptureMode::Shield => "隔膜",
+            MouseCaptureMode::Mask => "遮板",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            MouseCaptureMode::Shield => {
+                "在**钩子层**吞掉鼠标消息(默认,与从前行为一致)。\n\
+                 优点:不新增窗口、不依赖投屏窗口位置。\n\
+                 缺点:本界面在独占期间也点不了(键盘不受影响)。"
+            }
+            MouseCaptureMode::Mask => {
+                "在**窗口层**挡鼠标:一块透明置顶窗贴在投屏区域上,事件落在它身上,\n\
+                 底下的投屏窗口收不到 ⇒ 双份输入从根上消失;本界面照常可点。\n\
+                 它还会把键位/轮盘/锚点画在画面上(不透明的地方只有圈和字)。\n\
+                 注意:需要能定位到投屏窗口的位置;定位不到时会**自动退回隔膜**。"
+            }
+        }
+    }
+
+    pub const ALL: [MouseCaptureMode; 2] = [MouseCaptureMode::Shield, MouseCaptureMode::Mask];
+}
+
+/// 「隔膜此刻该不该开」的**纯判定**(用户 2026-10-13;便于单测)。
+///
+/// 输入:
+/// - `mode` = 外观页选的接管方式;
+/// - `mask_available` = 本平台支持遮板吗;
+/// - `mask_active` = 遮板此刻**真的在工作**吗(窗口已起 + 定位到了投屏窗口);
+/// - `shield_wanted` = 隔膜那条路自己算出来的结果(见 `keymap::mouse_shield_on`)。
+///
+/// 规则(两条,都是"只能有一个生效"):
+/// 1. 选了遮板**且**遮板真的在工作 ⇒ 隔膜必须关(`false`);
+/// 2. 其余情况 ⇒ 隔膜按它自己的判据走。
+///
+/// 为什么"遮板没起来就退回隔膜"而不是"什么都不开":后者会让用户以为接管生效了,
+/// 实际双份输入照旧 —— 退回隔膜至少行为与从前一致。
+pub fn shield_effective(
+    mode: MouseCaptureMode,
+    mask_available: bool,
+    mask_active: bool,
+    shield_wanted: bool,
+) -> bool {
+    if mode == MouseCaptureMode::Mask && mask_available && mask_active {
+        return false;
+    }
+    shield_wanted
+}
+
 fn default_bg_dim() -> u8 {
     // 压暗到 120/255:背景图清晰可见,同时保证文字可读
     120
@@ -890,5 +954,51 @@ mod tests {
         // 衬底必须是半透明的(不能把截图糊死)
         assert!(plate(light_ink).a() < 255 && plate(dark_ink).a() < 255);
         assert!(casing(light_ink).a() < 255 && casing(dark_ink).a() < 255);
+    }
+
+    /// **鼠标接管二选一**(用户 2026-10-13):「遮板」与「隔膜」只能生效一个。
+    ///
+    /// 三条必须成立:
+    /// ① 遮板真的在工作 ⇒ 隔膜必须关(否则鼠标被吞两次、界面也点不了);
+    /// ② 遮板**没起来**(平台不支持 / 定位不到投屏窗口 / 起窗失败)⇒ 退回隔膜
+    ///    —— 不能"什么都不开",那会让用户以为接管生效了而实际双份输入照旧;
+    /// ③ 选了隔膜 ⇒ 永远按隔膜自己的判据走(默认行为逐位不变)。
+    #[test]
+    fn mouse_capture_modes_are_mutually_exclusive() {
+        use MouseCaptureMode::{Mask, Shield};
+        // ① 遮板在工作:隔膜压成 false(无论隔膜自己多想开)
+        assert!(
+            !shield_effective(Mask, true, true, true),
+            "遮板生效时隔膜必须关"
+        );
+        assert!(!shield_effective(Mask, true, true, false));
+        // ② 遮板没起来:退回隔膜(按隔膜自己的判据)
+        assert!(
+            shield_effective(Mask, true, false, true),
+            "遮板未生效 ⇒ 退回隔膜"
+        );
+        assert!(
+            !shield_effective(Mask, true, false, false),
+            "隔膜本就不想开"
+        );
+        assert!(
+            shield_effective(Mask, false, true, true),
+            "平台不支持遮板 ⇒ 退回隔膜(哪怕 mask_active 谎报)"
+        );
+        // ③ 选了隔膜:永远按隔膜判据(不受遮板状态影响)
+        assert!(shield_effective(Shield, true, true, true));
+        assert!(!shield_effective(Shield, true, true, false));
+        // ④ 默认值必须是隔膜(老配置没有该字段 ⇒ 与从前逐位一致)
+        assert_eq!(
+            MouseCaptureMode::default(),
+            Shield,
+            "缺省必须是隔膜,否则老用户的行为会变"
+        );
+        // ⑤ 两个选项都要有可读标签与说明(否则界面上一片空白)
+        for m in MouseCaptureMode::ALL {
+            assert!(!m.label().is_empty(), "{m:?} 必须有标签");
+            assert!(!m.hint().is_empty(), "{m:?} 必须有悬停说明");
+        }
+        assert_eq!(MouseCaptureMode::ALL.len(), 2, "用户要求就两项:遮板 / 隔膜");
     }
 }

@@ -24,6 +24,7 @@
 //! 同级。**每次启动截断重写**(用户要求"每次运行后完全更新");
 //! 因此崩溃现场会一直保留到你下次启动程序为止。
 
+use std::collections::VecDeque;
 use std::fmt::Display;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -108,6 +109,24 @@ static STATE: OnceLock<Mutex<Diag>> = OnceLock::new();
 /// 启动快照的文本副本:界面"导出诊断包"要用,避免重新推导一遍
 static SNAPSHOT: OnceLock<String> = OnceLock::new();
 
+/// 诊断面板"最近日志"环形缓冲(容量 [`RECENT_CAP`] 行,满了挤掉最早的)。
+///
+/// 为什么必须有它:界面上的日志列表(`PadApp::logs`)只接 `PadApp::log()`,
+/// 而捕获层那三条 Raw Input 关键行走的是 `diag_info!`/`diag_warn!` —— 它们
+/// **只落文件,一行都不进界面**。于是"出问题时打开诊断面板"这条路径上,
+/// 用户看不到"原始输入到底启用没有 / 为什么退回光标差",而那正是
+/// "视角不动、手感不对"的第一现场。这条缓冲就是那座缺失的桥。
+///
+/// **语义 = "真正写进文件的那一行"**:推入点在 [`write_raw`] 内部,即已经过
+/// `enabled` 级别过滤、且 `writeln!` 成功之后的最终落盘行。取舍说明:面板因此
+/// **随级别变化**(级别压到 `error` 时面板也只剩 error 行)—— 这正是想要的:
+/// 面板里出现的每一行,用户都能在同目录的 `diagnostics.log` 里逐字找到;
+/// 反之,面板里绝不会出现"文件里其实没有"的行。
+static RECENT: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+/// 环形缓冲容量。界面一次只显示最近 8 行,留 64 行是为了让"刚滚过去的那几行"
+/// 仍然可读(用户点一下"刷新预览"之前就能看到现场)。
+const RECENT_CAP: usize = 64;
+
 /// 取全局状态。**中毒也要能用** —— 日志系统一旦罢工,排查就彻底瞎了。
 fn state() -> &'static Mutex<Diag> {
     STATE.get_or_init(|| {
@@ -135,17 +154,51 @@ fn initial_level() -> (Level, &'static str) {
     }
 }
 
+/// 打开(截断)日志文件,**父目录不存在时先建**。
+///
+/// Linux 首次启动时 `config_dir()`(如 `~/.config/scrcpy-pad`)往往还不存在。
+/// `trace.rs` / `settings.rs` / `instance.rs` 各自都会 `create_dir_all`,
+/// 只有这里原本是裸 `File::create` —— 于是诊断日志整份丢失。2026-10-19 在
+/// WSL 实测到的原文:
+/// `[diag] 无法创建 /home/xxx/.config/scrcpy-pad/diagnostics.log: No such file
+/// or directory (os error 2)`。诊断日志是取证链第一环,丢它等于用户报障时无
+/// 现场可看,所以这里必须补建。
+///
+/// 仍然遵守模块头约束 1:绝不 panic;建目录失败也只返回 `Err`,由调用方退化成
+/// "只写 stderr"。
+pub fn open_log_file(path: &Path) -> std::io::Result<File> {
+    if let Some(dir) = path.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir)?;
+        }
+    }
+    File::create(path)
+}
+
 /// 初始化:在配置目录下**截断重写**日志文件,并写入启动头部。
 ///
 /// 必须在 `app::PadApp::new()` 之前调用 —— 那里会立刻开始写设备清单,
 /// 晚一步那些最关键的第一手信息就会丢。
 pub fn init() {
+    // **测试构建绝不许碰生产日志路径**(2026-10-12 事故):
+    // `cargo test` 跑在**用户机器**上,而 `init()` 会对
+    // `config_dir()/diagnostics.log` 做 `File::create` —— 一次 `cargo test`
+    // 就把用户当时那场会话的日志整份覆盖掉(真实发生过:用户让我看的会话日志
+    // 因此丢失,而日志正是唯一的取证介质)。测试一律落到临时目录,名字带 pid
+    // 以便并发/多进程互不干扰。
+    #[cfg(test)]
+    let path = {
+        let mut p = std::env::temp_dir();
+        p.push(format!("scrcpy-pad-test-diag-{}.log", std::process::id()));
+        p
+    };
+    #[cfg(not(test))]
     let path = crate::app::config_dir().join(FILE_NAME);
     // 先看上一份日志的结尾(Create 会把内容冲掉,必须在此之前读)
     let prev_abnormal = previous_run_was_abnormal(&path);
 
     let mut file = None;
-    match File::create(&path) {
+    match open_log_file(&path) {
         Ok(f) => file = Some(BufWriter::new(f)),
         Err(e) => eprintln!(
             "[diag] 无法创建 {}: {e} —— 诊断日志将只输出到 stderr(便携模式 + 只读介质?)",
@@ -306,16 +359,53 @@ pub fn log(level: Level, tag: &str, msg: impl Display) {
 /// 或者用户只是没碰键盘),缓冲区里的尾巴就会一直留着,进程被强杀时直接丢光。
 /// 定时线程与主线程是否忙无关,能把"崩溃时最多丢多久"稳定限制在 500ms 以内。
 fn write_raw(line: &str) {
-    let mut guard = lock();
-    // 一次性把字段拆开:`st.sink.as_mut()` 会借用整个 `*guard`(Deref 之后
-    // 借用检查看不到字段互不相交),那样后面再用别的字段就会冲突。
-    let Diag { sink, .. } = &mut *guard;
-    let Some(sink) = sink.as_mut() else { return };
-    let Some(f) = sink.file.as_mut() else { return };
-    if writeln!(f, "{line}").is_err() && !sink.write_failed_reported {
-        sink.write_failed_reported = true;
-        // 此处不能调 log(会把锁再借一次),直接打 stderr
-        eprintln!("[diag] 诊断日志写入失败(后续不再提示)");
+    // 先落盘,成功后才推入界面缓冲(缓冲语义 = "真正写进文件的那一行")。
+    // 两块状态用两把锁,且顺序固定为 Diag → RECENT(反向不存在),
+    // 所以不会死锁;作用域分开只是为了不在持 Diag 锁时再做别的加锁。
+    let wrote = {
+        let mut guard = lock();
+        // 一次性把字段拆开:`st.sink.as_mut()` 会借用整个 `*guard`(Deref 之后
+        // 借用检查看不到字段互不相交),那样后面再用别的字段就会冲突。
+        let Diag { sink, .. } = &mut *guard;
+        let Some(sink) = sink.as_mut() else { return };
+        let Some(f) = sink.file.as_mut() else { return };
+        if writeln!(f, "{line}").is_ok() {
+            true
+        } else {
+            if !sink.write_failed_reported {
+                sink.write_failed_reported = true;
+                // 此处不能调 log(会把锁再借一次),直接打 stderr
+                eprintln!("[diag] 诊断日志写入失败(后续不再提示)");
+            }
+            false
+        }
+    };
+    if wrote {
+        push_recent(line);
+    }
+}
+
+/// 把一行已落盘的内容推进 [`RECENT`] 环形缓冲。
+///
+/// **任何失败都静默忽略**(中毒锁、容量问题都当作"面板少一行"处理):
+/// 诊断日志落盘是取证生命线,绝不允许界面侧的内存缓冲反过来影响它 ——
+/// 与模块头部"三条设计约束"第 1 条(绝不 panic)同一口径。
+fn push_recent(line: &str) {
+    let Ok(mut q) = RECENT.lock() else { return };
+    if q.len() >= RECENT_CAP {
+        q.pop_front();
+    }
+    q.push_back(line.to_string());
+}
+
+/// [`RECENT`] 的快照(最近若干条已落盘行,由旧到新)。
+///
+/// 给诊断面板用:面板只负责**显示**,不做任何过滤/排序,免得面板里出现
+/// 文件里没有的行(那会让"面板看到什么 = 日志里有什么"这条对应关系失效)。
+pub fn recent_lines() -> Vec<String> {
+    match RECENT.lock() {
+        Ok(q) => q.iter().cloned().collect(),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -562,7 +652,7 @@ fn user_and_groups() -> String {
         if names.iter().any(|n| n == "input") {
             "是"
         } else {
-            "否 —— 读不到 /dev/input,必须 sudo usermod -aG input $USER 后重新登录"
+            "否 —— 读不到 /dev/input;装 60-scrcpy-pad.rules(不用重登)或 sudo usermod -aG input $USER 后重新登录"
         }
     )
 }
@@ -796,6 +886,301 @@ mod tests {
         assert_eq!(Level::parse("trace"), Some(Level::Trace));
         assert_eq!(Level::parse(""), None);
         assert_eq!(Level::parse("verbose!"), None);
+    }
+
+    /// **测试串行锁**(2026-10-13):`diag` 的 sink / path 是**进程级全局**,
+    /// 而 `cargo test` 默认**并行**跑 —— 任何改这两个全局的测试都必须先拿这把锁,
+    /// 否则会互相踩(实测:`interface_log_reaches_the_diagnostics_file` 单跑绿、
+    /// 全量跑红,根因就是它把 `sink` 换成临时文件后又被别的测试 `init()` 覆盖)。
+    ///
+    /// 中毒也照拿(`unwrap_or_else`):一次失败不该连累后面每个测试都 panic
+    /// —— 与 `capture.rs` 的 `SHARED_LOCK` 同一套写法。
+    static DIAG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn diag_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        DIAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// **事故回归**(2026-10-12):测试**绝不许**碰生产诊断日志路径。
+    ///
+    /// 真实事故:`cargo test` 里一条测试调了 `init()`,而 `init()` 会对
+    /// `config_dir()/diagnostics.log` 做 `File::create` —— 用户机器上跑一次测试,
+    /// 用户当时那场会话的日志就被整份覆盖(而那正是唯一的取证介质)。
+    ///
+    /// 这条测试锁住修法:`init()` 在 `cfg(test)` 下必须指向**临时目录**。
+    #[test]
+    fn tests_never_touch_the_production_log_path() {
+        let _g = diag_test_guard();
+        let prod = crate::app::config_dir().join(FILE_NAME);
+        init();
+        let in_use = path();
+        assert_ne!(
+            in_use,
+            prod,
+            "测试构建下 init() 必须落到临时目录,不许指向生产日志 {}",
+            prod.display()
+        );
+        assert!(
+            in_use.starts_with(std::env::temp_dir()),
+            "测试日志必须在临时目录里:{:?}",
+            in_use
+        );
+    }
+
+    /// **F1 接线层回归**(2026-10-12,协议 §6.3 必测缝①):
+    /// 界面日志必须真的落进**文件**,而不是只进内存环形缓冲。
+    ///
+    /// 为什么必须有一条**落盘**断言,而不是只看实现:`PadApp::log()` 曾经只把
+    /// 消息推进 `self.logs` 环形缓冲,于是"手机被手触摸 / 手离开手机 / 设备端
+    /// 输入账本"这些自愈层消息在用户能看到的 diagnostics.log 里**一行都没有** ——
+    /// 承诺的取证链是空的,而所有门禁照样全绿(门禁绿 ≠ 问题解决)。
+    ///
+    /// **绝不调用 `init()`**(2026-10-12 事故):`init()` 会对
+    /// `config_dir()/diagnostics.log` 做 `File::create` —— 测试跑在**用户机器**上,
+    /// 一调就把用户当时那场会话的日志整份覆盖掉(真实发生过:用户让我看的
+    /// 21:47 会话日志因此丢失)。所以这里绕开 `init`,直接把 `Sink` 指向**临时
+    /// 目录**里的文件,验证同一条写入通路(`log()` → `write_raw()` → 文件),
+    /// 并在末尾断言"生产路径没有被本次测试动过"。
+    #[test]
+    fn interface_log_reaches_the_diagnostics_file() {
+        use std::io::Write as _;
+        // 串行:这条测试会**替换全局 sink**,必须与其它动 diag 全局的测试互斥
+        let _g = diag_test_guard();
+
+        // ① 记录生产路径的当前状态(绝不修改它)
+        let prod = crate::app::config_dir().join(FILE_NAME);
+        let prod_before = std::fs::read(&prod).ok();
+
+        // ② 把 sink 指向临时文件(与生产同一条 `write_raw` 通路,只是换了文件)
+        let tmp = std::env::temp_dir().join(format!(
+            "diag-seam-{}-{:?}.log",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let f = std::fs::File::create(&tmp).expect("临时日志文件应可创建");
+        {
+            let mut st = lock();
+            st.sink = Some(Sink {
+                file: Some(std::io::BufWriter::new(f)),
+                write_failed_reported: false,
+            });
+        }
+        let marker = format!("F1-SEAM-PROBE-{}", std::process::id());
+        // 直接走 `write_raw`(生产 `log()` 的落盘那一步):级别过滤与 stderr 行为
+        // 不属于这条缝,缝是"写下去到底进没进文件"。
+        write_raw(&format!("[INFO ][app][test] {marker}"));
+        flush();
+        // 关掉临时 sink,免得影响其它测试
+        {
+            let mut st = lock();
+            if let Some(s) = st.sink.as_mut() {
+                if let Some(f) = s.file.as_mut() {
+                    let _ = f.flush();
+                }
+            }
+            st.sink = None;
+        }
+        let text = std::fs::read_to_string(&tmp).expect("临时日志文件应可读回");
+        assert!(
+            text.contains(&marker),
+            "界面日志必须真的落进文件(F1 的回归点);文件里没有 {marker}"
+        );
+        assert!(
+            text.contains("[app]"),
+            "落盘行必须带来源标签,便于按模块过滤"
+        );
+        let _ = std::fs::remove_file(&tmp);
+
+        // ③ **不许碰生产日志**:这条断言是本事故(测试覆盖用户现场)的回归点
+        assert_eq!(
+            std::fs::read(&prod).ok(),
+            prod_before,
+            "测试绝不许改动生产诊断日志 {} —— 用户现场就是取证证据",
+            prod.display()
+        );
+    }
+
+    /// 把全局 sink 临时指向一个临时文件(与生产同一条 `write_raw` 通路,只是换了文件)。
+    /// 调用方必须已持有 [`diag_test_guard`],并在结束时调 [`restore_sink`]。
+    fn install_temp_sink(tag: &str) -> std::path::PathBuf {
+        let tmp = std::env::temp_dir().join(format!(
+            "diag-{tag}-{}-{:?}.log",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let f = std::fs::File::create(&tmp).expect("临时日志文件应可创建");
+        let mut st = lock();
+        st.sink = Some(Sink {
+            file: Some(std::io::BufWriter::new(f)),
+            write_failed_reported: false,
+        });
+        tmp
+    }
+
+    /// 收掉临时 sink,免得影响其它测试。
+    fn restore_sink() {
+        let mut st = lock();
+        if let Some(s) = st.sink.as_mut() {
+            if let Some(f) = s.file.as_mut() {
+                let _ = f.flush();
+            }
+        }
+        st.sink = None;
+    }
+
+    /// **R15 缝①(协议 §3.7)**:Raw Input 通道那三条关键日志必须**真的落盘**,
+    /// 并且**真的进得了诊断面板的环形缓冲**(界面可见性就靠这条桥)。
+    ///
+    /// 为什么值得单独一条:这三行是"原始输入到底启用没有 / 为什么退回光标差"的
+    /// 第一现场,而它们走的是 `diag_info!`/`diag_warn!` → `log()` → `write_raw()`,
+    /// **完全不经过 `PadApp::log()` 与界面的 `self.logs`**。改之前它们只落文件,
+    /// 面板上什么都没有(用户只能自己去翻文件)。这条测试同时钉住两头:
+    /// 文件里有(取证)、`recent_lines()` 里也有(面板可见)。
+    ///
+    /// **级别口径**(不许假绿):三条里有一条是 `INFO`。默认级别虽是 `info`,但
+    /// 环境变量 `SCRCPY_PAD_LOG` 可以把它压到 `error`,那样这条测试会因为
+    /// "级别被过滤"而**假绿/假红**。所以这里显式 `set_level(Info)` 并复原。
+    ///
+    /// **绝不调用 `init()`**(2026-10-12 事故):`init()` 会对
+    /// `config_dir()/diagnostics.log` 做 `File::create`,测试跑在用户机器上,
+    /// 一调就把用户当时那场会话的日志整份覆盖。末尾仍断言生产路径未被改动。
+    #[test]
+    fn raw_channel_logs_reach_the_diagnostics_file() {
+        // 串行:这条测试会替换全局 sink + 改全局级别,必须与其它动 diag 全局的测试互斥
+        let _g = diag_test_guard();
+
+        // ① 记录生产路径的当前状态(绝不修改它)
+        let prod = crate::app::config_dir().join(FILE_NAME);
+        let prod_before = std::fs::read(&prod).ok();
+
+        // ② 显式把级别抬到 info 并保存原值 —— 环境变量把它压到 error 时,
+        //    `log(Info, ..)` 会被 `enabled()` 静默吞掉,这条测试就会假绿。
+        let saved_level = level();
+        let saved_source = level_source();
+        set_level(Level::Info, "R15 测试");
+
+        // ③ 把 sink 指向临时文件(与生产同一条 `write_raw` 通路,只是换了文件)
+        let tmp = install_temp_sink("rawseam");
+
+        // ④ 逐条写 Raw Input 通道的三条**生产原文**(capture.rs 逐字引用)
+        log(
+            Level::Info,
+            "capture",
+            format_args!("原始输入(Raw Input)已启用:鼠标位移按设备计数上报(无指针加速/DPI 失真)"),
+        );
+        log(
+            Level::Warn,
+            "capture",
+            format_args!(
+                "检测到绝对坐标鼠标(数位板/远程桌面/部分触控板):原始输入对它不适用,位移退回光标差路径"
+            ),
+        );
+        log(
+            Level::Warn,
+            "capture",
+            format_args!(
+                "原始输入注册后持续丢弃位移 {}ms 仍未收到任何鼠标事件:位移退回光标差路径",
+                700
+            ),
+        );
+        flush();
+
+        // 先取缓冲快照、再读文件:缓冲是**进程级全局**,别的测试也会往里推行,
+        // 先取快照能把"被别的测试挤出去"的时间窗压到最小(§3.9 flaky = bug)。
+        let recent = recent_lines();
+        let text = std::fs::read_to_string(&tmp).expect("临时日志文件应可读回");
+
+        // ⑤ 三条都必须落盘,且带 `[capture]` 标签(便于 `grep '[capture]'` 过滤)
+        for (what, needle) in [
+            ("info 启用行", "原始输入(Raw Input)已启用"),
+            ("warn 绝对坐标行", "检测到绝对坐标鼠标"),
+            ("warn 丢弃位移行", "持续丢弃位移 700ms"),
+        ] {
+            assert!(
+                text.contains(needle),
+                "Raw 通道的{what}必须落进文件(缝①的回归点);文件里没有 {needle:?}\n--- 文件全文 ---\n{text}"
+            );
+            assert!(
+                text.contains("[capture]"),
+                "落盘行必须带 [capture] 标签,便于按模块过滤;文件里没有"
+            );
+            assert!(
+                recent.iter().any(|l| l.contains(needle)),
+                "Raw 通道的{what}必须同时进诊断面板的环形缓冲(否则面板上看不到 \
+                 『原始输入』的任何一行 —— 这正是 R15 要补的桥);缓冲里没有 {needle:?}\n\
+                 --- 缓冲全文 ---\n{recent:#?}"
+            );
+        }
+        // 带参数那条的参数必须被真的渲染进去(不是留下 `{}`)
+        assert!(
+            text.contains("位移退回光标差路径") && !text.contains("{}ms"),
+            "带参数的那条 warn 必须渲染出具体毫秒数,不能留下未展开的占位符"
+        );
+
+        // ⑥ 收尾:还原 sink 与级别
+        restore_sink();
+        set_level(saved_level, &saved_source);
+        let _ = std::fs::remove_file(&tmp);
+
+        // ⑦ **不许碰生产日志**:这条断言是"测试覆盖用户现场"事故的回归点
+        assert_eq!(
+            std::fs::read(&prod).ok(),
+            prod_before,
+            "测试绝不许改动生产诊断日志 {} —— 用户现场就是取证证据",
+            prod.display()
+        );
+    }
+
+    /// **R15:环形缓冲容量**。界面只显示最近 8 行,但缓冲留 [`RECENT_CAP`] 行;
+    /// 超容量时必须**挤掉最早的**,而不是无限增长(那是内存泄漏),也不是丢掉最新的
+    /// (那会让面板永远停在旧内容上)。
+    ///
+    /// 走 `write_raw` 而不是 `push_recent`:推入点必须在**落盘那一步** ——
+    /// 变异验证③(删掉 `write_raw` 里的推入行)就是要让这条测试变红。
+    #[test]
+    fn recent_log_lines_are_capped() {
+        let _g = diag_test_guard();
+        let prod = crate::app::config_dir().join(FILE_NAME);
+        let prod_before = std::fs::read(&prod).ok();
+
+        let tmp = install_temp_sink("recentcap");
+        // 多写 6 行,确保"最早那行"一定被挤出去(与缓冲里此前的残留无关)
+        let total = RECENT_CAP + 6;
+        for i in 0..total {
+            write_raw(&format!("[+{:>7}ms][R15-CAP] 第 {i} 行", i));
+        }
+        let lines = recent_lines();
+        restore_sink();
+        let _ = std::fs::remove_file(&tmp);
+
+        assert!(
+            lines.len() <= RECENT_CAP,
+            "环形缓冲不得超过容量 {RECENT_CAP},实为 {}",
+            lines.len()
+        );
+        assert_eq!(
+            lines.len(),
+            RECENT_CAP,
+            "写满 {total} 行后缓冲应恰好是容量 {RECENT_CAP} 行,实为 {}",
+            lines.len()
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("第 0 行")),
+            "最早的『第 0 行』必须已被挤掉(否则是无限增长)"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(&format!("第 {} 行", total - 1))),
+            "最后写的『第 {} 行』必须在缓冲里(否则会丢最新)",
+            total - 1
+        );
+        assert_eq!(
+            std::fs::read(&prod).ok(),
+            prod_before,
+            "测试绝不许改动生产诊断日志 {}",
+            prod.display()
+        );
     }
 
     /// 没有日志文件(或空文件)时不能误判成"上次异常结束" ——

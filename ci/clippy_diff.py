@@ -3,15 +3,22 @@
 
 用法::
 
-    python ci/clippy_diff.py            # 只报告，永远退出 0（信息性）
-    python ci/clippy_diff.py --strict   # 出现"新增/消失"即退出 1
+    python ci/clippy_diff.py                 # 本机（Windows）目标，只报告，永远退出 0
+    python ci/clippy_diff.py --strict        # 出现"新增/消失"即退出 1
+    python ci/clippy_diff.py --target linux  # Linux 交叉目标，用自己的基线
+    python ci/clippy_diff.py --target linux --strict
 
 口径与《全面审计与提升方案-2026-10-05.md》里历次实施记录一致：
 
 * 比对的是 **(文件, 消息文本) 去重集合**，不是行号 —— 行号每次重构都会动，
   消息文本才代表"同一类告警"；
-* 基线文件 `ci/clippy-baseline.txt` 每行 `src/xxx.rs: warning: <消息>`，
-  由维护者在"确认每一对都是既有构造"之后手工更新（更新时要在方案文档里记账）；
+* 基线文件每行 `src/xxx.rs: warning: <消息>`，由维护者在"确认每一对都是既有构造"
+  之后手工更新（更新时要在方案文档里记账）；
+* **两个目标各有一份基线**（2026-10-22 起）：本机基线 `ci/clippy-baseline.txt`，
+  Linux 交叉目标基线 `ci/clippy-baseline-linux.txt`。原因：两个平台编译的
+  `#[cfg]` 代码面不同，各有一对平台独有的告警（Linux 侧 manual implementation of
+  .is_multiple_of()，Windows 侧 this function has too many arguments (8/7)），
+  数量巧合都是 36 对。**不要试图用一份基线同时满足两边**。
 * 本机（Windows）的基线是 36 对；GitHub runner 上的 rustc 版本可能更新，
   因此 CI 把它当**信息性**步骤，不拦提交。
 """
@@ -25,7 +32,9 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BASELINE = os.path.join(HERE, "clippy-baseline.txt")
+BASELINE_NATIVE = os.path.join(HERE, "clippy-baseline.txt")
+BASELINE_LINUX = os.path.join(HERE, "clippy-baseline-linux.txt")
+LINUX_TARGET = "x86_64-unknown-linux-gnu"
 BS = chr(92)  # 反斜杠
 
 # Windows 控制台/重定向管道的默认编码是 GBK 或 cp1252，直接 print 中文会炸；
@@ -44,9 +53,12 @@ def load_baseline(path: str) -> set[tuple[str, str]]:
     return pairs
 
 
-def run_clippy() -> set[tuple[str, str]]:
+def run_clippy(target: str | None) -> set[tuple[str, str]]:
+    cmd = ["cargo", "clippy", "--all-targets"]
+    if target:
+        cmd += ["--target", target]
     proc = subprocess.run(
-        ["cargo", "clippy", "--all-targets"],
+        cmd,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -65,23 +77,50 @@ def run_clippy() -> set[tuple[str, str]]:
     return pairs
 
 
+def parse_target(argv: list[str]) -> str | None:
+    """返回 cargo 的 --target 值；本机目标返回 None。
+
+    认 --target linux 与 --target=linux 两种写法；native/windows/本机 都当本机。
+    """
+    for i, arg in enumerate(argv):
+        val = None
+        if arg == "--target" and i + 1 < len(argv):
+            val = argv[i + 1]
+        elif arg.startswith("--target="):
+            val = arg.split("=", 1)[1]
+        if val is None:
+            continue
+        v = val.strip().lower()
+        if v in ("linux", LINUX_TARGET):
+            return LINUX_TARGET
+        if v in ("native", "windows", "本机", "x86_64-pc-windows-msvc"):
+            return None
+        print("未知 --target 取值: " + val + "（认 linux / native）")
+        raise SystemExit(2)
+    return None
+
+
 def main() -> int:
     strict = "--strict" in sys.argv
-    baseline = load_baseline(BASELINE)
-    current = run_clippy()
+    target = parse_target(sys.argv)
+    baseline_path = BASELINE_LINUX if target else BASELINE_NATIVE
+    label = "linux(" + LINUX_TARGET + ")" if target else "本机(Windows)"
+    baseline = load_baseline(baseline_path)
+    current = run_clippy(target)
     new = sorted(current - baseline)
     gone = sorted(baseline - current)
 
-    print(f"当前告警对: {len(current)}   基线对: {len(baseline)}")
+    print("目标: " + label + "   基线: " + os.path.basename(baseline_path))
+    print("当前告警对: " + str(len(current)) + "   基线对: " + str(len(baseline)))
     print("--- 新增（当前有、基线没有）---")
     for f, msg in new:
-        print(f"  {f} | {msg}")
+        print("  " + f + " | " + msg)
     print("--- 消失（基线有、当前没有）---")
     for f, msg in gone:
-        print(f"  {f} | {msg}")
+        print("  " + f + " | " + msg)
 
     if new or gone:
-        print("提示：确认每一对都是既有构造/已消除后，更新 ci/clippy-baseline.txt 并在方案文档里记账。")
+        print("提示：确认每一对都是既有构造/已消除后，更新 " + os.path.basename(baseline_path) + " 并在方案文档里记账。")
         return 1 if strict else 0
     print("与基线零差异。")
     return 0

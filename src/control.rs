@@ -293,6 +293,10 @@ impl ControlClient {
                     // `set_screen`(转屏/截图校正),用批次开头那一份会把之后的
                     // 命令按旧坐标空间换算 —— 服务端启用视频/`--new-display` 时
                     // `PositionMapper` 会因此把它们缩放错位。
+                    // 轨迹(`SCRCPY_PAD_TRACE`):这里是"确实要发给设备"的唯一真相 ——
+                    // 队列可能丢旧保新、socket 可能写失败,只有写线程手里的这一份
+                    // 按 FIFO 原样落进轨迹,回放与断言都以它为准。
+                    crate::trace::out(&cmd);
                     let mut buf = serialize(
                         cmd,
                         proto_w.load(Ordering::Relaxed) as u16,
@@ -301,6 +305,7 @@ impl ControlClient {
                     let mut n = 1usize;
                     while n < WRITE_BATCH_LIMIT {
                         let Some(more) = queue.try_pop() else { break };
+                        crate::trace::out(&more);
                         buf.extend_from_slice(&serialize(
                             more,
                             proto_w.load(Ordering::Relaxed) as u16,

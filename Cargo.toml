@@ -1,6 +1,6 @@
 [package]
 name = "scrcpy-pad"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "A keyboard-mapping game console layered on top of scrcpy (virtual joystick, tap/hold/swipe injection)"
 license = "MIT"
@@ -44,9 +44,16 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    # 单实例守卫用 CreateMutexW:windows-sys 0.59 把它同时挂在 Win32_Security
+    # 下(参数类型 SECURITY_ATTRIBUTES 属于那个模块),少了这个 feature 会 E0432。
+    "Win32_Security",
     # GetModuleHandleW:Raw Input 接收窗口要按模块注册窗口类(W1-2)
     "Win32_System_LibraryLoader",
     "Win32_Graphics_Gdi",
+    # 参数表按**中文拼音**排序(用户 2026-10-13)用 CompareStringEx:
+    # 它在 zh-CN 下就是 Windows 资源管理器那套中文排序,零维护
+    # (不必手写几千字的拼音映射,也不会写错多音字)。
+    "Win32_Globalization",
 ] }
 
 [profile.release]

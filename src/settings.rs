@@ -65,13 +65,134 @@ pub struct Settings {
     /// 重启后打开的是另一份文件,用户会以为改动丢了 —— 这是正确性问题,不是偏好。
     #[serde(default)]
     pub profile_path: Option<String>,
+    /// 宏录制的「开始录制」热键(evdev 键码;0 = 未绑定)。
+    ///
+    /// 用户 2026-10-12 需求:给现有宏录制流程加**热键入口**(语法糖),
+    /// 不改变录制核心逻辑。只支持**单键** —— 组合键无法绑定。
+    #[serde(default)]
+    pub macro_record_start_key: u16,
+    /// 是否启用「开始录制」热键。**未勾选时即使绑了键也不触发任何行为**
+    /// (键位值保留)。默认关 = 与从前逐位一致。
+    #[serde(default)]
+    pub macro_record_start_key_enabled: bool,
+    /// 宏录制的「终止录制」热键(evdev 键码;0 = 未绑定)。同样只支持单键。
+    #[serde(default)]
+    pub macro_record_stop_key: u16,
+    /// 是否启用「终止录制」热键。默认关。
+    #[serde(default)]
+    pub macro_record_stop_key_enabled: bool,
+    /// 宏录制的「取消录制」热键(evdev 键码;0 = 未绑定)。
+    ///
+    /// 用户 2026-10-12 第 1 条:宏要能**取消** —— 与"终止录制"(保存已录内容)
+    /// 不同,取消 = **丢弃**这次录制、不写入任何东西。用户明确要求它是
+    /// "**全局公共的**":一个键,对所有宏录制生效,不必逐宏设置。
+    #[serde(default)]
+    pub macro_record_cancel_key: u16,
+    /// 是否启用「取消录制」热键。默认关。
+    #[serde(default)]
+    pub macro_record_cancel_key_enabled: bool,
+    /// **鼠标接管方式**:「隔膜」或「遮板」(用户 2026-10-13)。
+    ///
+    /// **为什么放在 settings.json 而不是 `Look`(外观)里** —— 这是实测出来的
+    /// 架构错误:外观是**每套按键组合各存一份**的(`profile.yaml` 里每套 scheme
+    /// 都有自己的 `look`),而程序启动时还会用全局的 `look.json` 覆盖它。
+    /// 于是"我在外观页选了遮板"会写进**当时生效那套**的 look,一旦切换组合、
+    /// 或被 look.json 覆盖,选择就丢了/串了(用户实测:选中 Mask 却跑成了 Shield)。
+    ///
+    /// 鼠标接管方式是**程序级**偏好(与"宏录制热键"同类),不该跟着按键组合走,
+    /// 所以放这里。界面入口仍按用户要求在「外观」页。
+    #[serde(default)]
+    pub mouse_capture: crate::theme::MouseCaptureMode,
+    /// 遮板要显示哪些项目(与「截图取点」的过滤项同一套语义,见 `OverlayFilter`)。
+    ///
+    /// 用位标志存(`u8`),加一项不会破坏老配置兼容性。
+    #[serde(default = "default_mask_filter")]
+    pub mask_filter: u8,
+    /// **轨迹录制的总开关**(用户 2026-10-14):未勾选时快捷键**不触发**录制
+    /// (卡片上的按钮仍可用)。默认关 = 与从前逐位一致。
+    #[serde(default)]
+    pub track_rec_enabled: bool,
+    /// 轨迹录制的**快捷键**(evdev 键码;0 = 未绑定/空缺)。
+    ///
+    /// 按一下开始、再按一下结束(**同一个键切换**,用户 2026-10-14 拍板)。
+    /// 只支持单键 —— 组合键无法绑定(捕获走 `waiting_key`,与宏触发键同路)。
+    #[serde(default)]
+    pub track_rec_key: u16,
+    /// 轨迹录制的**结束快捷键**(用户 2026-10-23 第 2 条:与宏录制一样"共用一对",
+    /// 开始/结束各一个键)。
+    ///
+    /// 0(缺省)= 未绑定 ⇒ 退回旧行为:开始键按一下开始、再按一下结束
+    /// (2026-10-14 定下的单键切换口径,老配置不用迁移、逐位一致)。
+    #[serde(default)]
+    pub track_rec_stop_key: u16,
+    /// **独占模式:已绑定键不再传给其它程序**(B21-2/G-b,2026-10-18)。默认关。
+    ///
+    /// 打开后,映射开启期间**当前配置里被绑定的键**(含 W/A/S/D 这类普通键)
+    /// 在 Windows 低级钩子里被吞掉(按下与抬起都吞),其它程序收不到。
+    /// 边界:仅在 legacy 消息层生效,拦不住通过 Raw Input 读输入的程序
+    /// (原理性天花板,见 app.rs 的 WIN_GRAB_MODES_NOTE)。
+    ///
+    /// **程序级**(存 settings.json,不跟按键组合走):它是"这台机器上要不要
+    /// 独占键盘"的环境偏好,与 mouse_capture 同类。老配置文件没有该字段 ⇒
+    /// serde default = false = 与从前逐位一致(一个键都不多吞)。
+    #[serde(default)]
+    pub swallow_bound_keys: bool,
+    /// **映射期间独占键盘设备**(Linux 的 `EVIOCGRAB`,仅非 Windows 使用)。默认关。
+    ///
+    /// 这是 Linux 侧**唯一的结构性优势**:整把设备被内核独占,同一把键鼠的
+    /// 按键在系统里任何前台程序都收不到,不需要"已绑定键"白名单。
+    ///
+    /// 为什么必须落盘(2026-10-21 修):以前存在 `PadApp` 的字段里,每次启动
+    /// 都重置为 false —— 用户勾了"映射时屏蔽原键",下次启动就悄悄失效,
+    /// 而且界面上那个勾选框看起来还是"记得"的样子(实际是每次重新建)。
+    /// 这是**承诺没兑现**,不是优化:`settings.json` 里没有它,等于这个开关
+    /// 只在本进程生命周期内有效。
+    ///
+    /// **程序级**(存 settings.json):这是"这台机器上要不要独占键盘"的环境偏好,
+    /// 与 `mouse_capture` / `swallow_bound_keys` 同类,不跟按键组合走。
+    /// 老配置文件没有该字段 ⇒ `#[serde(default)]` = false = 与从前一致
+    /// (Windows 侧本来就是死字段,见 `capture.rs` 的 `bound_key_words`)。
+    #[serde(default)]
+    pub grab_enabled: bool,
+    /// **瞄准期间把光标钉住**(B21-3/G-c,2026-10-18)。**默认开**。
+    ///
+    /// 打开后,FPS 瞄准(`mouse_grab` 为真)期间用 `ClipCursor` 把系统光标关在
+    /// 当前位置的 1x1 像素矩形里 —— 它不再满屏乱跑、也撞不到屏幕边。
+    /// 与既有的"回中"路径**并存**(回中留作兜底:钉子被目标程序覆盖/忽略时仍能拉回)。
+    ///
+    /// 为什么默认**开**:钉住只发生在"真的在瞄准"那一刻(判据是既有的
+    /// `mouse_grab`,不是新造的),退出瞄准/断连/退出程序都会释放;
+    /// 而它解决的问题(甩枪时点错窗口、撞边丢位移)是 FPS 体验的直接改善。
+    /// 关掉它 = 回到"只回中不钉住"的从前行为,一条路径都不变。
+    ///
+    /// **程序级**(存 settings.json):这是"这台机器上要不要钉光标"的环境偏好。
+    /// 老配置文件没有该字段 ⇒ serde 走 `default_clip_cursor` = true(新功能默认享受),
+    /// 而不是 `#[serde(default)]` 的 false。
+    #[serde(default = "default_clip_cursor")]
+    pub clip_cursor_in_aim: bool,
     /// 最后写入时间(epoch 秒,仅供用户查看,不参与逻辑)
     #[serde(default)]
     pub saved_at: u64,
 }
 
+/// 遮板过滤项的缺省值:与「截图取点」的 `OverlayFilter::default()` 保持一致
+/// (键位/组合键/永久轮盘/临时轮盘 = 开;宏/锚点 = 关)。
+fn default_mask_filter() -> u8 {
+    crate::app::MASK_FILTER_DEFAULT
+}
+
 /// serde 默认值函数:remember_paths 缺省为 true(老文件里没有该字段时按"记住"处理)
 fn default_true() -> bool {
+    true
+}
+
+/// serde 默认值函数:瞄准期间钉住光标缺省为 **true**(B21-3/G-c)。
+///
+/// 老配置文件里没有 `clip_cursor_in_aim` 这个字段 ⇒ 这里返回什么,升级后的行为
+/// 就是什么。返回 true 是**有意的**:该功能只在瞄准那一刻生效、四条释放路径
+/// 都已实现(见 `capture.rs` 的 G-c 段与消费线程的注释),默认享受它比"默认关、
+/// 用户永远不知道有这功能"更合用户口径。
+fn default_clip_cursor() -> bool {
     true
 }
 
@@ -88,6 +209,22 @@ impl Default for Settings {
             selected_serial: String::new(),
             log_level: String::new(),
             profile_path: None,
+            macro_record_start_key: 0,
+            macro_record_start_key_enabled: false,
+            macro_record_stop_key: 0,
+            macro_record_stop_key_enabled: false,
+            macro_record_cancel_key: 0,
+            macro_record_cancel_key_enabled: false,
+            mouse_capture: crate::theme::MouseCaptureMode::default(),
+            mask_filter: default_mask_filter(),
+            track_rec_enabled: false,
+            track_rec_key: 0,
+            track_rec_stop_key: 0,
+            swallow_bound_keys: false,
+            grab_enabled: false,
+            // B21-3/G-c:默认开(与 serde 的 `default_clip_cursor` 同一个值 ——
+            // 两处必须一致,否则"新装"与"老配置文件升级"会走出两种行为)。
+            clip_cursor_in_aim: default_clip_cursor(),
             saved_at: 0,
         }
     }
@@ -395,6 +532,179 @@ mod tests {
         );
     }
 
+    /// **轨迹录制快捷键配置的往返 + 老配置兼容**(用户 2026-10-14)。
+    ///
+    /// 两件事都必须成立:
+    /// ① 用户在界面上设的三项(启用 / 开始键 / 结束键)**重启后还在** ——
+    ///    否则"我设好了快捷键,重启又变空缺"就是必然故障;
+    /// ② 老 settings.json(没有这两个字段)**仍能读入**,且缺省 = 与从前一致
+    ///    (未启用 + 空缺 ⇒ 快捷键不触发,不会因为升级了一下程序就突然开始录轨迹)。
+    #[test]
+    fn track_recording_trigger_roundtrips_and_legacy_json_stays_inert() {
+        // ① 往返:两项都改成"非默认"值,存取一圈必须原样回来
+        let s = Settings {
+            track_rec_enabled: true,
+            track_rec_key: 88,
+            track_rec_stop_key: 89,
+            ..Settings::default()
+        };
+        let text = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&text).unwrap();
+        assert!(back.track_rec_enabled, "启用状态必须能存回来");
+        assert_eq!(back.track_rec_key, 88, "开始键必须能存回来");
+        assert_eq!(back.track_rec_stop_key, 89, "结束键必须能存回来");
+        assert_eq!(back, s, "除上述两项外不该有字段被改动");
+        // ② 老配置:完全没有这两个字段 ⇒ 缺省必须是"惰性"的
+        let old: Settings =
+            serde_json::from_str(r#"{ "scrcpy_path": "/usr/bin/scrcpy" }"#).unwrap();
+        assert!(
+            !old.track_rec_enabled,
+            "老配置必须缺省为**未启用**(升级不该让录制突然生效)"
+        );
+        assert_eq!(old.track_rec_key, 0, "缺省快捷键应为空缺 ⇒ 不触发");
+        assert_eq!(
+            old.track_rec_stop_key, 0,
+            "缺省结束键应为空缺 ⇒ 退回单键切换(升级不改变手感)"
+        );
+        // ③ 曾经存在的字段(鼠标键触发方式)从配置里**读不出来也不再需要** ——
+        //    用户 2026-10-14 明确要去掉鼠标控制录制;老文件里若残留该字段,
+        //    必须被**静默忽略**而不是解析失败(否则用户重启后整份设置回默认)。
+        let stale: Settings = serde_json::from_str(
+            r#"{ "track_rec_enabled": true, "track_rec_trigger": "mouse_right", "track_rec_key": 88 }"#,
+        )
+        .expect("残留的旧字段必须被忽略而不是报错");
+        assert!(
+            stale.track_rec_enabled && stale.track_rec_key == 88,
+            "旧文件里其余字段仍要正常读入"
+        );
+    }
+
+    /// **T3(B21-2/G-b):`swallow_bound_keys` 的往返 + 缺省 + 老配置兼容**。
+    ///
+    /// 三件事都必须成立(§5 配置字段新增证据矩阵):
+    /// ① 缺省 = false(独占模式默认关,与从前逐位一致);
+    /// ② 写 true 存盘再读回 = true(用户勾了重启还在);
+    /// ③ 老 JSON(**没有**该字段)解析不报错且 = false —— 升级程序不许让
+    ///    吞键突然生效,也不许整份设置回默认。
+    #[test]
+    fn swallow_bound_keys_roundtrips_and_legacy_json_defaults_off() {
+        // ① 缺省
+        assert!(
+            !Settings::default().swallow_bound_keys,
+            "独占模式必须默认关"
+        );
+        // ② 往返
+        let s = Settings {
+            swallow_bound_keys: true,
+            ..Settings::default()
+        };
+        let text = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&text).unwrap();
+        assert!(back.swallow_bound_keys, "勾选状态必须能存回来");
+        assert_eq!(back, s, "除该字段外不该有字段被改动");
+        // ③ 老 JSON(无该字段):不报错、= false
+        let old: Settings =
+            serde_json::from_str(r#"{ "scrcpy_path": "/usr/bin/scrcpy" }"#).unwrap();
+        assert!(
+            !old.swallow_bound_keys,
+            "老配置必须缺省为**关**(升级不该让吞键突然生效)"
+        );
+        assert_eq!(old.scrcpy_path, "/usr/bin/scrcpy", "其余字段照常读入");
+        // ③' 上一代真实字段集(track_rec 时代)也必须过
+        let recent: Settings = serde_json::from_str(
+            r#"{ "remember_paths": true, "track_rec_enabled": true, "track_rec_key": 88, "saved_at": 1760000000 }"#,
+        )
+        .expect("上一代配置必须能读入");
+        assert!(!recent.swallow_bound_keys, "上一代配置缺省为关");
+        assert!(recent.track_rec_enabled && recent.track_rec_key == 88);
+    }
+
+    /// **`grab_enabled` 的往返 + 缺省 + 老配置兼容**(2026-10-21 第 6 类欠账:
+    /// Linux 唯一的结构性优势开关曾经**根本不落盘**,每���启动重置为关)。
+    ///
+    /// 三件事(§5 配置字段新增证据矩阵):
+    /// ① 缺省 = false(与从前逐位一致:不勾就不独占);
+    /// ② 写 true 存盘再读回 = true —— **这一条是本次修复的核心**:
+    ///    以前这个状态只活在 `PadApp` 结构体里,`set()` 里没有它,
+    ///    于是"勾了 → 重启 → 悄悄变回关";
+    /// ③ 老 JSON(没有该字段)解析不报错且 = false。
+    #[test]
+    fn grab_enabled_roundtrips_and_legacy_json_defaults_off() {
+        // ① 缺省
+        assert!(
+            !Settings::default().grab_enabled,
+            "独占键盘必须默认关(不勾就不独占)"
+        );
+        // ② 往返:勾上之后必须能存回来(这正是以前丢掉的那一段)
+        let s = Settings {
+            grab_enabled: true,
+            ..Settings::default()
+        };
+        let text = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&text).unwrap();
+        assert!(
+            back.grab_enabled,
+            "grab 勾选状态必须能存回来 —— 丢了它等于用户每次启动都要重勾一次"
+        );
+        assert_eq!(back, s, "除该字段外不该有字段被改动");
+        // ③ 老 JSON(无该字段):不报错、= false
+        let old: Settings =
+            serde_json::from_str(r#"{ "scrcpy_path": "/usr/bin/scrcpy" }"#).unwrap();
+        assert!(
+            !old.grab_enabled,
+            "老配置必须缺省为**关**(升级不该让键盘突然被独占)"
+        );
+        assert_eq!(old.scrcpy_path, "/usr/bin/scrcpy", "其余字段照常读入");
+    }
+
+    /// **B21-3/G-c:`clip_cursor_in_aim` 的往返 + 缺省 + 老配置兼容**。
+    ///
+    /// 三件事(§5 配置字段新增证据矩阵):
+    /// ① 缺省 = **true**(新功能默认享受;注意与 `swallow_bound_keys` 默认 false 不同,
+    ///    这一条是用户口径下"FPS 体验的直接改善",不是有风险的独占行为);
+    /// ② 写 false 存盘再读回 = false(用户关掉后重启必须还是关);
+    /// ③ 老 JSON(**没有**该字段)解析不报错且 = true —— 升级不该让用户失去这个功能,
+    ///    也不许整份设置回默认。
+    #[test]
+    fn clip_cursor_in_aim_roundtrips_and_legacy_json_defaults_on() {
+        // ① 缺省:开(而且是与 serde 默认值**同一个**值)
+        assert!(
+            Settings::default().clip_cursor_in_aim,
+            "钉住光标必须默认开(与 default_clip_cursor 一致)"
+        );
+        assert!(
+            default_clip_cursor(),
+            "serde 默认值必须与 Default 实现一致,否则新装与老配置升级走两种行为"
+        );
+        // ② 往返:关掉后必须能存回来
+        let s = Settings {
+            clip_cursor_in_aim: false,
+            ..Settings::default()
+        };
+        let text = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&text).unwrap();
+        assert!(
+            !back.clip_cursor_in_aim,
+            "关掉的状态必须能存回来(否则用户每次重启都要重新关一遍)"
+        );
+        assert_eq!(back, s, "除该字段外不该有字段被改动");
+        // ③ 老 JSON(无该字段):不报错、= true(升级默认享受)
+        let old: Settings =
+            serde_json::from_str(r#"{ "scrcpy_path": "/usr/bin/scrcpy" }"#).unwrap();
+        assert!(
+            old.clip_cursor_in_aim,
+            "老配置必须缺省为**开**(升级后默认就有这个功能)"
+        );
+        assert_eq!(old.scrcpy_path, "/usr/bin/scrcpy", "其余字段照常读入");
+        // ③' 显式写了 false 的配置**不许**被默认值盖掉
+        let opted_out: Settings =
+            serde_json::from_str(r#"{ "clip_cursor_in_aim": false }"#).unwrap();
+        assert!(
+            !opted_out.clip_cursor_in_aim,
+            "显式的 false 被默认值盖掉了 —— 用户关不掉这个功能"
+        );
+    }
+
     /// W0-9:记住的配置文件路径必须能原样存取(重启后 app 靠它把配置读回来)
     #[test]
     fn profile_path_roundtrips_through_json() {
@@ -427,8 +737,22 @@ mod tests {
             scrcpy_args: "--stay-awake".into(),
             adb_command: "shell settings get global low_power".into(),
             selected_serial: " ABC123 ".into(),
+            grab_enabled: false,
             log_level: String::new(),
             profile_path: Some("/tmp/我的配置.yaml".into()),
+            macro_record_start_key: 0,
+            macro_record_start_key_enabled: false,
+            macro_record_stop_key: 0,
+            macro_record_stop_key_enabled: false,
+            macro_record_cancel_key: 0,
+            macro_record_cancel_key_enabled: false,
+            mouse_capture: crate::theme::MouseCaptureMode::default(),
+            mask_filter: default_mask_filter(),
+            track_rec_enabled: false,
+            track_rec_key: 0,
+            track_rec_stop_key: 0,
+            swallow_bound_keys: false,
+            clip_cursor_in_aim: default_clip_cursor(),
             saved_at: 0,
         };
         assert!(s.sanitize(), "存在死路径时 sanitize 应报告改动");

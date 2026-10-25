@@ -12,7 +12,10 @@
 //! - 消费 / 引擎线程:`AboveNormal` —— 它们计算量稍大(位移、对账、
 //!   签名),不抢到 `Highest`,避免反过来饿死游戏画面。
 //!
-//! 全部是"尽力而为":失败(平台不支持/权限不足)静默忽略,不影响功能。
+//! 全部是"尽力而为":失败不影响功能。但**失败必须可见**(2026-10-22):
+//! 以前两个平台都是 `let _ =` 静默吞掉,用户和排查者都以为"优先级已经提上去了",
+//! 而满载时输入线程仍被游戏线程拖后几十毫秒 —— 这种"以为修好了"比没修更糟。
+//! Linux 侧 2026-10-21 先改,WARN 里带补救命令;Windows 侧 2026-10-22 对齐。
 //! 进程退出时线程优先级随线程消失,无需恢复。
 
 #[derive(Clone, Copy)]
@@ -28,26 +31,55 @@ pub fn boost(class: Class) {
     use windows_sys::Win32::System::Threading::{
         GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_HIGHEST,
     };
-    let priority = match class {
-        Class::Highest => THREAD_PRIORITY_HIGHEST,
-        Class::AboveNormal => THREAD_PRIORITY_ABOVE_NORMAL,
+    let (priority, label) = match class {
+        Class::Highest => (THREAD_PRIORITY_HIGHEST, "Highest"),
+        Class::AboveNormal => (THREAD_PRIORITY_ABOVE_NORMAL, "AboveNormal"),
     };
-    unsafe {
-        // 返回值仅表示成功与否;失败(如被作业对象限制)不致命,忽略即可。
-        let _ = SetThreadPriority(GetCurrentThread(), priority);
+    // 失败必须**可见**,与 Linux 分支同一口径(2026-10-22)。
+    // 常见原因:本进程被放进带 CPU 速率限制的作业对象(某些启动器/沙箱会这么做),
+    // 或系统策略禁止改线程优先级。这类环境通常没有配置项可绕,只能如实告诉用户。
+    let ok = unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+    if ok == 0 {
+        let err = std::io::Error::last_os_error();
+        crate::diag_warn!(
+            "priority",
+            "提高线程优先级失败({label}): {err}。\
+             满载时输入线程仍可能被游戏线程拖后几十毫秒。\
+             常见原因:本进程被放进带 CPU 速率限制的作业对象(如某些启动器/沙箱),\
+             或系统策略禁止修改线程优先级;这类环境通常没有配置项可绕。"
+        );
     }
 }
 
 #[cfg(target_os = "linux")]
 pub fn boost(class: Class) {
-    // Linux:尽力而为地降低 nice 值。普通用户没有 CAP_SYS_NICE 时内核会拒绝
-    // (EPERM),静默忽略;有权限(如打了 setcap)时则生效。
+    // Linux:降低 nice 值。`setpriority(PRIO_PROCESS, 0, …)` 作用于**调用线程**
+    // (Linux 的 nice 是 per-thread 的,`PRIO_PROCESS` 在 Linux 上就是 `who=0`
+    //  指当前线程 —— 这一点与 POSIX 的"进程"语义不同,别被名字骗了)。
+    //
+    // 权限:需要 CAP_SYS_NICE,或 `RLIMIT_NICE` 允许该深度。现代桌面会话管理器
+    // 通常给一个宽松的 RLIMIT_NICE(实测本机 shell 的 nice 直接是 -8),所以
+    // 常见情况下**这条是生效的** —— 2026-10-19 那份文档里"很可能完全无效"
+    // 的说法是推断而不是观测,2026-10-21 在真机上用 `ps -Lo ni` 量到
+    // 读线程 nice=-5、引擎线程 nice=-2,与代码一致,故已纠正。
+    //
+    // 失败必须**可见**(2026-10-21 第 6 条):以前是 `let _ =`,EPERM 被吞掉,
+    // 用户和排查者都以为"优先级已经提上去了"。现在失败落一条 WARN,
+    // 并给出可执行的补救办法。
     let nice = match class {
         Class::Highest => -5,
         Class::AboveNormal => -2,
     };
-    unsafe {
-        let _ = libc::setpriority(libc::PRIO_PROCESS, 0, nice);
+    let r = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
+    if r != 0 {
+        let err = std::io::Error::last_os_error();
+        crate::diag_warn!(
+            "priority",
+            "提高线程优先级失败(nice={nice}): {err}。\
+             满载时输入线程仍可能被游戏线程拖后几十毫秒。\
+             补救:sudo setcap cap_sys_nice+ep <二进制>(重编译后需重做),\
+             或在 systemd user unit 里设 LimitNICE=10"
+        );
     }
 }
 

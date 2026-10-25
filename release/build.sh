@@ -69,14 +69,28 @@ elif id -nG "$USER" | grep -qw input; then
     exec sg input -c "$PWD/scrcpy-pad"
 else
     echo "=================================================="
-    echo " 缺少输入设备读取权限,请先执行一次:"
-    echo "   sudo usermod -aG input $USER"
-    echo " 然后【注销重新登录】(或重启),再运行本脚本"
+    echo " 缺少输入设备读取权限。两种解法,推荐第一种:"
+    echo ""
+    echo " ① 一次安装 udev 规则(不用注销重登,只对当前活动会话授权):"
+    echo "      sudo install -m 0644 60-scrcpy-pad.rules /etc/udev/rules.d/"
+    echo "      sudo udevadm control --reload-rules"
+    echo "      sudo udevadm trigger --subsystem-match=input"
+    echo "    然后重新运行本脚本。"
+    echo ""
+    echo " ② 传统做法(需要注销重新登录):"
+    echo "      sudo usermod -aG input $USER"
     echo "=================================================="
     exit 1
 fi
 LAUNCHER
     chmod +x "$1/启动.sh"
+    # 第 16 条:把 udev 规则一并放进发布包 —— 规则不在包里,用户就找不到,
+    # 等于没写(启动器打印的安装命令指向包内这个文件)。
+    if [ -f "$ROOT/release/60-scrcpy-pad.rules" ]; then
+        cp -f "$ROOT/release/60-scrcpy-pad.rules" "$1/60-scrcpy-pad.rules"
+    else
+        warn "未找到 release/60-scrcpy-pad.rules(udev 规则):发布包不含一次性授权方案"
+    fi
 }
 
 build_linux() {
