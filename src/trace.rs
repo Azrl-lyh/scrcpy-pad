@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::control::{ACTION_DOWN, ACTION_MOVE, ACTION_UP, ControlCmd};
 
@@ -231,6 +231,93 @@ fn now_ms() -> u128 {
     SINK.get()
         .map(|s| s.start.elapsed().as_millis())
         .unwrap_or(0)
+}
+
+/// 墙钟毫秒(Unix 纪元起)。diag 记录里带它,是为了能和 diagnostics.log 的
+/// 时间戳逐行对表 —— 相对毫秒 t 只能排序,回答不了"这一行和日志里那条隔多久"。
+fn wall_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// 诊断日志镜像开关(`--trace-diag`)。
+///
+/// **语义选择:自动开启轨迹**(而不是"轨迹没开就忽略")。理由:这个参数的全部
+/// 用途就是"我要把诊断行并进轨迹";若轨迹没开就静默忽略,参数会无声失效 ——
+/// 用户以为拿到了合并现场,实际只有日志。而轨迹本来就默认开启(见
+/// [`init_from_args`]),所以"自动开启"不引入任何新的默认行为,它只在轨迹因
+/// 权限/只读等原因没能打开时补一次尝试([`ensure_enabled`])。
+static DIAG_MIRROR: AtomicBool = AtomicBool::new(false);
+
+/// 打开/关闭诊断镜像(由 `main` 解析 `--trace-diag` 后调用)。
+pub fn set_diag_mirror(on: bool) {
+    DIAG_MIRROR.store(on, Ordering::Relaxed);
+}
+
+/// 镜像此刻是否真的会写(轨迹没开时返回 false:没有落点,写也是空转)。
+pub fn diag_mirror_enabled() -> bool {
+    DIAG_MIRROR.load(Ordering::Relaxed) && enabled()
+}
+
+/// 轨迹还没打开时,按默认路径再试一次。
+///
+/// `--trace-diag` 用它兑现"自动开启"的语义:参数已经明确要求了合并现场,
+/// 就不该因为一次 open 失败而静默变成"只有日志"。
+pub fn ensure_enabled() {
+    if enabled() {
+        return;
+    }
+    let path = default_path();
+    open_reporting(&path);
+}
+
+/// 把一行诊断日志写进轨迹(`kind = "diag"`)。
+///
+/// 字段:级别、目标(模块名)、文本,以及两个时刻 —— `t` 是轨迹内部的相对毫秒
+/// (与其它记录同一基准,便于排序),`at` 是 Unix 毫秒(便于和 diagnostics.log
+/// 的墙钟时间对表)。
+///
+/// `k` 刻意不取 "in"/"out":[`read`] 只认那两种,于是旧读者(回放、摘要)
+/// 遇到 diag 行会**原样跳过**,一行代码都不用改 —— 这就是"不破坏既有读取方向"。
+pub fn diag(level: &str, tag: &str, text: &str) {
+    if !diag_mirror_enabled() {
+        return;
+    }
+    write_line(diag_line(now_ms(), wall_ms(), level, tag, text));
+}
+
+/// 拼一条 diag 记录。**纯函数**:单测直接喂假值,不必开真文件
+/// (真文件要靠全局 SINK,而它在同一进程里只能被初始化一次)。
+fn diag_line(t: u128, at: u128, level: &str, tag: &str, text: &str) -> String {
+    format!(
+        r#"{{"t":{t},"k":"diag","e":"diag","lv":"{}","tag":"{}","at":{at},"text":"{}"}}"#,
+        esc(level),
+        esc(tag),
+        esc(text)
+    )
+}
+
+/// JSON 字符串转义(只处理会破坏"单行 JSON"的字符)。
+///
+/// 诊断文本里出现引号、反斜杠、换行都很正常(设备名、错误原文、多行提示)。
+/// 不转义就会写出一条无法解析的行;轨迹是**逐行**解析的,坏一行只丢一行 ——
+/// 但丢掉的恰好是 diag 镜像最想保留的那一行。
+fn esc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// 捕获层的一个按键事件(键盘与鼠标键同码空间)。
@@ -802,5 +889,89 @@ mod tests {
             aim_state_due(9000, 1000),
             "now < last 时应视作到期,不能卡死不再写"
         );
+    }
+}
+
+/// `--trace-diag` 的纯函数部分(格式 + 旧读者兼容)。
+///
+/// 独立成一个 mod:这里**不碰**全局 SINK/ON(同一进程只能初始化一次),
+/// 只测拼行与解析,所以不会和既有轨迹测试互相干扰。
+#[cfg(test)]
+mod diag_mirror_tests {
+    use super::{Rec, diag_line, esc, read};
+
+    /// 守护 `diag_line` 的 json 模板 + `esc` 的转义:
+    /// 诊断文本里的引号/反斜杠/换行必须被转义,否则整行无法解析 ——
+    /// 而逐行读取时,坏掉的恰好是 diag 镜像最想保住的那一行。
+    #[test]
+    fn diag_line_is_valid_json_and_escapes_text() {
+        let text = "说 \"你好\" \\ 然后换行\n第二行\t制表";
+        let line = diag_line(42, 1_700_000_000_123, "warn", "capture", text);
+        // 必须是**单行**:文本里的换行被转义掉了
+        assert!(!line.contains('\n'), "diag 行里不许有裸换行:{line}");
+        let v: serde_json::Value = serde_json::from_str(&line).expect("diag 行必须是合法 JSON");
+        assert_eq!(v.get("k").and_then(|x| x.as_str()), Some("diag"));
+        assert_eq!(v.get("e").and_then(|x| x.as_str()), Some("diag"));
+        assert_eq!(v.get("lv").and_then(|x| x.as_str()), Some("warn"));
+        assert_eq!(v.get("tag").and_then(|x| x.as_str()), Some("capture"));
+        assert_eq!(v.get("t").and_then(|x| x.as_u64()), Some(42));
+        assert_eq!(
+            v.get("at").and_then(|x| x.as_u64()),
+            Some(1_700_000_000_123),
+            "at 是墙钟毫秒,解析器必须能原样取回"
+        );
+        assert_eq!(
+            v.get("text").and_then(|x| x.as_str()),
+            Some(text),
+            "转义必须可逆:读回来要和原文逐字相同"
+        );
+        // 阴性对照:控制字符不转义会让 JSON 非法
+        assert_eq!(esc("\u{1}"), "\\u0001", "控制字符也必须转义");
+        assert_eq!(esc("a\"b"), "a\\\"b");
+    }
+
+    /// 守护"不破坏既有读取方向":diag 行进轨迹后,旧读者(`read`)必须原样跳过它,
+    /// 其余记录的条数与内容一个字都不变。
+    ///
+    /// 变异验证用:把 `diag_line` 里的 "k" 改成 "in"、"e" 改成 "btn",
+    /// 这条测试会红在"只剩 2 条"这一行。
+    #[test]
+    fn diag_records_are_invisible_to_the_existing_reader() {
+        let dir = std::env::temp_dir().join(format!("spl-diagmirror-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("t.jsonl");
+        let body = [
+            r#"{"t":1,"k":"in","e":"btn","code":30,"down":true}"#.to_string(),
+            diag_line(2, 1_700_000_000_123, "warn", "capture", "测试文本"),
+            r#"{"t":3,"k":"in","e":"btn","code":30,"down":false}"#.to_string(),
+        ]
+        .join("\n");
+        std::fs::write(&path, body).expect("写临时轨迹失败");
+        let recs = read(&path).expect("读轨迹失败");
+        assert_eq!(recs.len(), 2, "diag 行必须被旧读者跳过,只留两条按键记录");
+        assert!(
+            matches!(
+                recs[0],
+                Rec::Button {
+                    code: 30,
+                    down: true,
+                    ..
+                }
+            ),
+            "第一条按键记录必须原样读出"
+        );
+        assert!(
+            matches!(
+                recs[1],
+                Rec::Button {
+                    code: 30,
+                    down: false,
+                    ..
+                }
+            ),
+            "第二条按键记录必须原样读出"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

@@ -29,6 +29,7 @@ use std::fmt::Display;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -80,6 +81,19 @@ impl Level {
 pub const FILE_NAME: &str = "diagnostics.log";
 /// 控制级别的环境变量名(优先级高于 settings.json)
 pub const ENV_LEVEL: &str = "SCRCPY_PAD_LOG";
+/// 命令行 `--log-level` 定下级别之后的"来源"文案。
+///
+/// 它同时是一块**禁区标记**:级别来源等于它时,别的来源(settings.json 的
+/// log_level、环境变量)一律不许再改级别 —— 用户在同一条命令里写了参数,
+/// 就是要**这一次**生效(命令行 > 环境变量 > 配置文件)。
+pub const CLI_LEVEL_SOURCE: &str = "命令行 --log-level";
+/// 命令行显式指定的级别(由 `main` 在 [`init`] **之前**调用 [`set_cli_level`] 设置)。
+///
+/// 用 `OnceLock` 而不是普通原子整数:级别是枚举,放这里能保住类型,读的时候
+/// 不必每次做数值转换;而"命令行最多定一次"正好是 OnceLock 的语义。
+static CLI_LEVEL: OnceLock<Level> = OnceLock::new();
+/// 命令行是否已经定过级别(定过之后 [`set_level`] 拒绝来路不同的覆盖)。
+static CLI_PINNED: AtomicBool = AtomicBool::new(false);
 /// 正常退出的标记行。下次启动会检查上一次是否以它结尾 ——
 /// 没有它就意味着上次是崩溃/被强杀,这本身就是一个重要线索。
 const EXIT_MARKER: &str = "===== 正常退出 =====";
@@ -146,12 +160,52 @@ fn lock() -> std::sync::MutexGuard<'static, Diag> {
     state().lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 初始级别:环境变量优先,否则内置默认 `info`
-fn initial_level() -> (Level, &'static str) {
-    match std::env::var(ENV_LEVEL).ok().and_then(|v| Level::parse(&v)) {
-        Some(l) => (l, "环境变量 SCRCPY_PAD_LOG"),
-        None => (Level::Info, "内置默认"),
+/// 级别裁决(纯函数,便于单测):命令行 > 环境变量 > settings.json > 内置默认。
+///
+/// 为什么必须按这个顺序:用户在同一条命令里写了 --log-level,就是要**这一次**
+/// 生效;而 settings.json 是持久化产物,GUI 启动后必然拿它调一次
+/// [`set_level_from_str`](见 PadApp 的启动流程)。若不把命令行放在最前面,
+/// 一次普通启动就能把它静默冲掉 —— 用户看到的是"我加的参数好像没起作用"。
+fn pick_level(
+    cli: Option<Level>,
+    env: Option<&str>,
+    settings: Option<&str>,
+) -> (Level, &'static str) {
+    if let Some(l) = cli {
+        return (l, CLI_LEVEL_SOURCE);
     }
+    if let Some(l) = env.and_then(Level::parse) {
+        return (l, "环境变量 SCRCPY_PAD_LOG");
+    }
+    if let Some(l) = settings.and_then(Level::parse) {
+        return (l, "settings.json");
+    }
+    (Level::Info, "内置默认")
+}
+
+/// 初始级别:命令行 > 环境变量 > 内置默认。
+///
+/// settings.json 不参与这一步 —— 它在启动之后才被读到(GUI 侧),
+/// 那时走的是 [`set_level_from_str`],而它会尊重命令行钉住的级别。
+fn initial_level() -> (Level, &'static str) {
+    pick_level(cli_level(), std::env::var(ENV_LEVEL).ok().as_deref(), None)
+}
+
+/// 记下命令行给的级别。**必须在 [`init`] 之前调用**。
+///
+/// 位置有讲究:日志头部第 3 行写的是"级别 X (来源)",用户正是靠这一行确认
+/// "我加的 --log-level 生效没有";晚于 init 调用的话头部展示的还是旧级别,
+/// 自证链条就断了。
+pub fn set_cli_level(level: Level) {
+    // 顺序:先钉住,再写值。两个线程同时进来时最终值一致,不会出现
+    // "钉住了但值是空的"这种中间态被 initial_level 读到。
+    CLI_PINNED.store(true, Ordering::Relaxed);
+    let _ = CLI_LEVEL.set(level);
+}
+
+/// 命令行给的级别(没给则为 None)
+pub fn cli_level() -> Option<Level> {
+    CLI_LEVEL.get().copied()
 }
 
 /// 打开(截断)日志文件,**父目录不存在时先建**。
@@ -300,6 +354,20 @@ pub fn level_source() -> String {
 
 /// 运行期改级别(settings.json 的 log_level 会在启动后调用它)
 pub fn set_level(level: Level, source: &str) {
+    // 命令行优先:写了 --log-level 之后,其他来源一律不许改级别。
+    // 但**留一条 DEBUG 记录**(而不是完全无声):用户若在设置页里改了
+    // log_level 却看不到日志变化,这行就是答案 —— 命令行钉住了它。
+    if !should_apply(source, CLI_PINNED.load(Ordering::Relaxed)) {
+        log(
+            Level::Debug,
+            "diag",
+            format_args!(
+                "忽略来自 {source} 的日志级别 {}(命令行 --log-level 优先)",
+                level.name()
+            ),
+        );
+        return;
+    }
     {
         let mut st = lock();
         st.level = level;
@@ -330,6 +398,15 @@ pub fn path() -> PathBuf {
     lock().path.clone()
 }
 
+/// 这次改级别该不该生效(纯函数,便于单测)。
+///
+/// 规则只有一条:命令行钉住之后,只有"命令行"这个来源还能改级别。
+/// 抽成纯函数是为了能直接喂 "pinned=true + 各种 source" 的组合,
+/// 不必真的去动进程级全局(那会和并行跑的其它 diag 测试互踩)。
+fn should_apply(source: &str, pinned: bool) -> bool {
+    !pinned || source == CLI_LEVEL_SOURCE
+}
+
 /// 记一行(受级别过滤)。`tag` 是模块名,便于 `grep '\[capture\]'` 这类过滤。
 pub fn log(level: Level, tag: &str, msg: impl Display) {
     if !enabled(level) {
@@ -345,7 +422,7 @@ pub fn log(level: Level, tag: &str, msg: impl Display) {
     if level <= Level::Warn || file_broken {
         eprintln!("{line}");
     }
-    write_raw(&line);
+    write_raw_meta(&line, Some(level), tag);
     if level <= Level::Warn {
         flush();
     }
@@ -359,6 +436,23 @@ pub fn log(level: Level, tag: &str, msg: impl Display) {
 /// 或者用户只是没碰键盘),缓冲区里的尾巴就会一直留着,进程被强杀时直接丢光。
 /// 定时线程与主线程是否忙无关,能把"崩溃时最多丢多久"稳定限制在 500ms 以内。
 fn write_raw(line: &str) {
+    write_raw_meta(line, None, "");
+}
+
+/// [`write_raw`] 的带元信息版本:额外带上"级别 + 模块",供 --trace-diag 镜像进轨迹。
+///
+/// 为什么不从格式化后的行文本里反解级别:行里的 [WARN ] 只是 5 字符定宽的
+/// 展示形式,反解既脆弱,又会把"行首恰好长得像级别"的普通内容误认。
+/// 把元信息一路传下来,成本只是一次函数调用。
+fn write_raw_meta(line: &str, level: Option<Level>, tag: &str) {
+    // 镜像点必须在一切早退**之前**,两条理由:
+    //  1. 日志文件写不进去时(目录只读 / 句柄失效 / 本进程已 shutdown),
+    //     诊断内容仍然要进轨迹 —— 那正是最需要现场的时刻;
+    //  2. 轨迹与日志是两条独立汇流:开了 --trace-diag,即使日志只落到 stderr,
+    //     轨迹里也照样应该有这些行。
+    if crate::trace::diag_mirror_enabled() {
+        crate::trace::diag(level.map(|l| l.name()).unwrap_or("-"), tag, line);
+    }
     // 先落盘,成功后才推入界面缓冲(缓冲语义 = "真正写进文件的那一行")。
     // 两块状态用两把锁,且顺序固定为 Diag → RECENT(反向不存在),
     // 所以不会死锁;作用域分开只是为了不在持 Diag 锁时再做别的加锁。
@@ -759,6 +853,18 @@ fn fmt_time_ms() -> String {
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}.{ms:03}")
 }
 
+/// 当前本地时间,精确到毫秒。
+///
+/// 给**人读的**日志文本用(例如"放弃某设备时是几点"):日志行本身已经有时间戳,
+/// 但一句话里同时给出"哪台设备、哪些键、什么时刻",用户才方便把消息记录对回
+/// 自己当时在做什么 —— 用户能贴过来的往往只有日志片段,贴不了时间轴。
+// 目前只有 Linux 捕获层用(设备消失的 WARN);Windows 构建里它是空闲的,
+// 但函数本身不该因此被删 —— 那些 WARN 只在 Linux 才存在。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn clock_now() -> String {
+    fmt_time_ms()
+}
+
 /// epoch 秒 -> 本地时间各分量 (年,月,日,时,分,秒,毫秒)
 #[cfg(unix)]
 fn local_parts(secs: u64) -> (i64, i64, i64, i64, i64, i64, u32) {
@@ -886,6 +992,69 @@ mod tests {
         assert_eq!(Level::parse("trace"), Some(Level::Trace));
         assert_eq!(Level::parse(""), None);
         assert_eq!(Level::parse("verbose!"), None);
+    }
+
+    /// 守护 `initial_level` 的那一行 `pick_level(cli_level(), 环境变量, None)`
+    /// 以及 `set_level` 开头的 `should_apply(...)` 判断:
+    /// 级别顺序必须是 **命令行 > 环境变量 > settings.json > 内置默认**。
+    ///
+    /// 阳性对照:命令行给了值时必须压过环境变量与配置;
+    /// 阴性对照:命令行没给时,环境变量必须压过配置,两者都没给才落到内置默认。
+    /// 任何把顺序写反、或把"命令行"当成"最后一个才看"的改动都会让这里的断言红。
+    #[test]
+    fn level_priority_is_cli_then_env_then_settings() {
+        // 命令行给了:其余两个来源再详细也不许翻盘
+        assert_eq!(
+            pick_level(Some(Level::Warn), Some("trace"), Some("debug")),
+            (Level::Warn, CLI_LEVEL_SOURCE)
+        );
+        // 命令行没给:环境变量 > 配置
+        assert_eq!(
+            pick_level(None, Some("trace"), Some("debug")),
+            (Level::Trace, "环境变量 SCRCPY_PAD_LOG")
+        );
+        // 只有配置
+        assert_eq!(
+            pick_level(None, None, Some("debug")),
+            (Level::Debug, "settings.json")
+        );
+        // 什么都没有:内置默认 info
+        assert_eq!(pick_level(None, None, None), (Level::Info, "内置默认"));
+        // 非法值当没写:环境变量写错了不该把配置一起拖下水
+        assert_eq!(
+            pick_level(None, Some("verbo se"), Some("warn")),
+            (Level::Warn, "settings.json")
+        );
+        assert_eq!(
+            pick_level(None, Some("nope"), None),
+            (Level::Info, "内置默认")
+        );
+    }
+
+    /// 守护 `set_level` 里那句 `if !should_apply(source, CLI_PINNED.load(...))`:
+    /// 命令行钉住级别之后,settings.json / 环境变量都不许再覆盖它。
+    ///
+    /// 阳性对照:没钉住时任何来源都能改(否则运行期设级别就失效了);
+    /// 阴性对照:钉住之后非命令行来源必须被拒,而命令行来源自己仍可再改。
+    #[test]
+    fn cli_level_pin_rejects_other_sources() {
+        assert!(
+            should_apply("settings.json", false),
+            "未钉住时必须允许配置改级别"
+        );
+        assert!(should_apply("环境变量 SCRCPY_PAD_LOG", false));
+        assert!(
+            should_apply(CLI_LEVEL_SOURCE, true),
+            "命令行来源本身不受自己的钉子限制"
+        );
+        assert!(
+            !should_apply("settings.json", true),
+            "命令行钉住之后 settings.json 不许覆盖"
+        );
+        assert!(
+            !should_apply("环境变量 SCRCPY_PAD_LOG", true),
+            "命令行钉住之后环境变量不许覆盖"
+        );
     }
 
     /// **测试串行锁**(2026-10-13):`diag` 的 sink / path 是**进程级全局**,

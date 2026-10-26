@@ -415,6 +415,24 @@ Linux 发布包必须以 **Ubuntu 20.04 / glibc 2.31 基线**构建，才能兼�
 | Linux (Wayland/X11) | evdev | 支持（界面显示该选项） | xdg-portal | 已实测 |
 | Windows | 自建低级钩子(WH_KEYBOARD_LL / WH_MOUSE_LL) | 不适用（界面隐藏，走钩子链路） | Win32 原生 | 已原生运行验证(钩子安装、输入、退出) |
 
+### 8.1 Linux 上做不到的几项（如实说明）
+
+| 功能 | Windows | Linux | 为什么 |
+|---|---|---|---|
+| 遮板（蒙版） | 透明置顶窗贴在投屏区域上，鼠标事件落在它身上 | **不支持**，选它自动退回「隔膜」 | 遮板要在别的进程的窗口上方开自己的窗口：Wayland 不允许客户端定位/覆盖他人的 surface（GNOME 不实现 wlr-layer-shell）；X11 需 override-redirect 窗口 + 定位投屏窗，本轮未做 |
+| 鼠标独占（隔膜） | 钩子层吞鼠标消息 | **不支持** | Linux 没有系统级鼠标钩子；`EVIOCGRAB` 独占的是输入设备（会连键盘一起独占），不是同一件事 |
+| 指针消隐 | `ShowCursor`，全系统生效 | **只在本程序自己的窗口内生效** | 只能对本进程窗口设 `CursorIcon::None`；光标到 scrcpy 窗口上由那个窗口重新绘制，进程外无法干预 |
+| 钉住光标 | `ClipCursor` 把光标钉在 1 像素矩形里 | **不支持** | Wayland 无全局指针夹取原语；X11 的 XGrabPointer 一类本轮未做 |
+
+强制走 XWayland 再试（只是启动方式，不改变上表结论）：
+
+```bash
+env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET ./scrcpy-pad
+SDL_VIDEODRIVER=x11 scrcpy --stay-awake
+```
+
+启动项写法：`Exec=env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET /path/to/scrcpy-pad`。
+
 ## 9. 更新日志
 
 ### 2026-10-10（v0.2.0：取消按键捕获修正 / 按后延迟（可选） / 截图缩放与滚动 / 称谓统一）

@@ -108,6 +108,25 @@ pub struct Settings {
     /// 用位标志存(`u8`),加一项不会破坏老配置兼容性。
     #[serde(default = "default_mask_filter")]
     pub mask_filter: u8,
+    /// **背景图路径**(空 = 不启用)。用户 2026-10-26 第 1 条。
+    ///
+    /// **为什么放在 settings.json 而不是 `Look`(外观)里** —— 与上面 `mouse_capture` 那个
+    /// P22 事故**完全同型**:外观是**每套按键组合各存一份**的(`profile.yaml` 里每套
+    /// scheme 都有自己的 `look`),启动时还会被全局 `look.json` 覆盖。
+    /// 用户实测症状:「**只有第一个组合继承默认设置的图片,否则导入后连图片都会
+    /// 变成虚无缥缈的东西**……换键位为啥要换图片呢?」—— 背景图是**这台机器的
+    /// 界面偏好**,不是键位方案的一部分,换一套配置(哪怕是对面发来的 YAML)也不该动它。
+    ///
+    /// 老版本把这三项存在每套 `look` 里;升级时的迁移见 [`pick_bg`]:
+    /// 当前那张图若已不存在(路径为假),就按配置文件的顺序找**第一张能显示的**。
+    #[serde(default)]
+    pub bg_path: String,
+    /// 背景图填充方式(铺满裁切 / 完整显示 / 平铺)
+    #[serde(default)]
+    pub bg_fit: crate::theme::BgFit,
+    /// 背景图上的暗化遮罩不透明度(0=不遮,保证可读性的兜底)
+    #[serde(default = "default_bg_dim")]
+    pub bg_dim: u8,
     /// **轨迹录制的总开关**(用户 2026-10-14):未勾选时快捷键**不触发**录制
     /// (卡片上的按钮仍可用)。默认关 = 与从前逐位一致。
     #[serde(default)]
@@ -196,6 +215,34 @@ fn default_clip_cursor() -> bool {
     true
 }
 
+/// serde 默认值函数:背景图压暗缺省 120/255。老版 `theme::Look` 里的
+/// `default_bg_dim` 是同一个数 —— 迁移前后观感一致(背景图清晰可见,文字仍可读)。
+fn default_bg_dim() -> u8 {
+    120
+}
+
+/// 从候选背景图里选出"该显示的那一张"(用户 2026-10-26 第 1 条的迁移规则)。
+///
+/// 用户原话:「如果当前图片位置为假的,那么就自动在配置文件里找第一个图片路径
+/// 为显示的图片。」按优先级:
+/// 1. 候选中**文件真的存在**的第一张 —— 这才是"能显示";
+/// 2. 都不存在时取第一个**非空路径** —— 保住用户的记忆(界面仍显示文件名,
+///    可以[更换]/[清除]),不要静默退成"从没设过背景图";
+/// 3. 全空 ⇒ `None`(与旧版逐位一致:不画背景)。
+///
+/// 纯函数,`exists` 由调用方注入(生产传真实文件系统,测试传闭包),
+/// 于是迁移规则可以脱离磁盘单测(AGENTS §3.1 变异可验)。
+pub fn pick_bg(
+    candidates: &[(String, crate::theme::BgFit, u8)],
+    exists: impl Fn(&str) -> bool,
+) -> Option<(String, crate::theme::BgFit, u8)> {
+    candidates
+        .iter()
+        .find(|(p, _, _)| !p.trim().is_empty() && exists(p))
+        .or_else(|| candidates.iter().find(|(p, _, _)| !p.trim().is_empty()))
+        .cloned()
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -217,6 +264,9 @@ impl Default for Settings {
             macro_record_cancel_key_enabled: false,
             mouse_capture: crate::theme::MouseCaptureMode::default(),
             mask_filter: default_mask_filter(),
+            bg_path: String::new(),
+            bg_fit: crate::theme::BgFit::default(),
+            bg_dim: default_bg_dim(),
             track_rec_enabled: false,
             track_rec_key: 0,
             track_rec_stop_key: 0,
@@ -717,6 +767,64 @@ mod tests {
         assert_eq!(back.profile_path, s.profile_path);
         assert_eq!(back, s, "除 profile_path 外也不该有字段被改动");
     }
+    /// 背景图三件套搬到程序级设置(2026-10-26 第 1 条)的往返 + 老文件兼容。
+    ///
+    /// 老 settings.json 里根本没有这三个键:必须落到 (空 / 铺满 / 压暗 120),
+    /// 而不是解析失败 —— 失败会让**整份设置**回退默认(§5「配置字段新增」)。
+    #[test]
+    fn background_roundtrips_and_legacy_json_defaults() {
+        let s = Settings {
+            bg_path: r"D:\图片\背景.png".into(),
+            bg_fit: crate::theme::BgFit::Tile,
+            bg_dim: 42,
+            ..Settings::default()
+        };
+        let text = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, s, "背景图三件套必须原样往返");
+        let legacy: Settings =
+            serde_json::from_str(r#"{ "scrcpy_path": "/usr/bin/scrcpy" }"#).unwrap();
+        assert_eq!(legacy.bg_path, "", "老文件没有背景图字段 -> 空");
+        assert_eq!(legacy.bg_fit, crate::theme::BgFit::Cover, "缺省铺满(裁切)");
+        assert_eq!(legacy.bg_dim, 120, "缺省压暗值与老 Look 一致");
+    }
+
+    /// 背景图迁移的判定核(调用方见 app::migrate_background):
+    ///  ① 先挑**文件真的存在**的(顺序即优先级)
+    ///  ② 都不存在时保住第一个非空的(别把用户填过的路径丢掉)
+    ///  ③ 全空才是空(不许伪造一个路径出来)
+    #[test]
+    fn pick_bg_prefers_existing_then_first_nonempty() {
+        use crate::theme::BgFit;
+        let t = |p: &str, fit: BgFit, dim: u8| (p.to_string(), fit, dim);
+        // ① 第一个路径是假的,第二个是真的 => 选第二个
+        let c = vec![
+            t("/x/a.png", BgFit::Cover, 1),
+            t("/x/b.png", BgFit::Contain, 2),
+        ];
+        assert_eq!(
+            pick_bg(&c, |p| p == "/x/b.png"),
+            Some(t("/x/b.png", BgFit::Contain, 2)),
+            "文件不存在的候选必须被跳过"
+        );
+        // ② 都不存在 => 第一个非空(纯空白不算)
+        let c = vec![
+            t("   ", BgFit::Cover, 1),
+            t("/x/b.png", BgFit::Cover, 2),
+            t("/x/c.png", BgFit::Cover, 3),
+        ];
+        assert_eq!(pick_bg(&c, |_| false), Some(t("/x/b.png", BgFit::Cover, 2)));
+        // ③ 全空 => None
+        let c = vec![t("", BgFit::Cover, 1), t("  ", BgFit::Cover, 2)];
+        assert_eq!(pick_bg(&c, |_| true), None, "全空时不该伪造一个路径");
+        assert_eq!(pick_bg(&[], |_| true), None);
+        // ④ 第一个就存在 => 直接用它(顺序就是优先级)
+        let c = vec![
+            t("/x/a.png", BgFit::Cover, 1),
+            t("/x/b.png", BgFit::Cover, 2),
+        ];
+        assert_eq!(pick_bg(&c, |_| true), Some(t("/x/a.png", BgFit::Cover, 1)));
+    }
 
     /// 死路径必须被清空 —— 留着它会让 [启动 scrcpy] 直接失败,
     /// 清空后才能走"同目录推导 + PATH"的自动逻辑。
@@ -748,6 +856,9 @@ mod tests {
             macro_record_cancel_key_enabled: false,
             mouse_capture: crate::theme::MouseCaptureMode::default(),
             mask_filter: default_mask_filter(),
+            bg_path: String::new(),
+            bg_fit: crate::theme::BgFit::default(),
+            bg_dim: default_bg_dim(),
             track_rec_enabled: false,
             track_rec_key: 0,
             track_rec_stop_key: 0,

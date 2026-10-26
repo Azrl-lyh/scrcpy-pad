@@ -5033,7 +5033,8 @@ mod tests {
         for w in &p.wheels {
             n += w.directions.capacity() * std::mem::size_of::<WheelDirection>();
         }
-        n += p.look.bg_path.capacity();
+        // 注:背景图三件套已搬到程序级 Settings(2026-10-26 第 1 条),
+        // 不再随 Profile 进撤销栈,这一项不用再算。
         n
     }
 
@@ -5074,7 +5075,6 @@ mod tests {
         empty.binds = Vec::new();
         empty.combos = Vec::new();
         empty.wheels = Vec::new();
-        empty.look.bg_path = String::new();
 
         // 阳性对照:精确 100 条 Tap
         let mut exact = empty.clone();

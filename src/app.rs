@@ -101,16 +101,6 @@ const SPACE_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// 上)。**变化时才写日志**,所以 1s 的节拍不会刷屏。
 const DEVICE_LEDGER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// 压枪"控制强度档位表"默认展开的上限档数(用户 2026-10-10 第 3 条:
-/// "挡位过多时,非添加模式自动折叠")。
-///
-/// 档位是这个面板里唯一会"越加越长"的列表,档位一多就把下面的[摇晃]/[覆盖灵敏度]
-/// 顶出屏幕。所以档数超过这个数时,档位表**第一次出现**就默认收起,只留一行标题;
-/// 用户点标题可展开/收起,点[＋ 添加一档]时强制展开(正在添加,不该藏)。
-/// 注意这是"默认值"而非"每当档数变多就强制收起":一旦用户自己点过标题,
-/// 之后就以用户的选择为准 —— 正在调档时列表自己收起来,才是真的难用。
-const RECOIL_TIER_COLLAPSE_AT: usize = 4;
-
 /// 自检面板里"当前触点数"开始变黄的门限(DF-7,2026-10-11)。
 ///
 /// 设备端十指池是 10(`crate::engine::DEVICE_MAX_POINTERS`),但**池满**才是
@@ -2034,7 +2024,10 @@ impl MacroInstructionKind {
 /// 而两者写入的位置完全不同(草稿在 `self.draft.swipe_points`,已有绑定在
 /// `Shared.profile`)。把目标做成状态的一部分,于是**同一套录制 UI 与同一套
 /// 状态机**服务于全部入口,不必每处各写一份。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Hash 是给折叠头做**稳定 id** 用的(用户 2026-10-26 第 4 条):录制卡片在
+/// 同一屏里可能有好几张,折叠状态必须按目标各记各的,不能用自动 id。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum TrackTarget {
     /// 新增草稿(像素坐标,写在 `App::draft` 里)
     Draft,
@@ -2542,6 +2535,14 @@ pub struct PadApp {
     bg_tex: Option<(String, egui::TextureHandle)>,
     /// 加载失败过的背景图路径(避免每帧重试并刷屏日志)
     bg_failed: Option<String>,
+    /// 背景图路径。**程序级**设置(settings.json):换"按键组合"不该换背景图,
+    /// 所以它不能放在跟着 scheme 走的 `theme::Look` 里(用户 2026-10-26 第 1 条;
+    /// 与 `mouse_capture` 搬走时同一个理由,见 settings.rs)。
+    bg_path: String,
+    /// 背景图填充方式(程序级设置,同上)
+    bg_fit: theme::BgFit,
+    /// 背景图压暗 0..=255(程序级设置,同上;0=完全不压暗)
+    bg_dim: u8,
     /// 诊断面板里缓存的日志尾部(点[刷新预览]或首次展开时读一次,不每帧读盘)
     diag_preview: String,
     /// 诊断面板的"显示日志末尾"是否展开
@@ -3110,11 +3111,17 @@ impl PadApp {
         let mut profile = doc.active_profile().cloned().unwrap_or_default();
         // 外观(配色/密度/背景图)另有一份"程序自用"的缓存,与键位配置同目录。
         // 有了它,即使没点过[保存配置],重启后外观也保持上次调好的样子。
-        let (cached_look, look_notes) = load_look_cache();
+        let (cached_look, legacy_look_bg, look_notes) = load_look_cache();
         startup_notes.extend(look_notes);
         if let Some(cached) = cached_look {
             profile.look = cached;
         }
+        // 背景图三件套从 `Look` 搬到程序级 `Settings`(2026-10-26 第 1 条):
+        // 老版本把它们存在 look.json 和 profile.yaml 每个 scheme 的 look 里,
+        // 这里做**一次性只读迁移** —— 迁移只影响内存,老文件照原样留着不备份不提示。
+        let legacy_bgs = legacy_profile_bgs(&profile_path);
+        let (bg_path, bg_fit, bg_dim) =
+            migrate_background(&saved, legacy_look_bg.as_ref(), &legacy_bgs);
         // 生效中的那套要与刚装载的 profile 对齐(外观缓存可能刚覆盖过它)
         if let Some(slot) = doc.schemes.get_mut(doc.active) {
             *slot = profile.clone();
@@ -3363,6 +3370,9 @@ impl PadApp {
             aim_mode_prev: false,
             bg_tex: None,
             bg_failed: None,
+            bg_path,
+            bg_fit,
+            bg_dim,
             diag_preview: String::new(),
             diag_preview_open: false,
             look_saved: None,
@@ -6096,6 +6106,11 @@ impl PadApp {
             grab_enabled: self.grab_enabled,
             mouse_capture: self.mouse_capture,
             mask_filter: self.mask_filter.to_bits(),
+            // 背景图也是**程序级**设置(settings.json,2026-10-26 第 1 条):
+            // 换按键组合不换背景图,所以它跟 mouse_capture 走同一条路。
+            bg_path: self.bg_path.clone(),
+            bg_fit: self.bg_fit,
+            bg_dim: self.bg_dim,
             saved_at: 0,
         };
         if !self.remember_paths {
@@ -6723,8 +6738,8 @@ impl eframe::App for PadApp {
         // profile(老 YAML 没有 style 字段),不盖回来就会"一切变回默认"。
         self.stamp_style();
         let look = self.look();
-        ctx.all_styles_mut(|style| theme::apply_style(style, &look, look.has_bg()));
-        self.paint_background(ctx, &look);
+        ctx.all_styles_mut(|style| theme::apply_style(style, &look, !self.bg_path.is_empty()));
+        self.paint_background(ctx);
         self.persist_look(&look);
 
         // 每帧联动:路径文本变化时自动补齐 scrcpy/server/adb 并刷新设备
@@ -7023,32 +7038,40 @@ impl eframe::App for PadApp {
                     (DialogPurpose::PickBackground, Some(p)) => {
                         let path = p.display().to_string();
                         let before = lock_shared(&self.shared).profile.clone();
+                        // 背景图是**程序级**设置(settings.json,2026-10-26 第 1 条),
+                        // 写的是 self;而"面板不透明度"仍在外观(Look)里 —— 两者不同
+                        // 存储,所以面板不透明度走"读局部量 → 算 → 真有变才写回"。
+                        self.bg_path = path.clone();
                         // 顶栏+左栏+中央区几乎铺满窗口,背景图只能透过面板显出来。
                         // 若"面板不透明度 × 压暗"已经把图压到基本看不见(用户会以为
                         // 选图没生效),就自动调到能看见的档位并写进日志说明。
                         let mut adjusted: Vec<String> = Vec::new();
-                        {
-                            let mut g = lock_shared(&self.shared);
-                            let look = &mut g.profile.look;
-                            look.bg_path = path.clone();
-                            let visible = f32::from(255 - look.panel_alpha) / 255.0
-                                * f32::from(255 - look.bg_dim)
-                                / 255.0;
-                            if visible < 0.20 {
-                                if look.panel_alpha > 150 {
-                                    adjusted
-                                        .push(format!("面板不透明度 {} → 150", look.panel_alpha));
-                                    look.panel_alpha = 150;
-                                }
-                                if look.bg_dim > 120 {
-                                    adjusted.push(format!("背景图压暗 {} → 120", look.bg_dim));
-                                    look.bg_dim = 120;
-                                }
+                        let mut panel_alpha = lock_shared(&self.shared).profile.look.panel_alpha;
+                        let panel_alpha_before = panel_alpha;
+                        let visible = f32::from(255 - panel_alpha) / 255.0
+                            * f32::from(255 - self.bg_dim)
+                            / 255.0;
+                        if visible < 0.20 {
+                            if panel_alpha > 150 {
+                                adjusted.push(format!("面板不透明度 {panel_alpha} → 150"));
+                                panel_alpha = 150;
+                            }
+                            if self.bg_dim > 120 {
+                                adjusted.push(format!("背景图压暗 {} → 120", self.bg_dim));
+                                self.bg_dim = 120;
                             }
                         }
-                        self.push_undo_snapshot(before);
+                        if panel_alpha != panel_alpha_before {
+                            lock_shared(&self.shared).profile.look.panel_alpha = panel_alpha;
+                            // 撤销栈回退的是外观:这一支真正进栈的只有 panel_alpha 的
+                            // 自动调整。背景图本身是程序级设置,不进撤销栈 ——
+                            // "撤销"顺手把图换掉不是用户要的粒度(见 ui_look 同段注释)。
+                            self.push_undo_snapshot(before);
+                        }
                         self.bg_tex = None; // 丢弃旧图,下一帧按新路径加载
                         self.bg_failed = None; // 允许对同一路径重新尝试
+                        // 背景图要随下一次落盘写进 settings.json
+                        self.remember_now();
                         if adjusted.is_empty() {
                             self.log(format!("背景图已设为: {path}"));
                         } else {
@@ -12060,12 +12083,34 @@ impl PadApp {
         let mut combo_easing = self.easing_edit;
         for (index, original) in combos.into_iter().enumerate() {
             let mut combo = original;
-            ui.add_enabled_ui(enabled, |ui| {
-                egui::Frame::group(ui.style())
-                    .inner_margin(egui::Margin::same(8))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
+            egui::Frame::group(ui.style())
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
+                    // ---- 整卡折叠:标题行常显,参数编辑器直接住在卡片体里 ----
+                    //
+                    // 用户 2026-10-26 第 4 条第二次:上一版是"常显标题 + 内层再套一个
+                    // 「成员与动作详细设置」折叠",被判为"折叠里面还要有参数编辑按钮,"
+                    // "太丑陋太不优雅"。现在只有一层 —— 卡片自身就是折叠头,展开后
+                    // 成员格、动作编辑器、三个选项全部直接可见,没有第二层折叠。
+                    //
+                    // 收起时标题行仍要一眼看出"第几套、几个键、什么动作、启用没有"
+                    // (否则折叠成了"看不见也猜不到");组级按钮也留在标题行,
+                    // 收起状态照样能删/加,不必先展开。
+                    //
+                    // id 必须带 index:同一页里每套组合各记各的展开状态,
+                    // 否则"点开一套"会把所有组合一起展开(自动 id 串卡)。
+                    let card_id = ui.make_persistent_id(("combo_card", index));
+                    let card = egui::collapsing_header::CollapsingState::load_with_default_open(
+                        ui.ctx(),
+                        card_id,
+                        false,
+                    );
+                    card.show_header(ui, |ui| {
+                        ui.add_enabled_ui(enabled, |ui| {
                             ui.label(format!("组合 {}", index + 1));
+                            ui.small(format!("{} 个键", combo.keys.len()));
+                            ui.small(combo.action.kind_name());
+                            ui.small(if enabled { "已启用" } else { "已停用" });
                             if ui.small_button("删除组合").clicked() {
                                 delete_combo = Some(index);
                             }
@@ -12073,76 +12118,80 @@ impl PadApp {
                                 add_slot = Some(index);
                             }
                         });
-                        ui.horizontal(|ui| {
-                            ui.label("按键:");
-                            // 用户 2026-10-23 第 2 条:每个键后面原本还挂一个
-                            // "前缀"/"成员"标签,一行被撑成 300+px、不像一个按键。
-                            // 前缀语义上面那行说明已经讲清 ⇒ 只留"＋"分隔符,
-                            // 前缀/成员的身份改为悬停提示(不丢信息,只挪位置)。
-                            for (slot, key) in combo.keys.iter().copied().enumerate() {
-                                let this = KeySlot::ComboKey { combo: index, slot };
-                                // 等待态要同时认**和弦**捕获 —— 成员格现在走
-                                // `begin_combo_member_capture`(见那里的事故说明)。
-                                let waiting = self.waiting_key == Some(this)
-                                    || self.waiting_keys == Some(this);
-                                let shown = (key != 0).then_some(key);
-                                if slot > 0 {
-                                    ui.label("＋");
+                    })
+                    .body(|ui| {
+                        ui.add_enabled_ui(enabled, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("按键:");
+                                // 用户 2026-10-23 第 2 条:每个键后面原本还挂一个
+                                // "前缀"/"成员"标签,一行被撑成 300+px、不像一个按键。
+                                // 前缀语义上面那行说明已经讲清 ⇒ 只留"＋"分隔符,
+                                // 前缀/成员的身份改为悬停提示(不丢信息,只挪位置)。
+                                for (slot, key) in combo.keys.iter().copied().enumerate() {
+                                    let this = KeySlot::ComboKey { combo: index, slot };
+                                    // 等待态要同时认**和弦**捕获 —— 成员格现在走
+                                    // `begin_combo_member_capture`(见那里的事故说明)。
+                                    let waiting = self.waiting_key == Some(this)
+                                        || self.waiting_keys == Some(this);
+                                    let shown = (key != 0).then_some(key);
+                                    if slot > 0 {
+                                        ui.label("＋");
+                                    }
+                                    let r = Self::key_button_sized(ui, waiting, shown, 62.0);
+                                    if r.clicked() {
+                                        // 走唯一武装点(第二个 helper):顺手解掉上一次遗留的捕获,
+                                        // 否则这一下按的键会落到那一行上(2026-10-23)。
+                                        self.begin_combo_member_capture(index, slot);
+                                    }
+                                    r.on_hover_text(if slot == 0 {
+                                        "第 1 个键 = 前缀:按住它再按后面的键,就是一个组合键"
+                                    } else {
+                                        "与前缀同时按住的那个键"
+                                    });
+                                    if combo.keys.len() > 2 && ui.small_button("×").clicked() {
+                                        delete_slot = Some((index, slot));
+                                    }
                                 }
-                                let r = Self::key_button_sized(ui, waiting, shown, 62.0);
-                                if r.clicked() {
-                                    // 走唯一武装点(第二个 helper):顺手解掉上一次遗留的捕获,
-                                    // 否则这一下按的键会落到那一行上(2026-10-23)。
-                                    self.begin_combo_member_capture(index, slot);
-                                }
-                                r.on_hover_text(if slot == 0 {
-                                    "第 1 个键 = 前缀:按住它再按后面的键,就是一个组合键"
-                                } else {
-                                    "与前缀同时按住的那个键"
-                                });
-                                if combo.keys.len() > 2 && ui.small_button("×").clicked() {
-                                    delete_slot = Some((index, slot));
-                                }
+                            });
+                            let action_changed = combo_action_editor(
+                                ui,
+                                &mut combo.action,
+                                &mapper,
+                                index,
+                                &mut combo_pick,
+                                &mut combo_easing,
+                            );
+                            // 轨迹录制卡片(组合键):与键位/草稿共用同一张。
+                            // 放在这里而不是 `combo_action_editor` 内部 —— 后者是自由函数,
+                            // 拿不到 `&mut App`(录制要改会话状态、要写日志、要取 Mapper)。
+                            if let Action::Swipe(s) = &combo.action {
+                                self.track_rec_card(ui, TrackTarget::Combo(index), s);
+                            }
+                            let fps_changed = ui.checkbox(&mut combo.fps_only, "仅 FPS").changed();
+                            // 「长按重复」(用户 2026-10-11 第 2 条):组合键自己的一份 ——
+                            // 整组键都按着时循环重放这一组合的动作,松开任一成员即停
+                            // (正在跑的那一轮跑完)。间隔用本组合的「按后延迟」。
+                            let repeat_changed = ui
+                                .checkbox(&mut combo.repeat_while_held, "长按重复")
+                                .on_hover_text(
+                                    "长按重复(按住时循环,直到抬起):\n\
+                                         整组键都按着时,这一组合的动作一轮接一轮地重放;\n\
+                                         松开任何一个成员键就**不再排下一轮** —— \
+                                         正在跑的那一轮会跑完,设备端不会留下'只按不抬'的触点。\n\
+                                         两轮之间的间隔用本组合的「按后延迟」;那个总开关关着时\
+                                         不留间隔,一轮接一轮不等待。",
+                                )
+                                .changed();
+                            // 「按后延迟」(用户 2026-10-10 第 2 条):组合键自己的一份。
+                            let tail_changed = Self::tail_delay_widget(ui, combo.tail_delay_ms)
+                                .map(|v| combo.tail_delay_ms = v)
+                                .is_some();
+                            if action_changed || fps_changed || repeat_changed || tail_changed {
+                                snapshots.push((index, combo.clone()));
                             }
                         });
-                        let action_changed = combo_action_editor(
-                            ui,
-                            &mut combo.action,
-                            &mapper,
-                            index,
-                            &mut combo_pick,
-                            &mut combo_easing,
-                        );
-                        // 轨迹录制卡片(组合键):与键位/草稿共用同一张。
-                        // 放在这里而不是 `combo_action_editor` 内部 —— 后者是自由函数,
-                        // 拿不到 `&mut App`(录制要改会话状态、要写日志、要取 Mapper)。
-                        if let Action::Swipe(s) = &combo.action {
-                            self.track_rec_card(ui, TrackTarget::Combo(index), s);
-                        }
-                        let fps_changed = ui.checkbox(&mut combo.fps_only, "仅 FPS").changed();
-                        // 「长按重复」(用户 2026-10-11 第 2 条):组合键自己的一份 ——
-                        // 整组键都按着时循环重放这一组合的动作,松开任一成员即停
-                        // (正在跑的那一轮跑完)。间隔用本组合的「按后延迟」。
-                        let repeat_changed = ui
-                            .checkbox(&mut combo.repeat_while_held, "长按重复")
-                            .on_hover_text(
-                                "长按重复(按住时循环,直到抬起):\n\
-                                 整组键都按着时,这一组合的动作一轮接一轮地重放;\n\
-                                 松开任何一个成员键就**不再排下一轮** —— \
-                                 正在跑的那一轮会跑完,设备端不会留下'只按不抬'的触点。\n\
-                                 两轮之间的间隔用本组合的「按后延迟」;那个总开关关着时\
-                                 不留间隔,一轮接一轮不等待。",
-                            )
-                            .changed();
-                        // 「按后延迟」(用户 2026-10-10 第 2 条):组合键自己的一份。
-                        let tail_changed = Self::tail_delay_widget(ui, combo.tail_delay_ms)
-                            .map(|v| combo.tail_delay_ms = v)
-                            .is_some();
-                        if action_changed || fps_changed || repeat_changed || tail_changed {
-                            snapshots.push((index, combo.clone()));
-                        }
                     });
-            });
+                });
         }
         // 帧首快照回写:只在这一帧里没人动过时才写回(见 frame_local_take)。
         self.picking = frame_local_take(pick_at_start, self.picking, combo_pick);
@@ -12232,28 +12281,50 @@ impl PadApp {
         let wheel_count = lock_shared(&self.shared).profile.wheels.len();
 
         for i in 0..wheel_count {
-            ui.horizontal(|ui| {
-                let temp_info = {
-                    let g = lock_shared(&self.shared);
-                    // 列表长度是上一次加锁时读的:引擎换组合后可能越界(W0-10),
-                    // 取不到就整行不渲染
-                    let Some(w) = g.profile.wheels.get(i) else {
-                        return;
-                    };
+            // 折叠头要常显"轮盘N(临时) + 类型 + 模式"与删除按钮,所以先在锁内只读一次
+            // 摘要;索引失效(引擎刚换组合)就整张卡不渲染。
+            let card_summary = {
+                let g = lock_shared(&self.shared);
+                g.profile.wheels.get(i).map(|w| {
                     (
-                        w.temp.as_ref().map(|t| (t.key, t.mode)),
-                        w.mode,
-                        w.kind,
                         format!(
                             "轮盘{}{}",
                             i + 1,
                             if w.temp.is_some() { "(临时)" } else { "" },
                         ),
+                        w.kind,
+                        w.mode,
+                        w.temp.as_ref().map(|t| (t.key, t.mode)),
                     )
-                };
-                let (temp, old_mode, old_kind, title) = temp_info;
-                ui.label(title);
-
+                })
+            };
+            let Some((title, old_kind, old_mode, temp)) = card_summary else {
+                continue;
+            };
+            // 用户 2026-10-26 第 4 条:每套轮盘 = 一张**一层折叠**卡片,卡片自身就是
+            // 折叠头、默认收起;参数编辑器直接住在卡片体里 —— 折叠里不许再藏
+            // "编辑参数"按钮(二层折叠已因"丑陋、多一次点击"被否掉一次)。
+            egui::Frame::group(ui.style())
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
+                    let card_id = ui.make_persistent_id(("wheel_card", i));
+                    egui::collapsing_header::CollapsingState::load_with_default_open(
+                        ui.ctx(),
+                        card_id,
+                        false,
+                    )
+                    .show_header(ui, |ui| {
+                        ui.label(title);
+                        ui.small(old_kind.label());
+                        if old_kind == WheelKind::Standard {
+                            ui.small(old_mode.label());
+                        }
+                        // 删除留在折叠头:收起状态也能删,不必先展开
+                        if ui.small_button("删除").clicked() {
+                            to_delete = Some(i);
+                        }
+                    })
+                    .body(|ui| {
                 let mut kind = old_kind;
                 egui::ComboBox::from_id_salt(("wheel_kind", i))
                     .selected_text(kind.label())
@@ -12348,12 +12419,11 @@ impl PadApp {
                 } else {
                     ui.label("(永久)");
                 }
-            });
             let (dirs, kind, manuals) = {
                 let g = lock_shared(&self.shared);
                 // 索引失效(引擎刚换组合)则跳过这一行,继续渲染后面的
                 let Some(w) = g.profile.wheels.get(i) else {
-                    continue;
+                    return;
                 };
                 // 手动终点按下标取(自定义/执行轮盘的 active_dirs 与 directions 一一对应)
                 let manuals: Vec<Option<(f32, f32)>> = (0..8)
@@ -12582,10 +12652,9 @@ impl PadApp {
                         self.begin_resize_wheel(i);
                     }
                 }
-                if ui.button("删除").clicked() {
-                    to_delete = Some(i);
-                }
             });
+                    });
+                });
         }
         if let Some(i) = to_delete {
             self.push_undo();
@@ -15336,8 +15405,8 @@ impl PadApp {
         let mut pick_bg = false;
         let mut edit = false;
         let mut style_restart: Option<theme::UiStyle> = None;
-        // 鼠标接管方式/遮板过滤项改了(程序级设置,需在持锁块外登记落盘)
-        let mut capture_or_filter_dirty = false;
+        // 鼠标接管方式/遮板过滤项/背景图改了(都是程序级设置,需在持锁块外登记落盘)
+        let mut settings_dirty = false;
         // 撤销快照的"改动前"只需要本页会改的那一份(`Look`,~17ns/帧);
         // 整份配置(~5µs/帧,见 W2-3 度量)推迟到真的改了东西那一刻再组装。
         let look_before = lock_shared(&self.shared).profile.look.clone();
@@ -15385,6 +15454,13 @@ impl PadApp {
             let mut filter = self.mask_filter;
             let mut capture_changed = false;
             let mut filter_changed = false;
+            // 背景图(路径/填充/压暗)同样是**程序级**设置(settings.json,2026-10-26 第 1 条):
+            // 换按键组合不该换背景图,所以它不能跟着 scheme 走的 Look 走(与上面
+            // mouse_capture 同一个理由,见 settings.rs 里那段 P22 注释)。
+            // 同样用局部量中转,块尾比较后写回,再由块外统一登记落盘。
+            let mut bg_path = self.bg_path.clone();
+            let mut bg_fit = self.bg_fit;
+            let mut bg_dim = self.bg_dim;
             // U11:这一段的提示色取语义色,不写死 RGB(取一次,Theme 是 Copy)
             let th = look.theme();
             ui.horizontal(|ui| {
@@ -15431,7 +15507,7 @@ impl PadApp {
                 // 落盘登记:这两个是**程序级**设置(settings.json)。
                 // 放在这里(持锁块外)是因为 `remember_now` 会取 `settings_snapshot`,
                 // 而那要再借一次 `self` —— 在 `g` 还活着时调用过不了借用检查。
-                capture_or_filter_dirty = true;
+                settings_dirty = true;
             }
             ui.small(
                 "「隔膜」在钩子层吞鼠标(默认);「遮板」在窗口层贴一块透明置顶窗挡鼠标,\
@@ -15475,13 +15551,15 @@ impl PadApp {
                     });
             });
 
+            // 背景图是**程序级**设置(settings.json,2026-10-26 第 1 条):
+            // 这里只改局部量,块尾比对后写回 self,再由块外统一登记落盘。
             ui.horizontal(|ui| {
                 ui.label("背景图:");
-                if look.has_bg() {
-                    let name = std::path::Path::new(&look.bg_path)
+                if !bg_path.is_empty() {
+                    let name = std::path::Path::new(&bg_path)
                         .file_name()
                         .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_else(|| look.bg_path.clone());
+                        .unwrap_or_else(|| bg_path.clone());
                     // 长文件名必须**截断**并给宽度上限,否则它会把右边的[更换]/[清除]
                     // 顶出可视区(用户 2026-10-21 反馈"更换图片的按钮被顶到右边无法找回")。
                     //
@@ -15510,13 +15588,14 @@ impl PadApp {
                             .truncate()
                             .sense(egui::Sense::hover()),
                     )
-                    .on_hover_text(&look.bg_path);
+                    .on_hover_text(&bg_path);
                     if ui.small_button("更换").clicked() {
                         pick_bg = true;
                     }
                     if ui.small_button("清除").clicked() {
-                        look.clear_bg();
-                        edit = true;
+                        // 不置 edit:背景图已不属于外观(不随配置切换、不进撤销栈),
+                        // 清空只需块尾比对 → 登记落盘。
+                        bg_path.clear();
                     }
                 } else {
                     ui.label("未设置");
@@ -15526,29 +15605,21 @@ impl PadApp {
                 }
             });
 
-            if look.has_bg() {
+            if !bg_path.is_empty() {
                 ui.horizontal(|ui| {
                     ui.label("填充:");
                     egui::ComboBox::from_id_salt("look_bgfit")
-                        .selected_text(look.bg_fit.label())
+                        .selected_text(bg_fit.label())
                         .show_ui(ui, |ui| {
                             for f in [BgFit::Cover, BgFit::Contain, BgFit::Tile] {
-                                if ui
-                                    .selectable_value(&mut look.bg_fit, f, f.label())
-                                    .changed()
-                                {
-                                    edit = true;
-                                }
+                                ui.selectable_value(&mut bg_fit, f, f.label());
                             }
                         });
                 });
-                // 连续滑块:开始拖动/聚焦那一帧记一个撤销点,避免每帧塞一条
-                let r = ui
-                    .add(egui::Slider::new(&mut look.bg_dim, 0..=255).text("背景图压暗"))
+                // 三个控件都不逐次置位:块尾拿局部量与 self 比对,值真变了才登记
+                // —— 拖动过程中的中间值同样会被写回,不会漏。
+                ui.add(egui::Slider::new(&mut bg_dim, 0..=255).text("背景图压暗"))
                     .on_hover_text("数值越大背景图越暗、文字越清楚;0=完全不压暗");
-                if r.drag_started() || r.gained_focus() {
-                    edit = true;
-                }
                 let r = ui
                     .add(egui::Slider::new(&mut look.panel_alpha, 30..=255).text("面板不透明度"))
                     .on_hover_text(
@@ -15563,7 +15634,17 @@ impl PadApp {
             if Self::ui_readability_controls(ui, look) {
                 edit = true;
             }
-            ui.small("外观随配置保存;[选用配置]会一并切换外观");
+            ui.small("外观随配置保存;[选用配置]会一并切换外观;背景图是程序级设置,不随配置切换");
+            // 背景图(程序级设置):值真变了才写回,块外统一登记落盘。
+            // 它**不进撤销栈** —— 撤销栈回退的是整份配置里的 `look`,背景图已搬到
+            // settings.json 塞不进去;而"撤销"顺手换掉背景图也不是用户要的粒度
+            // (用户 2026-10-26 第 1 条:换键位为啥要换图片)。
+            if bg_path != self.bg_path || bg_fit != self.bg_fit || bg_dim != self.bg_dim {
+                self.bg_path = bg_path;
+                self.bg_fit = bg_fit;
+                self.bg_dim = bg_dim;
+                settings_dirty = true;
+            }
         }
         if pick_bg {
             self.dialog = Some(crate::filedialog::pick_file());
@@ -15582,15 +15663,18 @@ impl PadApp {
             self.request_style_restart(&ctx, s);
         }
         // 鼠标接管方式 / 遮板过滤项是**程序级**设置(settings.json):
-        // 在持锁块外统一登记落盘(见上面 `capture_or_filter_dirty` 的说明)。
-        if capture_or_filter_dirty {
+        // 在持锁块外统一登记落盘(见上面 `settings_dirty` 的说明)。
+        if settings_dirty {
             self.remember_now();
         }
     }
 
     /// 按填充方式把背景图画到窗口背景层(带可读性遮罩)
-    fn paint_background(&mut self, ctx: &egui::Context, look: &theme::Look) {
-        if !look.has_bg() {
+    fn paint_background(&mut self, ctx: &egui::Context) {
+        // 背景图是程序级设置(settings.json),这里先取出路径的副本:
+        // 后面要可变地改 `bg_tex`/`bg_failed`,不能一直借着 self.bg_path。
+        let path = self.bg_path.clone();
+        if path.is_empty() {
             if self.bg_tex.is_some() {
                 self.bg_tex = None;
             }
@@ -15600,16 +15684,16 @@ impl PadApp {
         let need_load = self
             .bg_tex
             .as_ref()
-            .map(|(p, _)| p != &look.bg_path)
+            .map(|(p, _)| p != &path)
             .unwrap_or(true);
         // 同一路径此前已加载失败:不再重试(换图后会重置),否则会每帧刷屏
-        if need_load && self.bg_failed.as_deref() == Some(look.bg_path.as_str()) {
+        if need_load && self.bg_failed.as_deref() == Some(path.as_str()) {
             return;
         }
         if need_load {
             self.bg_tex = None;
             let mut err = None;
-            match std::fs::read(&look.bg_path) {
+            match std::fs::read(&path) {
                 Ok(bytes) => match image::load_from_memory(&bytes) {
                     Ok(img) => {
                         let rgba = img.to_rgba8();
@@ -15619,7 +15703,7 @@ impl PadApp {
                             &rgba.into_raw(),
                         );
                         let tex = ctx.load_texture("bg", color, egui::TextureOptions::LINEAR);
-                        self.bg_tex = Some((look.bg_path.clone(), tex));
+                        self.bg_tex = Some((path.clone(), tex));
                         self.bg_failed = None;
                     }
                     Err(e) => {
@@ -15629,7 +15713,7 @@ impl PadApp {
                 Err(e) => err = Some(format!("背景图读取失败: {e}")),
             }
             if let Some(e) = err {
-                self.bg_failed = Some(look.bg_path.clone());
+                self.bg_failed = Some(path.clone());
                 self.log(e);
             }
         }
@@ -15637,7 +15721,7 @@ impl PadApp {
         let screen = ctx.content_rect();
         let painter = ctx.layer_painter(egui::LayerId::background());
         let ts = tex.size_vec2();
-        match look.bg_fit {
+        match self.bg_fit {
             BgFit::Tile => {
                 for y in 0..((screen.height() / ts.y).ceil() as i32 + 1) {
                     for x in 0..((screen.width() / ts.x).ceil() as i32 + 1) {
@@ -15652,7 +15736,7 @@ impl PadApp {
                 }
             }
             BgFit::Cover | BgFit::Contain => {
-                let scale = if look.bg_fit == BgFit::Cover {
+                let scale = if self.bg_fit == BgFit::Cover {
                     (screen.width() / ts.x).max(screen.height() / ts.y)
                 } else {
                     (screen.width() / ts.x).min(screen.height() / ts.y)
@@ -15660,7 +15744,7 @@ impl PadApp {
                 let size = ts * scale;
                 // 居中:超出部分按 UV 裁切
                 let min = screen.center() - size / 2.0;
-                let uv = if look.bg_fit == BgFit::Cover {
+                let uv = if self.bg_fit == BgFit::Cover {
                     let u0 = (-min.x / size.x).clamp(0.0, 1.0);
                     let v0 = (-min.y / size.y).clamp(0.0, 1.0);
                     let u1 = ((screen.max.x - min.x) / size.x).clamp(0.0, 1.0);
@@ -15678,8 +15762,8 @@ impl PadApp {
             }
         }
         // 可读性兜底:整体压暗
-        if look.bg_dim > 0 {
-            painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(look.bg_dim));
+        if self.bg_dim > 0 {
+            painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(self.bg_dim));
         }
     }
 
@@ -16579,6 +16663,19 @@ impl PadApp {
                 .unwrap_or(false);
             let aim = &mut g.profile.aim;
 
+            // 用户 2026-10-26 第 4 条:FPS 页也改成整卡一层折叠 —— 每张卡片自身就是
+            // 折叠头、默认收起,参数编辑器直接住在卡片体里;折叠里不许再藏
+            // "编辑参数"按钮,更不许出现第二层折叠(原先档位表那一层已就地展开)。
+            let card_id = ui.make_persistent_id(("aim_card_input", 0));
+            egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                card_id,
+                false,
+            )
+            .show_header(ui, |ui| {
+                ui.label("启用、视角输入与锚点");
+            })
+            .body(|ui| {
             // ---- U10(2026-10-17):FPS 页分组 ----
             // 只**加**分组标题/分隔线/间距,不动任何字段的先后顺序 —— 没有 GUI
             // 走查条件时,重排的破坏性无法验证(V2-4 事故的教训)。
@@ -16755,6 +16852,18 @@ impl PadApp {
                 }
             }
 
+            });
+
+            let card_id = ui.make_persistent_id(("aim_card_feel", 1));
+            egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                card_id,
+                false,
+            )
+            .show_header(ui, |ui| {
+                ui.label("灵敏度、归中与开关按键");
+            })
+            .body(|ui| {
             // ---- 分组:手感参数(灵敏度 / 滚轮缩放 / 移速 / 归中) ----
             ui.separator();
             ui.heading("灵敏度与归中");
@@ -16952,6 +17061,18 @@ impl PadApp {
                 ui.label("(按住暂时退出 FPS,恢复普通映射并显示鼠标;松开回到 FPS)");
             });
 
+            });
+
+            let card_id = ui.make_persistent_id(("aim_card_recoil", 2));
+            egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                card_id,
+                false,
+            )
+            .show_header(ui, |ui| {
+                ui.label("压枪(后坐力)");
+            })
+            .body(|ui| {
             // ---- 压枪 / 后坐力补偿(V2-1;产品立场:默认关闭、UI 明示) ----
             // 参数语义对齐 K2er《鼠标宏》专页(原文抄在 keymap::Recoil 的注释里)。
             ui.separator();
@@ -17096,16 +17217,13 @@ impl PadApp {
                     undo_needed = true;
                 }
                 // 控制强度档位表:每档 = 名字 + 强度 + 是否参与滚轮换档,可拖动排序。
-                // 档位过多时默认收起(非添加模式),见 RECOIL_TIER_COLLAPSE_AT;
-                // 点[＋ 添加一档]的这一帧强制展开 —— 正在添加就不该藏。
+                // 用户 2026-10-26 第 4 条:档位表**直接住在压枪卡片的体里** —— 原先
+                // 这里还套了一层折叠(档多时收起),正是"折叠里又藏一层折叠"的返工原因;
+                // 现在没有它,添加档位也不必再强制展开。
                 let n_now = aim.recoil.strengths.len();
                 let mut remove_idx = None;
                 // (被拖的档, 插入边界):插入边界 = "插到第几档之前"(0..=档数)
                 let mut reorder: Option<(usize, usize)> = None;
-                egui::CollapsingHeader::new("控制强度档位表")
-                    .default_open(n_now <= RECOIL_TIER_COLLAPSE_AT)
-                    .open(add_gear.then_some(true))
-                    .show(ui, |ui| {
                         ui.small(
                             "每档:名字(可留空)+ 强度 + 水平 px(常量偏置)+ 水平幅度/周期/\
                              波形(交替补偿)+ 是否参与滚轮换档 —— 切档时垂直与水平一起切。\
@@ -17313,7 +17431,6 @@ impl PadApp {
                                 let _ = egui::DragAndDrop::take_payload::<usize>(ui.ctx());
                             }
                         }
-                    });
                 if let Some((from, to)) = reorder {
                     if let Some(new_idx) = aim.recoil.move_gear(from, to) {
                         undo_needed = true;
@@ -17401,106 +17518,122 @@ impl PadApp {
                 });
             }
 
-            // ---- S①/S②/S③ 鼠标独占(隔膜)的作用范围 + 手动开关 ----
-            // 用户 2026-10-11 第二问:"真的不能 scrcpy 运行时切换可否使用鼠标点击吗?"
-            // —— 能:隔膜是一枚原子开关,钩子每个事件现读它,翻转**下一帧即生效**,
-            // 不需要重启 scrcpy。这里给它三档范围 + 一个手动开关热键。
-            ui.separator();
-            // ---- 分组:鼠标独占 + 卡死自愈 + 两个自救键 ----
-            ui.heading("鼠标独占与自救");
-            ui.add_space(2.0);
-            // G-c 实时状态行(2026-10-18 用户反馈驱动):用户 `log_level=warn` 时
-            // 日志被压掉 ⇒ 「钉住光标」**无法验收**。这里给它一条与「鼠标独占」
-            // 同形态的状态行:不翻日志就能判"钉没钉住、以及为什么没钉住"。
-            #[cfg(windows)]
-            {
-                let applied = self.mouse_grab_flag.load(Ordering::Relaxed);
-                // 主题色是进这个块**之前**取好的(见上面的 `aim_page_theme`)。
-                // 这里绝不能再调任何会加配置锁的 `&self` 方法:本块外面持着 `g`。
-                let (text, color) = Self::clip_status_line(
-                    &aim_page_theme,
-                    self.clip_cursor_in_aim,
-                    applied,
-                    self.scrcpy_is_foreground(),
-                );
-                ui.colored_label(color, text);
-            }
-            ui.horizontal(|ui| {
-                ui.label("鼠标独占:");
-                egui::ComboBox::from_id_salt("aim_mouse_shield")
-                    .selected_text(aim.mouse_shield.label())
-                    .show_ui(ui, |ui| {
-                        for m in crate::keymap::MouseShieldMode::ALL {
-                            // 平台不对等(2026-10-22,只读审计发现):`ScrcpyForeground`
-                            // 靠"投屏窗口是不是前台"判定,而前台进程查询
-                            // (`capture::foreground_pid`)只有 Windows 实现 ——
-                            // 非 Windows 恒 `None` ⇒ 这一档恒等于"从不独占"。
-                            // 以前它照常可选、hint 一字未提平台,用户选了会发现
-                            // "没生效"却查不出原因。这里在不可用的平台上置灰 +
-                            // 说明,而不是偷偷把它当 FpsOnly 用。
-                            let usable = m.usable_on(cfg!(windows));
-                            let hint = match m {
-                                crate::keymap::MouseShieldMode::FpsOnly => {
-                                    "只在 FPS 模式生效期间独占(默认;与从前行为一致)"
-                                }
-                                crate::keymap::MouseShieldMode::ScrcpyForeground => {
-                                    "只在投屏窗口(scrcpy)处于前台时独占 —— 切到别的窗口鼠标照常"
-                                }
-                                crate::keymap::MouseShieldMode::Always => {
-                                    "映射开启且已连接就一直独占"
-                                }
-                            };
-                            let hint = if usable {
-                                hint.to_string()
-                            } else {
-                                format!(
-                                    "{hint}\n\n本平台不可用:Linux 拿不到「投屏窗口是否前台」\
+            });
+
+            // 卡片体要读"投屏窗口是否前台",而它是个整份 `&self` 方法;同一个闭包里
+            // 还有 `&mut self.clip_cursor_in_aim`(钉住光标勾选框) —— 整份共享借 +
+            // 字段可变借进同一个闭包编译不过,所以在这里(卡片之外)先算成标量传进去。
+            let aim_scrcpy_foreground = self.scrcpy_is_foreground();
+            let card_id = ui.make_persistent_id(("aim_card_shield", 3));
+            egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                card_id,
+                false,
+            )
+            .show_header(ui, |ui| {
+                ui.label("鼠标独占与自救");
+            })
+            .body(|ui| {
+                // ---- S①/S②/S③ 鼠标独占(隔膜)的作用范围 + 手动开关 ----
+                // 用户 2026-10-11 第二问:"真的不能 scrcpy 运行时切换可否使用鼠标点击吗?"
+                // —— 能:隔膜是一枚原子开关,钩子每个事件现读它,翻转**下一帧即生效**,
+                // 不需要重启 scrcpy。这里给它三档范围 + 一个手动开关热键。
+                ui.separator();
+                // ---- 分组:鼠标独占 + 卡死自愈 + 两个自救键 ----
+                ui.heading("鼠标独占与自救");
+                ui.add_space(2.0);
+                // G-c 实时状态行(2026-10-18 用户反馈驱动):用户 `log_level=warn` 时
+                // 日志被压掉 ⇒ 「钉住光标」**无法验收**。这里给它一条与「鼠标独占」
+                // 同形态的状态行:不翻日志就能判"钉没钉住、以及为什么没钉住"。
+                #[cfg(windows)]
+                {
+                    let applied = self.mouse_grab_flag.load(Ordering::Relaxed);
+                    // 主题色是进这个块**之前**取好的(见上面的 `aim_page_theme`)。
+                    // 这里绝不能再调任何会加配置锁的 `&self` 方法:本块外面持着 `g`。
+                    let (text, color) = Self::clip_status_line(
+                        &aim_page_theme,
+                        self.clip_cursor_in_aim,
+                        applied,
+                        aim_scrcpy_foreground,
+                    );
+                    ui.colored_label(color, text);
+                }
+                ui.horizontal(|ui| {
+                    ui.label("鼠标独占:");
+                    egui::ComboBox::from_id_salt("aim_mouse_shield")
+                        .selected_text(aim.mouse_shield.label())
+                        .show_ui(ui, |ui| {
+                            for m in crate::keymap::MouseShieldMode::ALL {
+                                // 平台不对等(2026-10-22,只读审计发现):`ScrcpyForeground`
+                                // 靠"投屏窗口是不是前台"判定,而前台进程查询
+                                // (`capture::foreground_pid`)只有 Windows 实现 ——
+                                // 非 Windows 恒 `None` ⇒ 这一档恒等于"从不独占"。
+                                // 以前它照常可选、hint 一字未提平台,用户选了会发现
+                                // "没生效"却查不出原因。这里在不可用的平台上置灰 +
+                                // 说明,而不是偷偷把它当 FpsOnly 用。
+                                let usable = m.usable_on(cfg!(windows));
+                                let hint = match m {
+                                    crate::keymap::MouseShieldMode::FpsOnly => {
+                                        "只在 FPS 模式生效期间独占(默认;与从前行为一致)"
+                                    }
+                                    crate::keymap::MouseShieldMode::ScrcpyForeground => {
+                                        "只在投屏窗口(scrcpy)处于前台时独占 —— 切到别的窗口鼠标照常"
+                                    }
+                                    crate::keymap::MouseShieldMode::Always => {
+                                        "映射开启且已连接就一直独占"
+                                    }
+                                };
+                                let hint = if usable {
+                                    hint.to_string()
+                                } else {
+                                    format!(
+                                        "{hint}\n\n本平台不可用:Linux 拿不到「投屏窗口是否前台」\
                                      (scrcpy 是另一个进程,前台进程查询只有 Windows 有)\
                                      ⇒ 选这一档等于从不独占。想常开请用「始终」。"
-                                )
-                            };
-                            let resp = ui
-                                .add_enabled_ui(usable, |ui| {
-                                    ui.selectable_value(&mut aim.mouse_shield, m, m.label())
-                                })
-                                .inner
-                                .on_hover_text(hint);
-                            if resp.changed() {
-                                undo_needed = true;
+                                    )
+                                };
+                                let resp = ui
+                                    .add_enabled_ui(usable, |ui| {
+                                        ui.selectable_value(&mut aim.mouse_shield, m, m.label())
+                                    })
+                                    .inner
+                                    .on_hover_text(hint);
+                                if resp.changed() {
+                                    undo_needed = true;
+                                }
                             }
-                        }
-                    });
-                ui.label("手动开关热键:");
-                let mk = aim.shield_key;
-                let waiting = self.waiting_keys == Some(KeySlot::AimShield);
-                if Self::keys_button(ui, waiting, &mk).clicked() {
-                    pick_shield_key = true;
-                }
-                if (waiting || !mk.is_empty()) && Self::cancel_bind_button(ui, waiting) {
-                    if waiting {
-                        cancel_bind = Some(KeySlot::AimShield);
-                    } else {
-                        aim.shield_key = KeySet::new();
-                        undo_needed = true;
+                        });
+                    ui.label("手动开关热键:");
+                    let mk = aim.shield_key;
+                    let waiting = self.waiting_keys == Some(KeySlot::AimShield);
+                    if Self::keys_button(ui, waiting, &mk).clicked() {
+                        pick_shield_key = true;
                     }
-                }
-            });
-            ui.small(
-                "独占开着时:鼠标消息不投递给任何窗口(投屏窗口也收不到),\
+                    if (waiting || !mk.is_empty()) && Self::cancel_bind_button(ui, waiting) {
+                        if waiting {
+                            cancel_bind = Some(KeySlot::AimShield);
+                        } else {
+                            aim.shield_key = KeySet::new();
+                            undo_needed = true;
+                        }
+                    }
+                });
+                ui.small(
+                    "独占开着时:鼠标消息不投递给任何窗口(投屏窗口也收不到),\
                  代价是本界面也点不了 —— 键盘事件不受影响,\
                  按上面的[手动开关热键]即可随时关掉它。",
-            );
-            // ---- G-c:瞄准期间钉住光标(默认开)----
-            // 用户口径:甩枪时光标满屏乱跑、撞到屏幕边还会丢位移 ⇒ 用系统的
-            // `ClipCursor` 把它关在当前位置的 1x1 像素里。**入口就在这里**
-            // (FPS 页「鼠标独占与自救」分组):它和上面的独占是同一类问题 ——
-            // "瞄准时怎么处置系统鼠标",放在一起才找得到。
-            #[cfg(windows)]
-            {
-                if ui
-                    .checkbox(&mut self.clip_cursor_in_aim, "钉住光标(避免甩枪撞边)")
-                    .on_hover_text(
-                        "默认开启。瞄准(FPS 抓取)期间用系统接口把光标关在当前位置的\n\
+                );
+                // ---- G-c:瞄准期间钉住光标(默认开)----
+                // 用户口径:甩枪时光标满屏乱跑、撞到屏幕边还会丢位移 ⇒ 用系统的
+                // `ClipCursor` 把它关在当前位置的 1x1 像素里。**入口就在这里**
+                // (FPS 页「鼠标独占与自救」分组):它和上面的独占是同一类问题 ——
+                // "瞄准时怎么处置系统鼠标",放在一起才找得到。
+                #[cfg(windows)]
+                {
+                    if ui
+                        .checkbox(&mut self.clip_cursor_in_aim, "钉住光标(避免甩枪撞边)")
+                        .on_hover_text(
+                            "默认开启。瞄准(FPS 抓取)期间用系统接口把光标关在当前位置的\n\
                          1 像素矩形里 —— 它不再满屏乱跑,也撞不到屏幕边。\n\
                          \n只在你**真的在瞄准**时生效(判据就是 FPS 抓取本身):\n\
                          只是按下[指针消隐]开关时**不会**钉住 —— 那不是瞄准。\n\
@@ -17508,42 +17641,42 @@ impl PadApp {
                          都会自动释放(进程被强制结束时由系统归还)。\n\
                          原有的[回中]仍然保留兜底。\n\
                          \n这是程序级设置,存在 settings.json 里,重启后保持。",
-                    )
-                    .changed()
-                {
-                    // 这里**只能**改原子量与攒文案:本次绘制发生在 lock_shared
-                    // 的借用期内(变量 g 还活着),而 remember_now / log 都要借
-                    // self —— 直接调用会被借用检查拒绝(E0502)。所以落盘登记与
-                    // 日志都攒到锁外(与 preset_log 同一套做法)。
-                    clip_changed = Some(self.clip_cursor_in_aim);
-                    // 立即写原子量:勾选/取消在**这一帧**就生效,不必等下一帧
-                    // (关掉时必须立刻放 —— 光标钉着是能被用户直接感觉到的状态)。
-                    self.clip_cursor_flag
-                        .store(self.clip_cursor_in_aim, Ordering::Relaxed);
-                }
-                ui.small(
-                    "钉住光标(默认开):瞄准期间用系统接口把光标关在当前位置的 1 像素里,\
+                        )
+                        .changed()
+                    {
+                        // 这里**只能**改原子量与攒文案:本次绘制发生在 lock_shared
+                        // 的借用期内(变量 g 还活着),而 remember_now / log 都要借
+                        // self —— 直接调用会被借用检查拒绝(E0502)。所以落盘登记与
+                        // 日志都攒到锁外(与 preset_log 同一套做法)。
+                        clip_changed = Some(self.clip_cursor_in_aim);
+                        // 立即写原子量:勾选/取消在**这一帧**就生效,不必等下一帧
+                        // (关掉时必须立刻放 —— 光标钉着是能被用户直接感觉到的状态)。
+                        self.clip_cursor_flag
+                            .store(self.clip_cursor_in_aim, Ordering::Relaxed);
+                    }
+                    ui.small(
+                        "钉住光标(默认开):瞄准期间用系统接口把光标关在当前位置的 1 像素里,\
                      甩枪不再撞边、也不会点到别的窗口;退出瞄准立刻释放,\
                      原有的[回中]仍在,作为钉子被目标程序覆盖时的兜底。",
-                );
-            }
-            // 非 Windows 没有这层隔膜(那边的鼠标独占走 evdev 的 EVIOCGRAB),
-            // 明说一句,免得用户以为"选了始终独占却没生效"。
-            #[cfg(not(windows))]
-            ui.small(
-                "提示:本平台没有这层鼠标隔膜(FPS 的鼠标独占由 evdev 的 EVIOCGRAB 承担),\
+                    );
+                }
+                // 非 Windows 没有这层隔膜(那边的鼠标独占走 evdev 的 EVIOCGRAB),
+                // 明说一句,免得用户以为"选了始终独占却没生效"。
+                #[cfg(not(windows))]
+                ui.small(
+                    "提示:本平台没有这层鼠标隔膜(FPS 的鼠标独占由 evdev 的 EVIOCGRAB 承担),\
                  上面这一档不影响行为。",
-            );
-            // ---- 分组:自愈与两个自救键(与上面的独占分开放) ----
-            ui.separator();
-            // ---- 卡死自愈(2026-10-12,用户第 6 条)----
-            // 用户明确拒绝"靠按键自救"的做法(竞品没这毛病)⇒ 这一项的默认是**开**。
-            // 它只在出问题时才动作(手离开手机 / 设备端账本与本地对不上),正常滑动
-            // 一次都不动 —— 所以"默认开"不改变默认手感(见 `Aim::self_heal`)。
-            if ui
-                .checkbox(&mut aim.self_heal, "卡死自愈（推荐）")
-                .on_hover_text(
-                    "手碰了一下手机屏之后注入失效?开着它就不必再按自救键。\n\
+                );
+                // ---- 分组:自愈与两个自救键(与上面的独占分开放) ----
+                ui.separator();
+                // ---- 卡死自愈(2026-10-12,用户第 6 条)----
+                // 用户明确拒绝"靠按键自救"的做法(竞品没这毛病)⇒ 这一项的默认是**开**。
+                // 它只在出问题时才动作(手离开手机 / 设备端账本与本地对不上),正常滑动
+                // 一次都不动 —— 所以"默认开"不改变默认手感(见 `Aim::self_heal`)。
+                if ui
+                    .checkbox(&mut aim.self_heal, "卡死自愈（推荐）")
+                    .on_hover_text(
+                        "手碰了一下手机屏之后注入失效?开着它就不必再按自救键。\n\
                      \n只在出问题时动作(正常滑动时一次都不动,手感不变):\n\
                      ① 手离开手机(只读监听手机触摸屏的 Up 边沿)⇒ 自动抬指重建;\n\
                      ② 设备端账本与本地对不上(dumpsys input 的 TouchStates 触点数\n\
@@ -17552,109 +17685,110 @@ impl PadApp {
                      不关映射、不退出 FPS;下一次鼠标位移会自动重新落指。\n\
                      限流 300ms;宏步进 / 绑定捕获 / 截图取点期间不自愈。\n\
                      \n关掉它 = 回到纯手动:下面两个自救键照旧可用。",
-                )
-                .changed()
-            {
-                undo_needed = true;
-            }
-            ui.small(
-                "卡死自愈(默认开):手离开手机、或设备端触点账本与本地对不上时,\
+                    )
+                    .changed()
+                {
+                    undo_needed = true;
+                }
+                ui.small(
+                    "卡死自愈(默认开):手离开手机、或设备端触点账本与本地对不上时,\
                  自动抬指重建(与[唤醒视角]同一个动作);关掉后仍可用下面两个自救键。",
-            );
-            // ---- 锁死自救:两个逃生热键(A/B,2026-10-11) ----
-            // 真机现象:界面显示一切正常、日志零异常,而鼠标点不了任何界面
-            // (只有键盘还通)。两个键都**默认不绑** —— 不改默认手感,要用自己绑。
-            ui.horizontal(|ui| {
-                ui.label("唤醒视角热键:");
-                let wk = aim.wake_key;
-                let waiting = self.waiting_keys == Some(KeySlot::AimWake);
-                if Self::keys_button(ui, waiting, &wk)
-                    .on_hover_text(
-                        "卡住时按一下,不必退出 FPS:只把此刻按着的瞄准指抬起来,\
+                );
+                // ---- 锁死自救:两个逃生热键(A/B,2026-10-11) ----
+                // 真机现象:界面显示一切正常、日志零异常,而鼠标点不了任何界面
+                // (只有键盘还通)。两个键都**默认不绑** —— 不改默认手感,要用自己绑。
+                ui.horizontal(|ui| {
+                    ui.label("唤醒视角热键:");
+                    let wk = aim.wake_key;
+                    let waiting = self.waiting_keys == Some(KeySlot::AimWake);
+                    if Self::keys_button(ui, waiting, &wk)
+                        .on_hover_text(
+                            "卡住时按一下,不必退出 FPS:只把此刻按着的瞄准指抬起来,\
                          \n不关映射、不退出 FPS;下一次鼠标位移会自动重新落指。\
                          \n与 F8(关映射、抬起全部触点)的区别就在这。默认未绑定。",
-                    )
-                    .clicked()
-                {
-                    pick_wake_key = true;
-                }
-                if (waiting || !wk.is_empty()) && Self::cancel_bind_button(ui, waiting) {
-                    if waiting {
-                        cancel_bind = Some(KeySlot::AimWake);
-                    } else {
-                        aim.wake_key = KeySet::new();
-                        undo_needed = true;
+                        )
+                        .clicked()
+                    {
+                        pick_wake_key = true;
                     }
-                }
-                ui.label("强制重连热键:");
-                let rk = aim.reconnect_key;
-                let waiting = self.waiting_keys == Some(KeySlot::AimReconnect);
-                if Self::keys_button(ui, waiting, &rk)
-                    .on_hover_text(
-                        "「唤醒视角」无效时再按这个:等同诊断面板里的[强制重连控制通道],\
+                    if (waiting || !wk.is_empty()) && Self::cancel_bind_button(ui, waiting) {
+                        if waiting {
+                            cancel_bind = Some(KeySlot::AimWake);
+                        } else {
+                            aim.wake_key = KeySet::new();
+                            undo_needed = true;
+                        }
+                    }
+                    ui.label("强制重连热键:");
+                    let rk = aim.reconnect_key;
+                    let waiting = self.waiting_keys == Some(KeySlot::AimReconnect);
+                    if Self::keys_button(ui, waiting, &rk)
+                        .on_hover_text(
+                            "「唤醒视角」无效时再按这个:等同诊断面板里的[强制重连控制通道],\
                          \n只重启我们自己的控制通道,不动 scrcpy 投屏。\
                          \n卡住时按一下,不必退出 FPS;连不上时不会打断已有连接。默认未绑定。",
-                    )
-                    .clicked()
-                {
-                    pick_reconnect_key = true;
-                }
-                if (waiting || !rk.is_empty()) && Self::cancel_bind_button(ui, waiting) {
-                    if waiting {
-                        cancel_bind = Some(KeySlot::AimReconnect);
-                    } else {
-                        aim.reconnect_key = KeySet::new();
-                        undo_needed = true;
+                        )
+                        .clicked()
+                    {
+                        pick_reconnect_key = true;
                     }
-                }
-            });
-            ui.small(
-                "两个自救键默认都未绑定(不动默认手感):卡住时先按[唤醒视角],\
+                    if (waiting || !rk.is_empty()) && Self::cancel_bind_button(ui, waiting) {
+                        if waiting {
+                            cancel_bind = Some(KeySlot::AimReconnect);
+                        } else {
+                            aim.reconnect_key = KeySet::new();
+                            undo_needed = true;
+                        }
+                    }
+                });
+                ui.small(
+                    "两个自救键默认都未绑定(不动默认手感):卡住时先按[唤醒视角],\
                  若无效再按[强制重连]。两者都只认物理按键的按下,不受鼠标隔膜影响。",
-            );
-            {
-                // 状态行:与左栏共用同一份文案(原因 + 怎么关掉它)。
-                // 入参全取标量(`g` 此刻已被 `aim` 可变借走,整份借 `g` 编译不过;
-                // 而且 `lock_shared` 也不可重入)。
-                let scrcpy_foreground = self.scrcpy_is_foreground();
-                let fps_active = aim.enabled
-                    && recoil_live.mode_active
-                    && !recoil_live.suspended
-                    && aim.anchor_set();
-                let (on, why) = Self::shield_on_and_reason(
-                    aim.mouse_shield,
-                    mapping_enabled,
-                    connected,
-                    fps_active,
-                    scrcpy_foreground,
-                    recoil_live.shield_manual,
                 );
-                let line = Self::shield_status_line(aim.shield_key, on, why);
-                let color = if on { th.warn } else { th.muted };
-                ui.colored_label(color, egui::RichText::new(line).small())
-                    .on_hover_text(
-                        "「仅投屏窗口在前台」的判据:前台窗口的进程 pid == 我们启动的\n\
+                {
+                    // 状态行:与左栏共用同一份文案(原因 + 怎么关掉它)。
+                    // 入参全取标量(`g` 此刻已被 `aim` 可变借走,整份借 `g` 编译不过;
+                    // 而且 `lock_shared` 也不可重入)。
+                    let scrcpy_foreground = aim_scrcpy_foreground;
+                    let fps_active = aim.enabled
+                        && recoil_live.mode_active
+                        && !recoil_live.suspended
+                        && aim.anchor_set();
+                    let (on, why) = Self::shield_on_and_reason(
+                        aim.mouse_shield,
+                        mapping_enabled,
+                        connected,
+                        fps_active,
+                        scrcpy_foreground,
+                        recoil_live.shield_manual,
+                    );
+                    let line = Self::shield_status_line(aim.shield_key, on, why);
+                    let color = if on { th.warn } else { th.muted };
+                    ui.colored_label(color, egui::RichText::new(line).small())
+                        .on_hover_text(
+                            "「仅投屏窗口在前台」的判据:前台窗口的进程 pid == 我们启动的\n\
                          scrcpy 子进程 pid(拿不到 pid 时保守地不独占)。\n\
                          隔膜本身是运行时可切换的:翻转下一帧即生效,不需要重启 scrcpy。",
-                    );
-            }
+                        );
+                }
 
-            // ---- 分组:指针消隐(运行时状态行紧跟在它下面,属于同一块的说明) ----
-            ui.separator();
-            if ui
-                .checkbox(&mut aim.capture_mouse, "指针消隐(FPS 模式下隐藏系统光标)")
-                .changed()
-            {
-                undo_needed = true;
-            }
-            if captured {
-                ui.colored_label(th.ok, "当前: 鼠标已捕获,视角跟随鼠标");
-            } else {
-                ui.label("当前: 鼠标未被捕获");
-            }
-            ui.small(
+                // ---- 分组:指针消隐(运行时状态行紧跟在它下面,属于同一块的说明) ----
+                ui.separator();
+                if ui
+                    .checkbox(&mut aim.capture_mouse, "指针消隐(FPS 模式下隐藏系统光标)")
+                    .changed()
+                {
+                    undo_needed = true;
+                }
+                if captured {
+                    ui.colored_label(th.ok, "当前: 鼠标已捕获,视角跟随鼠标");
+                } else {
+                    ui.label("当前: 鼠标未被捕获");
+                }
+                ui.small(
                 "捕获跟随 FPS 模式:进入 FPS 即捕获并消隐,用[FPS 模式开关键]或[按住才退出]键离开。",
             );
+            });
         }
 
         // 锁外发日志:锁内只能把字符串攒进 `preset_log`(见它的声明处)。
@@ -19622,24 +19756,30 @@ fn look_cache_path() -> PathBuf {
     config_dir().join("look.json")
 }
 
-/// 读取外观缓存;不存在或内容损坏时返回 (None, 提示),调用方退回配置里的外观。
+/// 读取外观缓存;不存在或内容损坏时返回 (None, None, 提示),调用方退回配置里的外观。
 ///
-/// 返回值第二项是**要上屏的提示**:读取失败的分级处理见
+/// 第二项是**老版本残留的背景图三件套**(见 [`LegacyLookBg`] 与
+/// [`migrate_background`]);正常情况是 None。
+///
+/// 第三项是**要上屏的提示**:读取失败的分级处理见
 /// [`read_config_text_graded`] —— "文件不存在"是正常的,不该打扰用户;
 /// "读不动/解析不了"必须让用户看到,否则只会觉得"我调好的外观自己变了"。
-fn load_look_cache() -> (Option<theme::Look>, Vec<String>) {
+fn load_look_cache() -> (Option<theme::Look>, Option<LegacyLookBg>, Vec<String>) {
     let path = look_cache_path();
     let mut notes = Vec::new();
     let text = match read_config_text_graded(&path) {
         Ok(Some(t)) => t,
-        Ok(None) => return (None, notes),
+        Ok(None) => return (None, None, notes),
         Err(e) => {
             notes.push(format!("{e},本次改回配置里保存的外观"));
-            return (None, notes);
+            return (None, None, notes);
         }
     };
+    // 背景图三件套已从 Look 搬走(2026-10-26 第 1 条):顺手从同一份文本里
+    // 只读捞出老字段,交给启动链做一次性迁移。解析失败不算错(老/新文件都可能)。
+    let legacy = serde_json::from_str::<LegacyLookBg>(&text).ok();
     match serde_json::from_str::<theme::Look>(&text) {
-        Ok(l) => (Some(l), notes),
+        Ok(l) => (Some(l), legacy, notes),
         Err(e) => {
             let mut msg = format!("{} 解析失败({e}),本次改回配置里保存的外观", path.display());
             match backup_broken_config(&path) {
@@ -19648,8 +19788,90 @@ fn load_look_cache() -> (Option<theme::Look>, Vec<String>) {
             }
             crate::diag_error!("look", "{msg}");
             notes.push(msg);
-            (None, notes)
+            (None, legacy, notes)
         }
+    }
+}
+
+/// 老版本把背景图存在外观(Look)里的"三件套"。这个结构只用来**只读**把老配置里的
+/// 那三个字段捞出来 —— 2026-10-26 第 1 条已把它们搬到程序级 Settings(settings.json),
+/// 于是 theme::Look 里不再有这些字段,直接 from_str::<Look> 拿不到(serde 默认忽略未知字段)。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct LegacyLookBg {
+    #[serde(default)]
+    bg_path: String,
+    #[serde(default)]
+    bg_fit: theme::BgFit,
+    #[serde(default = "legacy_default_bg_dim")]
+    bg_dim: u8,
+}
+
+/// 与老 theme::Look 里 default_bg_dim 同一个数(120):迁移时若老文件没写这一项,
+/// 按老版本的默认值接着用,用户的观感不跳变。
+fn legacy_default_bg_dim() -> u8 {
+    120
+}
+
+impl LegacyLookBg {
+    fn as_tuple(&self) -> (String, theme::BgFit, u8) {
+        (self.bg_path.clone(), self.bg_fit, self.bg_dim)
+    }
+}
+
+/// profile.yaml 的只读视图:只关心每个 scheme 的 look.bg_*(迁移用)。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct LegacyDocBg {
+    #[serde(default)]
+    schemes: Vec<LegacySchemeBg>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct LegacySchemeBg {
+    #[serde(default)]
+    look: LegacyLookBg,
+}
+
+/// 从老 profile.yaml 里按文件顺序捞出各 scheme 的背景图三件套。
+///
+/// best-effort:读不到/解析不了都返回空。迁移的本意是"顺手把用户已经选过的图
+/// 接着用",所以它绝不该弹提示、更不该备份或改写用户的配置文件。
+fn legacy_profile_bgs(path: &Path) -> Vec<LegacyLookBg> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    match serde_norway::from_str::<LegacyDocBg>(&text) {
+        Ok(d) => d.schemes.into_iter().map(|s| s.look).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 决定启动时用哪张背景图(2026-10-26 第 1 条的一次性迁移)。
+///
+/// 用户原话:「如果当前图片位置为假的,那么就自动在配置文件里找第一个图片路径
+/// 为显示的图片」。落成优先顺序:
+///   1. settings.json 里已经有非空路径 => 原样用(迁移只发生一次)
+///   2. 老 look.json 的 bg_path(它是"程序自用"缓存,最接近用户最后看到的样子)
+///   3. profile.yaml 各 scheme 按文件顺序
+/// 前三者里**先挑文件真的存在**的;都不存在则取第一个非空的(保住用户的记忆,
+/// 界面上会显示文件名,用户能看见路径失效并重新选图);全空 => 空。
+fn migrate_background(
+    saved: &Settings,
+    legacy_look: Option<&LegacyLookBg>,
+    legacy_profile: &[LegacyLookBg],
+) -> (String, theme::BgFit, u8) {
+    if !saved.bg_path.trim().is_empty() {
+        return (saved.bg_path.clone(), saved.bg_fit, saved.bg_dim);
+    }
+    let mut candidates: Vec<(String, theme::BgFit, u8)> = Vec::new();
+    if let Some(l) = legacy_look {
+        candidates.push(l.as_tuple());
+    }
+    for l in legacy_profile {
+        candidates.push(l.as_tuple());
+    }
+    match crate::settings::pick_bg(&candidates, |p| Path::new(p).exists()) {
+        Some(t) => t,
+        None => (String::new(), theme::BgFit::default(), saved.bg_dim),
     }
 }
 
@@ -20368,6 +20590,53 @@ impl PadApp {
         }
     }
 
+    /// 折叠区里的**逐点坐标明细**(用户 2026-10-26 第 4 条:录制相关内容太大)。
+    ///
+    /// # 为什么只列首尾各一段
+    ///
+    /// 轨迹上限是 [`crate::keymap::TRACK_MAX_POINTS`](2000 点):整份罗列时一张
+    /// 卡片能铺满好几屏,折叠本身也就失去意义。这里固定"前 12 + 省略 + 后 12",
+    /// 起手与收尾的走向照样看得见,卡片却不会被撑开 —— 精确的逐点数值本来
+    /// 也不属于"扫一眼"的信息。
+    ///
+    /// 口径:[`pixel`] 为真时按像素取整显示(录制中的会话缓冲就是像素坐标);
+    /// 为假时按相对坐标(0~1)保留三位小数 —— 与配置里存下来的口径一致。
+    fn track_points_detail(ui: &mut egui::Ui, pts: &[(f32, f32)], pixel: bool) {
+        // 每段最多列几个点(前一段 + 后一段)
+        const SHOW: usize = 12;
+        let n = pts.len();
+        if n == 0 {
+            ui.small("(还没有点)");
+            return;
+        }
+        let text = |i: usize| -> String {
+            let (x, y) = pts[i];
+            if pixel {
+                format!("#{} ({x:.0}, {y:.0})", i + 1)
+            } else {
+                format!("#{} ({x:.3}, {y:.3})", i + 1)
+            }
+        };
+        let (head, tail_from) = if n <= SHOW * 2 {
+            (n, n)
+        } else {
+            (SHOW, n - SHOW)
+        };
+        ui.horizontal_wrapped(|ui| {
+            for i in 0..head {
+                ui.small(text(i));
+            }
+        });
+        if tail_from > head {
+            ui.small(format!("……中间省略 {} 点……", tail_from - head));
+            ui.horizontal_wrapped(|ui| {
+                for i in tail_from..n {
+                    ui.small(text(i));
+                }
+            });
+        }
+    }
+
     /// 轨迹录制的**卡片 UI**(用户 2026-10-13,V2-3):四个入口(新增草稿、已有键位、
     /// 已有组合键)共用这一份,于是"录制"这件事在界面上处处一致,不会这里一套那里一套。
     ///
@@ -20430,9 +20699,6 @@ impl PadApp {
                             self.cancel_track_recording();
                         }
                     });
-                    ui.small(
-                        "在截图浮层上划出路径(可绕圈/折返/S 形);红色轨迹与 REC 角标即实时预览",
-                    );
                 } else if stored >= 2 {
                     // ---------- 已有轨迹 ----------
                     // Mapper 只取一次:循环里反复 `self.mapper()` 会反复加配置锁
@@ -20460,7 +20726,6 @@ impl PadApp {
                             self.clear_track(target);
                         }
                     });
-                    ui.small("这条滑动按真实轨迹走(优先于起点/终点与曲线)");
                 } else {
                     // ---------- 还没有轨迹 ----------
                     ui.horizontal(|ui| {
@@ -20478,6 +20743,46 @@ impl PadApp {
                         ui.small("未录制(当前走起点→终点 + 曲线)");
                     });
                 }
+                // ---- 折叠区(用户 2026-10-26 第 4 条:录制相关内容太大) ----
+                //
+                // 只把**说明与逐点明细**收进来:上面那行状态 + 按钮是每次都要
+                // 用的,永远常显。折叠头默认收起,于是这张卡片默认只占一行多一点。
+                //
+                // id 必须带**目标**:同一屏里可能同时有好几张卡片(多条滑动键位),
+                // 凭标题文字自动生成的 id 会让"点开第 1 张"变成"所有卡片一起展开"。
+                egui::CollapsingHeader::new("轨迹明细与说明")
+                    .id_salt(("trackrec_fold", target))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        if recording {
+                            ui.small(
+                                "在截图浮层上划出路径(可绕圈/折返/S 形);红色轨迹与 REC 角标即实时预览",
+                            );
+                            if let Some(rec) = self.track_rec.as_ref() {
+                                let pts: Vec<(f32, f32)> = rec
+                                    .points
+                                    .iter()
+                                    .map(|&(x, y)| (x as f32, y as f32))
+                                    .collect();
+                                ui.small(format!(
+                                    "实时点(像素坐标,与浮层同一口径):共 {} 点",
+                                    pts.len()
+                                ));
+                                Self::track_points_detail(ui, &pts, true);
+                            }
+                        } else if stored >= 2 {
+                            ui.small("这条滑动按真实轨迹走(优先于起点/终点与曲线)");
+                            ui.small(format!(
+                                "逐点坐标明细(相对坐标 0~1,换分辨率/换设备后不变):共 {stored} 点"
+                            ));
+                            Self::track_points_detail(ui, &s.recorded_points, false);
+                        } else {
+                            ui.small(
+                                "录制后这条滑动按真实轨迹走(可表达绕圈/折返/S 形);清除轨迹即\
+                                 回到『起点→终点 + 曲线』。",
+                            );
+                        }
+                    });
             });
         // 触发配置区(用户 2026-10-14):附在卡片**下方**,四条入口自动都有。
         //
@@ -22457,6 +22762,180 @@ mod tests {
             remembered_profile_path(&s),
             Some(PathBuf::from("/tmp/我的.yaml")),
             "手改过的 settings.json 允许带空白,必须去掉再用"
+        );
+    }
+    /// 2026-10-26 第 1 条:老版本把背景图存在外观(Look)里,搬到程序级 Settings 时
+    /// 必须能把老文件里的三件套捞回来。
+    ///
+    /// 这条钉的是"只读视图"本身:那些 bg_* 已不是 Look 的字段,serde 会**静默忽略**
+    /// 未知字段 —— 不另建 LegacyLookBg 就永远捞不回来,而且一点错都不会报。
+    #[test]
+    fn legacy_look_bg_is_readable_from_old_look_json() {
+        let text = r#"{"preset":"Nord","bg_path":"D:/pics/x.png","bg_fit":"Tile","bg_dim":200}"#;
+        let legacy: LegacyLookBg = serde_json::from_str(text).expect("老 look.json 必须能解析");
+        assert_eq!(
+            legacy.as_tuple(),
+            ("D:/pics/x.png".to_string(), theme::BgFit::Tile, 200)
+        );
+        // 老文件里压根没设过背景图:按老版本的默认值(不压暗?)不 —— 老默认压暗 120、
+        // 铺满(裁切),迁移后观感必须一样,所以缺省值要与老 Look 一致。
+        let bare: LegacyLookBg = serde_json::from_str(r#"{"preset":"Nord"}"#).unwrap();
+        assert_eq!(bare.as_tuple(), (String::new(), theme::BgFit::Cover, 120));
+    }
+
+    /// 老 profile.yaml 里每套方案都带一份 look.bg_*:迁移要按**文件顺序**收集,
+    /// 并且"读不到/解析不了"必须静默为空(迁移是顺手捡回用户的图,不该弹提示、
+    /// 更不该备份或改写用户的配置文件)。
+    #[test]
+    fn legacy_profile_bgs_collects_schemes_in_order() {
+        let dir = std::env::temp_dir().join(format!("scrcpy-pad-legacybg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("profile.yaml");
+        std::fs::write(
+            &path,
+            "active: 0\nschemes:\n  - name: A\n    look:\n      bg_path: /tmp/a.png\n      bg_fit: Contain\n      bg_dim: 30\n  - name: B\n    look:\n      bg_path: /tmp/b.png\n",
+        )
+        .unwrap();
+        let got = legacy_profile_bgs(&path);
+        assert_eq!(got.len(), 2, "每套方案都要收进来");
+        assert_eq!(
+            got[0].as_tuple(),
+            ("/tmp/a.png".to_string(), theme::BgFit::Contain, 30)
+        );
+        assert_eq!(
+            got[1].as_tuple(),
+            ("/tmp/b.png".to_string(), theme::BgFit::Cover, 120),
+            "老 YAML 没写 bg_fit/bg_dim 时按老默认值"
+        );
+        assert!(
+            legacy_profile_bgs(&dir.join("没有这个.yaml")).is_empty(),
+            "读不到就是空,不能报错"
+        );
+        std::fs::write(&path, "这不是: [合法 yaml").unwrap();
+        assert!(
+            legacy_profile_bgs(&path).is_empty(),
+            "解析不了也只能是空:迁移不许因为老文件坏掉就打扰用户"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 迁移规则(用户 2026-10-26 第 1 条原话:「如果当前图片位置为假的,那么就自动在
+    /// 配置文件里找第一个图片路径为显示的图片」):
+    ///  ① settings.json 里已经有值 => 原样用,一眼都不看老配置(迁移只做一次)
+    ///  ② 否则先挑**文件真的存在**的(老 look.json 优先,再按 profile.yaml 方案顺序)
+    #[test]
+    fn migrate_background_prefers_a_file_that_exists() {
+        let dir = std::env::temp_dir().join(format!("scrcpy-pad-bgmig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.png");
+        std::fs::write(&real, b"x").unwrap();
+        let real_s = real.display().to_string();
+        let missing_s = dir.join("missing.png").display().to_string();
+
+        let legacy_look = LegacyLookBg {
+            bg_path: missing_s.clone(),
+            bg_fit: theme::BgFit::Tile,
+            bg_dim: 10,
+        };
+        let legacy_profile = vec![LegacyLookBg {
+            bg_path: real_s.clone(),
+            bg_fit: theme::BgFit::Contain,
+            bg_dim: 20,
+        }];
+
+        // ① settings.json 已有值:优先且原样
+        let saved = Settings {
+            bg_path: "/tmp/已保存.png".into(),
+            bg_fit: theme::BgFit::Tile,
+            bg_dim: 77,
+            ..Settings::default()
+        };
+        assert_eq!(
+            migrate_background(&saved, Some(&legacy_look), &legacy_profile),
+            ("/tmp/已保存.png".to_string(), theme::BgFit::Tile, 77),
+            "已经有值就不该被老配置覆盖"
+        );
+
+        // ② 没有值:跳过"路径是假的"那条,选文件真的存在的
+        let saved = Settings::default();
+        assert_eq!(
+            migrate_background(&saved, Some(&legacy_look), &legacy_profile),
+            (real_s, theme::BgFit::Contain, 20),
+            "前一条路径是假的,必须挑后面那个真的能显示的"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 迁移的退路:一个都不存在时**保住用户填过的路径**(界面上看得见文件名,
+    /// 用户能自己发现路径失效并重选);全都空才真的是空。
+    #[test]
+    fn migrate_background_keeps_first_nonempty_when_nothing_exists() {
+        let missing1 = "/绝对不存在的目录/a.png".to_string();
+        let missing2 = "/绝对不存在的目录/b.png".to_string();
+        let legacy_look = LegacyLookBg {
+            bg_path: String::new(),
+            bg_fit: theme::BgFit::Tile,
+            bg_dim: 10,
+        };
+        let legacy_profile = vec![
+            LegacyLookBg {
+                bg_path: missing1.clone(),
+                bg_fit: theme::BgFit::Contain,
+                bg_dim: 20,
+            },
+            LegacyLookBg {
+                bg_path: missing2,
+                bg_fit: theme::BgFit::Tile,
+                bg_dim: 30,
+            },
+        ];
+        let saved = Settings {
+            bg_dim: 99,
+            ..Settings::default()
+        };
+        assert_eq!(
+            migrate_background(&saved, Some(&legacy_look), &legacy_profile),
+            (missing1, theme::BgFit::Contain, 20),
+            "都不存在时取第一个非空的(保住记忆)"
+        );
+        // 全空:留空路径,但压暗值沿用 settings.json 里的
+        let empty_look = LegacyLookBg::default();
+        assert_eq!(
+            migrate_background(&saved, Some(&empty_look), &[]),
+            (String::new(), theme::BgFit::Cover, 99)
+        );
+    }
+
+    /// 用户症状「只有第一个组合继承默认设置的图片,导入后连图片都会变」(2026-10-26
+    /// 第 1 条)的结构性保证:背景图**不在**随方案走的 Look 里,而在程序级
+    /// Settings 里 —— 换方案的代码是把整份 profile 换掉,因此它不可能换掉背景图。
+    /// 反过来,老版本写出去的 look.json 也不该再出现 bg_ 键(否则下次启动又会被
+    /// 老值覆盖回去)。
+    #[test]
+    fn background_lives_in_settings_not_in_look() {
+        let look_json = serde_json::to_string(&theme::Look::default()).unwrap();
+        assert!(
+            !look_json.contains("bg_"),
+            "Look 不该再序列化背景图(会随方案切换): {look_json}"
+        );
+        let d = Settings::default();
+        assert_eq!(
+            (d.bg_path.clone(), d.bg_fit, d.bg_dim),
+            (String::new(), theme::BgFit::Cover, 120)
+        );
+        let s = Settings {
+            bg_path: "/tmp/x.png".into(),
+            bg_fit: theme::BgFit::Tile,
+            bg_dim: 42,
+            ..Settings::default()
+        };
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(
+            (back.bg_path, back.bg_fit, back.bg_dim),
+            ("/tmp/x.png".to_string(), theme::BgFit::Tile, 42),
+            "背景图三件套必须能从 settings.json 原样读回"
         );
     }
 
@@ -25189,6 +25668,357 @@ mod tests {
         assert!(
             !probe_bad.contains("码 {}"),
             "阳性对照失效:不带码的写法居然通过"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 折叠守护(用户 2026-10-26 第 4 条:录制相关内容与组合键成员都太大)
+    // ------------------------------------------------------------------
+
+    /// 从函数体里逐行切出所有折叠头语句:CollapsingHeader::new(...) 起,
+    /// 到含 .show( 的那一行止,返回 (语句首行的行下标, 语句全文)。
+    ///
+    /// 为什么逐行(AGENTS §3.2):fmt 会重排多行链,任何带缩进/换行的转义串模式
+    /// 都可能整条失配;这里只依赖"这几个词出现在某一行",与缩进无关。
+    fn fold_statements(body: &str) -> Vec<(usize, String)> {
+        let lines: Vec<&str> = body.lines().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            if !lines[i].contains("CollapsingHeader::new(") {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            let mut stmt = String::new();
+            let mut closed = false;
+            while i < lines.len() {
+                let l = lines[i];
+                stmt.push_str(l);
+                stmt.push('\n');
+                i += 1;
+                if l.contains(".show(") {
+                    closed = true;
+                    break;
+                }
+            }
+            assert!(
+                closed,
+                "第 {} 行起的折叠头没有 .show( —— 扫描口径过期(不许静默退化)",
+                start + 1
+            );
+            out.push((start, stmt));
+        }
+        out
+    }
+
+    /// 折叠头是否显式写了 default_open(false)(同一行判定,不吃缩进)。
+    fn fold_is_closed(stmt: &str) -> bool {
+        stmt.lines().any(|l| l.contains(".default_open(false)"))
+    }
+
+    /// 折叠头是否用显式 id_salt;给出 parts 时还要求这些字面片段都在那一行上。
+    fn fold_salt_has(stmt: &str, parts: &[&str]) -> bool {
+        match stmt
+            .lines()
+            .find(|l| l.trim_start().starts_with(".id_salt(("))
+        {
+            Some(l) => parts.iter().all(|p| l.contains(*p)),
+            None => false,
+        }
+    }
+
+    /// 函数体里第 line_idx 行行首的字节偏移 —— 用来判"常显项在折叠头之前"。
+    fn line_offset(body: &str, line_idx: usize) -> usize {
+        body.lines().take(line_idx).map(|l| l.len() + 1).sum()
+    }
+
+    /// 从 start 起取最多 max_len 个字节的切片;**结束边界**落在多字节字符中间时向前回退。
+    ///
+    /// 2026-10-26 事故:只对起点做了 is_char_boundary,终点直接切 ⇒
+    /// `end byte index 13445 is not a char boundary; it is inside '重'` 让守护测试自己 panic。
+    /// 中文源码里"多取几百字节"必然落在字符中间,起点和终点都得回退。
+    fn slice_within(s: &str, start: usize, max_len: usize) -> &str {
+        let mut end = (start + max_len).min(s.len());
+        while end > start && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[start..end]
+    }
+
+    /// 守护:两处折叠区必须默认收起、用稳定 id,且常显区不许被折进去。
+    ///
+    /// 扫描口径(§3.2 的历史事故:src.contains 被测试自己的期望字符串满足):
+    /// 先切生产代码(mod tests 之前),再切函数体,最后逐行切折叠头语句 ——
+    /// 测试自己源码里的那些字面串永远进不了扫描范围。
+    #[test]
+    fn fold_sections_default_to_closed() {
+        let src = include_str!("app.rs");
+        let prod = &src[..src.find("mod tests {").expect("mod tests 边界")];
+
+        // ---------- ① 轨迹录制卡片 ----------
+        let card = fn_body(prod, "fn track_rec_card(");
+        let folds = fold_statements(card);
+        assert_eq!(
+            folds.len(),
+            1,
+            "轨迹录制卡片应只有 1 处折叠头,实际 {}",
+            folds.len()
+        );
+        let (fold_line, stmt) = &folds[0];
+        assert!(
+            fold_is_closed(stmt),
+            "轨迹明细折叠头必须 default_open(false): {stmt}"
+        );
+        assert!(
+            fold_salt_has(stmt, &["\"trackrec_fold\"", "target"]),
+            "轨迹明细折叠头必须用 (trackrec_fold, target) 做稳定 id;自动 id 会让同屏几张卡片一起展开: {stmt}"
+        );
+        // 常显项:状态与按钮必须在折叠头之前(折进去就再也点不到了)
+        let fold_at = line_offset(card, *fold_line);
+        for keep in [
+            "■ 结束并保存",
+            "已录轨迹:",
+            "重录",
+            "清除轨迹",
+            "● 录制轨迹",
+        ] {
+            let at = card
+                .find(keep)
+                .unwrap_or_else(|| panic!("常显项 {keep} 不见了"));
+            assert!(at < fold_at, "{keep} 被折进折叠区了 —— 它必须常显在卡片上");
+        }
+        // 收起项:逐点明细与长说明只许出现在折叠头之后
+        for hidden in ["逐点坐标明细", "实时点(像素坐标"] {
+            let at = card
+                .find(hidden)
+                .unwrap_or_else(|| panic!("折叠区里找不到 {hidden}"));
+            assert!(at > fold_at, "{hidden} 跑到了折叠头外面 —— 它该在折叠区里");
+        }
+
+        // ---------- ② 组合键页:一层折叠,编辑器直接住在卡片体里 ----------
+        let page = fn_body(prod, "fn ui_combos(");
+        assert_eq!(
+            page.matches("CollapsingState::load_with_default_open(")
+                .count(),
+            1,
+            "组合键页每套组合只允许一处折叠头(卡片自身)"
+        );
+        // 用户 2026-10-26 第 4 条第二次的硬要求:折叠里不许再有第二层折叠,
+        // 参数编辑器必须直接可见。所以"整个函数里出现任何 CollapsingHeader"都算不合格。
+        assert!(
+            !page.contains("CollapsingHeader::new("),
+            "组合键页不许再套内层折叠 —— 参数编辑器必须直接住在卡片体里"
+        );
+        let head_at = page
+            .find("CollapsingState::load_with_default_open(")
+            .expect("整卡折叠头不见了");
+        // 窗口要往前带 160 字节:稳定 id 是在折叠头**上一行**(make_persistent_id)给的。
+        // 往回退必须退到 UTF-8 字符边界,否则切片直接 panic(中文注释每字 3 字节)。
+        let mut head_lo = head_at.saturating_sub(160);
+        while !page.is_char_boundary(head_lo) {
+            head_lo -= 1;
+        }
+        let head = slice_within(page, head_lo, head_at + 220 - head_lo);
+        // 空白折掉再比:源码里 `false,` 与 `"combo_card"` 都被换行/缩进拆开,
+        // 逐字比原文会永远失配(那正是 §3.2 那类假判据)。
+        let head_flat: String = head.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            head_flat.contains("\"combo_card\""),
+            "折叠头必须用 (combo_card, index) 做稳定 id: {head}"
+        );
+        assert!(
+            head_flat.contains("index"),
+            "折叠 id 必须带 index,否则点开一套会把别的组合一起展开: {head}"
+        );
+        assert!(
+            head_flat.contains(",false,"),
+            "卡片必须默认收起(load_with_default_open 的第三个参数 false): {head}"
+        );
+        let body_at = page.find(".body(|ui|").expect("卡片体不见了");
+        // 常显项:概览与组级按钮留在折叠头那一行(收起也能删/加)。
+        // 判据只认**代码里的字面量**(带 small_button/format/if 前缀):
+        // 第一版拿裸词 "个键" 去 find,结果被上一行注释里的"一个键 62px"满足 ——
+        // 变异 M-D 照样全绿,正是 §3.2 那类假判据。
+        for keep in [
+            "small_button(\"删除组合\")",
+            "small_button(\"＋ 新增成员\")",
+            "format!(\"{} 个键\"",
+            "\"已启用\" } else { \"已停用\"",
+        ] {
+            let at = page
+                .find(keep)
+                .unwrap_or_else(|| panic!("常显项 {keep} 不见了"));
+            assert!(at < body_at, "{keep} 必须留在折叠头(常显),不许进卡片体");
+        }
+        // 卡片体:成员格与动作编辑器 —— 在一层折叠之内、不许再包一层
+        for editor in [
+            "begin_combo_member_capture(",
+            "key_button_sized(ui, waiting, shown, 62.0)",
+            "combo_action_editor(",
+        ] {
+            let at = page
+                .find(editor)
+                .unwrap_or_else(|| panic!("卡片体里找不到 {editor}"));
+            assert!(
+                at > body_at,
+                "{editor} 必须直接住在卡片体里(折叠头之后),不许再套第二层折叠"
+            );
+        }
+
+        // ---------- ③ 轮盘映射页:一层折叠,编辑器直接住在卡片体里 ----------
+        let page = fn_body(prod, "fn ui_wheels(");
+        assert_eq!(
+            page.matches("CollapsingState::load_with_default_open(")
+                .count(),
+            1,
+            "轮盘页每套轮盘只允许一处折叠头(卡片自身)"
+        );
+        assert!(
+            !page.contains("CollapsingHeader::new("),
+            "轮盘页不许再有第二层折叠 —— 参数编辑器必须直接住在卡片体里"
+        );
+        let head_at = page
+            .find("CollapsingState::load_with_default_open(")
+            .expect("轮盘卡片折叠头不见了");
+        let mut head_lo = head_at.saturating_sub(160);
+        while !page.is_char_boundary(head_lo) {
+            head_lo -= 1;
+        }
+        let head = slice_within(page, head_lo, head_at + 220 - head_lo);
+        let head_flat: String = head.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            head_flat.contains("\"wheel_card\",i"),
+            "轮盘折叠头必须用 (wheel_card, i) 做稳定 id: {head}"
+        );
+        assert!(
+            head_flat.contains(",false,"),
+            "轮盘卡片必须默认收起(load_with_default_open 的第三个参数 false): {head}"
+        );
+        let body_at = page.find(".body(|ui|").expect("轮盘卡片体不见了");
+        // 判据只用代码字面量(带 format!/ui.small/small_button 前缀),不用裸词 ——
+        // 裸词会被注释满足,本项目踩过「一个键 62px」被注释命中的假绿。
+        for keep in [
+            "\"轮盘{}{}\"",
+            "ui.small(old_kind.label())",
+            "ui.small(old_mode.label())",
+            "small_button(\"删除\")",
+        ] {
+            let at = page
+                .find(keep)
+                .unwrap_or_else(|| panic!("轮盘折叠头常显项 {keep} 不见了"));
+            assert!(at < body_at, "{keep} 必须留在折叠头(常显),不许进卡片体");
+        }
+        // 页面上只允许折叠头上那一个删除按钮;卡片体里再放一个就是二层折叠的旧样子
+        assert_eq!(
+            page.matches("small_button(\"删除\")").count(),
+            1,
+            "轮盘页只允许折叠头上那一个删除按钮"
+        );
+        // 编辑器:种类/模式下拉、方向绑定与取点、半径/影响范围 —— 全部住在卡片体里
+        for editor in [
+            "egui::ComboBox::from_id_salt((\"wheel_kind\", i))",
+            "egui::ComboBox::from_id_salt((\"wheel_mode\", i))",
+            "radius_input(ui, &mut pr, RADIUS_RANGE_WHEEL_PX, None)",
+            "self.begin_keys_capture(KeySlot::WheelDir { wheel: i, dir: d })",
+            "self.begin_pick(CoordSlot::WheelCenter(i))",
+            "DragValue::new(&mut w.execute_duration_ms)",
+        ] {
+            let at = page
+                .find(editor)
+                .unwrap_or_else(|| panic!("轮盘卡片体里找不到 {editor}"));
+            assert!(at > body_at, "{editor} 必须直接住在卡片体里(折叠头之后)");
+        }
+
+        // ---------- ④ FPS 功能页:4 张一层折叠卡,编辑器直接住在卡体里 ----------
+        let page = fn_body(prod, "fn ui_aim_body(");
+        assert_eq!(
+            page.matches("CollapsingState::load_with_default_open(")
+                .count(),
+            4,
+            "FPS 页应为 4 张折叠卡(卡片自身),不许再套内层折叠"
+        );
+        assert!(
+            !page.contains("CollapsingHeader::new("),
+            "FPS 页不许再有第二层折叠(档位表那个内层折叠已展开) —— 编辑器必须直接可见"
+        );
+        let cards = [
+            ("aim_card_input", "启用、视角输入与锚点"),
+            ("aim_card_feel", "灵敏度、归中与开关按键"),
+            ("aim_card_recoil", "压枪(后坐力)"),
+            ("aim_card_shield", "鼠标独占与自救"),
+        ];
+        // 每张卡:(卡片起点, 卡片体起点);后面判「摘要在体前 / 编辑器在体内」共用
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for (salt, summary) in cards {
+            let salt_lit = format!("\"{salt}\"");
+            let salt_at = page
+                .find(&salt_lit)
+                .unwrap_or_else(|| panic!("折叠 id {salt_lit} 不见了"));
+            let seg = slice_within(page, salt_at, 520);
+            let seg_flat: String = seg.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                seg_flat.contains(",false,"),
+                "{salt} 必须默认收起(load_with_default_open 第三个参数 false)"
+            );
+            let body_at = salt_at + seg.find(".body(|ui|").expect("卡片体不见了");
+            let summary_lit = format!("\"{summary}\"");
+            let sum_at = salt_at
+                + seg
+                    .find(&summary_lit)
+                    .unwrap_or_else(|| panic!("{salt} 的折叠头摘要「{summary}」不见了"));
+            assert!(sum_at < body_at, "{salt} 的摘要行必须在卡片体之前(常显)");
+            spans.push((salt_at, body_at));
+        }
+        // 编辑器/分组标题只许出现在**所属卡片**的 .body( 之后(一层折叠之内)
+        let owner_body = |at: usize| -> usize {
+            spans
+                .iter()
+                .rev()
+                .find(|p| p.0 < at)
+                .map(|p| p.1)
+                .unwrap_or_else(|| panic!("位置 {at} 不在任何 FPS 卡片之后"))
+        };
+        for header in [
+            "ui.heading(\"启用与视角输入\")",
+            "ui.heading(\"瞄准锚点\")",
+            "ui.heading(\"灵敏度与归中\")",
+            "ui.heading(\"FPS 开关与按键\")",
+            "ui.heading(\"压枪\")",
+            "ui.heading(\"鼠标独占与自救\")",
+        ] {
+            let at = page
+                .find(header)
+                .unwrap_or_else(|| panic!("分组标题 {header} 不见了"));
+            assert!(at > owner_body(at), "分组标题 {header} 必须住在卡片体里");
+        }
+        for editor in [
+            "egui::Slider::new(&mut aim.open_world_radius",
+            "egui::DragValue::new(&mut aim.sensitivity_x)",
+            "egui::DragValue::new(&mut aim.recoil.strengths[i])",
+            "egui::ComboBox::from_id_salt(\"aim_mouse_shield\")",
+            ".checkbox(&mut self.clip_cursor_in_aim",
+        ] {
+            let at = page
+                .find(editor)
+                .unwrap_or_else(|| panic!("卡片体里找不到 {editor}"));
+            assert!(
+                at > owner_body(at),
+                "{editor} 必须直接住在卡片体里(折叠头之后)"
+            );
+        }
+        // 阴性对照(§3.3):判据本身必须能红 —— 少 default_open(false)、
+        // 或用自动 id(只有标题文字),同一套判据都要判不合格。
+        let default_open = "egui::CollapsingHeader::new(\"x\")\n    .id_salt((\"trackrec_fold\", target))\n    .show(ui, |ui| {});";
+        assert!(
+            !fold_is_closed(default_open),
+            "阴性对照失效:没写 default_open(false) 也算收起了"
+        );
+        let auto_id =
+            "egui::CollapsingHeader::new(\"x\")\n    .default_open(false)\n    .show(ui, |ui| {});";
+        assert!(
+            !fold_salt_has(auto_id, &["\"trackrec_fold\"", "target"]),
+            "阴性对照失效:自动 id 也算稳定 id"
         );
     }
 }

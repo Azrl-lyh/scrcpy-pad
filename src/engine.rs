@@ -2055,6 +2055,19 @@ fn ledger_mismatch(
 /// 三个前提全成立才动手:总映射开着、`Aim::self_heal` 开着、当前不在
 /// "宏步进 / 绑定捕获 / 截图取点"这类界面交互里。原因取"界面的请求"优先于
 /// "账本对不上" —— 两者同时成立时,报最先发生的那个(手离开手机)。
+///
+/// **这里刻意没有"按住多久就强制抬起"的时长阈值**,理由三条:
+/// 1. 正常的长按(蓄力、拉弓、长推镜头)本来就会持续很久,按时刻一刀切会把
+///    好手势判成卡键 —— 这正是"默认开也不许毁掉正常手感"的红线;
+/// 2. 判据用**证据**而不是时长:设备端账本"0 而本地按着"或"比本地多"是
+///    真的丢了 UP 的硬证据,连续两份**新采样**成立才动手
+///    (`SELF_HEAL_LEDGER_ZERO_SAMPLES`,约 1s/份,即 ~2s 量级的观察窗);
+/// 3. 本函数只是兜底,不是主触发(AGENTS §7:设备账本不可作主触发)——
+///    真按住的指只能靠"确实对不上账"来救,不能靠计时器猜。
+///
+/// 守护测试:`self_heal_throttles_to_one_lift_per_300ms`(动作限流)、
+/// `ledger_zero_needs_two_consecutive_samples`(两份采样)、
+/// `a_long_healthy_press_is_never_lifted_by_elapsed_time`(时长不是触发条件)。
 fn self_heal_decision(
     enabled: bool,
     self_heal: bool,
@@ -10064,6 +10077,53 @@ mod tests {
         );
         assert!(!st.down, "自愈动作仍然是抬指");
         assert_eq!(st.self_heals, 1);
+    }
+
+    /// ③c:时长**不是**触发条件 —— 账本与本地一直对得上的长按,不管按多久都不许抬。
+    ///
+    /// 守护 `self_heal_decision` 里"只看三个开关 + 原因,不看时刻"这一事实:
+    /// 若有人往里面加"按住超过 N 秒就抬"的时长阈值,这个循环跑到第 60 秒时
+    /// 会返回 Some,断言立刻红 —— 而现实里那是一次正常的长按蓄力。
+    ///
+    /// 阈值口径(写在这里,方便以后查):真正的时间量级只有两处 ——
+    /// `SELF_HEAL_MIN_GAP`(300ms,两次自愈之间的最小间隔)与
+    /// `DEVICE_LEDGER_FRESH_MS`(3000ms,账本多久算过期);**"多久没抬起"本身
+    /// 没有任何阈值**,恢复只认"连续两份新账本都对不上"。
+    #[test]
+    fn a_long_healthy_press_is_never_lifted_by_elapsed_time() {
+        let ctl = ControlClient::for_test(1000, 1000);
+        let shared = shared_with_control(ctl);
+        let cfg = self_heal_cfg(true);
+        let t0 = Instant::now();
+        let mut st = AimState {
+            down: true,
+            cur: (500, 500),
+            ledger_reflects_injection: true,
+            ..AimState::default()
+        };
+        let mut live = AimLive {
+            // 账本 1 个触点、本地也是 1 个 ⇒ 对得上,没有任何对不上的证据
+            device_pointers: Some(1),
+            device_input_seen_at: Some(t0),
+            ..AimLive::default()
+        };
+        // 模拟 60 秒长按:每 1s 一份新账本,始终对得上
+        for sec in 1..=60u64 {
+            let now = t0 + Duration::from_secs(sec);
+            live.device_input_seen_at = Some(now);
+            let hit = {
+                let g = lock_shared(&shared);
+                let ctl = g.control.as_ref().unwrap();
+                self_heal_tick(ctl, true, &cfg, &mut st, &mut live, 1, now)
+            };
+            assert_eq!(
+                hit, None,
+                "第 {sec} 秒:账本对得上就不许因为\"按了很久\"抬指"
+            );
+        }
+        assert!(st.down, "长按 60 秒仍然按着:时长不是触发条件");
+        assert_eq!(st.self_heals, 0, "一次自愈都不许发生");
+        assert_eq!(st.ledger_zero_streak, 0, "账本从没对不上,streak 保持 0");
     }
 
     /// ④:300ms 限流的**动作**级测试(不管是哪条触发源,都不能比这个更密)。

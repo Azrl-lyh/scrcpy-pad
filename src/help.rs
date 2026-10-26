@@ -216,25 +216,48 @@ impl Renderer {
     }
 
     fn render(&mut self, ui: &mut Ui) {
-        for ev in Parser::new(HELP_MD) {
+        self.render_markdown(ui, HELP_MD);
+    }
+
+    /// 渲染任意 markdown 原文:生产固定传 [`HELP_MD`],测试用合成文本驱动同一套渲染
+    /// 代码(不必为了验一条渲染规则去改真实的 help.md)。
+    fn render_markdown(&mut self, ui: &mut Ui, md: &str) {
+        for ev in Parser::new(md) {
             match ev {
                 Event::Start(tag) => self.start(tag),
                 Event::End(end) => self.end(ui, end),
                 Event::Text(t) => {
-                    let f = self.fmt(false);
-                    self.job.append(&t, 0.0, f);
+                    // 代码块里的文本**不能**混进段落 job:混进去就会和前后正文挤在同一个
+                    // LayoutJob 里、用正文字体渲染,用户看到的"命令"其实是一段正文,复制
+                    // 出去也带着说明文字。先攒进 code_block,由 TagEnd::CodeBlock 单独铺一块
+                    // 等宽字体 + 底色的文本块。
+                    if let Some(buf) = self.code_block.as_mut() {
+                        buf.push_str(&t);
+                    } else {
+                        let f = self.fmt(false);
+                        self.job.append(&t, 0.0, f);
+                    }
                 }
                 Event::Code(t) => {
                     let f = self.fmt(true);
                     self.job.append(&t, 0.0, f);
                 }
                 Event::SoftBreak => {
-                    let f = self.fmt(false);
-                    self.job.append(" ", 0.0, f);
+                    if let Some(buf) = self.code_block.as_mut() {
+                        // 代码块内换行必须保留(改成空格会把多行命令粘成一行)
+                        buf.push('\n');
+                    } else {
+                        let f = self.fmt(false);
+                        self.job.append(" ", 0.0, f);
+                    }
                 }
                 Event::HardBreak => {
-                    let f = self.fmt(false);
-                    self.job.append("\n", 0.0, f);
+                    if let Some(buf) = self.code_block.as_mut() {
+                        buf.push('\n');
+                    } else {
+                        let f = self.fmt(false);
+                        self.job.append("\n", 0.0, f);
+                    }
                 }
                 Event::Rule => {
                     self.flush(ui);
@@ -536,15 +559,29 @@ mod tests {
             run(&ctx, &mut w, &mut open, &th, Vec::new());
         }
 
-        // 取最后一个章节:它离正文顶部最远,跳转效果最明显
+        // 取"索引里**当前可见**的最靠后章节":离正文顶部最远,跳转效果最明显。
+        //
+        // 两条边界都是踩过的坑:
+        //  1. 不能直接取整份文档的最后一节 —— 说明越写越长(2026-10-26 新增「Linux 上
+        //     做不到的几项」一节)后,末条索引被顶到窗口下沿乃至窗口外。ScrollArea
+        //     里的行**仍会被画出来**(内容不裁),但点击送不到,于是测试误报"没滚"。
+        //  2. 也不能只按"在 900 高的测试屏幕内"筛 —— 窗口默认高 640(见 show() 的
+        //     default_height),y>=640 的行已经在窗口外:首次修这条测试时上界写 880,
+        //     选中的那条落在 y=655 ⇒ 点击无效、正文没动,如实报红(不是假红)。
+        // 所以上界必须落在窗口内,并给下沿留余量(避免整行被半裁、中心点在裁剪矩形外):
+        const SAFE_TOP: f32 = 60.0;
+        const SAFE_BOTTOM: f32 = 520.0;
+        let texts = run(&ctx, &mut w, &mut open, &th, Vec::new());
         let sec = w
             .sections
-            .last()
-            .expect("help.md 至少应有一个标题")
-            .title
-            .clone();
-        let texts = run(&ctx, &mut w, &mut open, &th, Vec::new());
-        let idx = find_in_index(&texts, &sec).expect("索引里找不到最后一个章节");
+            .iter()
+            .rev()
+            .find_map(|s| {
+                let r = find_in_index(&texts, &s.title)?;
+                (r.center().y > SAFE_TOP && r.center().y < SAFE_BOTTOM).then(|| s.title.clone())
+            })
+            .expect("索引里应至少有一条落在可视区内的章节");
+        let idx = find_in_index(&texts, &sec).expect("索引里找不到选中的章节");
         // 视口外的文字不会被画出来,正好用来确认这一节本来在下面
         assert!(
             find_in_body(&texts, &sec).is_none(),
@@ -585,5 +622,117 @@ mod tests {
         );
         // 索引高亮(当前章节=视口最上面那一节)也得跟着走
         assert!(w.current > 1, "当前章节没有跟着跳转,仍是 {}", w.current);
+    }
+
+    /// 无窗口直接渲染一段 markdown,收集这一帧所有文本块的 (文本, 矩形, 字体族, 底色)
+    ///
+    /// 需要这个入口是因为"代码块该用等宽字体单独铺一块"这条规则得用**合成 markdown**
+    /// 才能稳定验到:真实 help.md 里那块命令在长文档的中后段,没有滚动就画不到视口里,
+    /// 测试会变成"看运气"。
+    fn run_md(
+        ctx: &egui::Context,
+        th: &Theme,
+        md: &str,
+    ) -> Vec<(String, Rect, egui::FontFamily, egui::Color32)> {
+        // 窗口第一帧只做"我要多大"的登记,尺寸要到下一帧才生效;第一帧里内容
+        // 还没拿到可用区,Label 会被判成不可见而不画。所以跑 3 帧,收最后一帧。
+        let mut texts = Vec::new();
+        for _ in 0..3 {
+            let time = ctx.input(|i| i.time) + 1.0 / 60.0;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1400.0, 900.0))),
+                time: Some(time),
+                ..Default::default()
+            };
+            ctx.begin_pass(input);
+            egui::Window::new("md_test")
+                .default_width(600.0)
+                .show(ctx, |ui| {
+                    let mut r = Renderer::new(ui, th, None, 0);
+                    r.render_markdown(ui, md);
+                });
+            let out = ctx.end_pass();
+            texts.clear();
+            for cs in &out.shapes {
+                collect_text_fmt(&cs.shape, &mut texts);
+            }
+            out.drop_without_applying_deltas();
+        }
+        texts
+    }
+
+    fn collect_text_fmt(
+        shape: &egui::Shape,
+        out: &mut Vec<(String, Rect, egui::FontFamily, egui::Color32)>,
+    ) {
+        match shape {
+            egui::Shape::Text(t) => {
+                // 取第一段的格式:本模块里一块文本内部格式一致(粗体/链接除外)
+                let sec = t.galley.job.sections.first();
+                let family = sec
+                    .map(|s| s.format.font_id.family.clone())
+                    .unwrap_or(egui::FontFamily::Proportional);
+                let bg = sec
+                    .map(|s| s.format.background)
+                    .unwrap_or(egui::Color32::TRANSPARENT);
+                out.push((
+                    t.galley.text().to_string(),
+                    t.galley.rect.translate(t.pos.to_vec2()),
+                    family,
+                    bg,
+                ));
+            }
+            egui::Shape::Vec(v) => {
+                for s in v {
+                    collect_text_fmt(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 围栏代码块必须单独铺成等宽字体的一块,不能混进正文段落。
+    ///
+    /// 回归点(2026-10-26):`Event::Text` 原先无条件 append 到段落 job,于是 help.md
+    /// 里新加的 bash 命令块被按正文字体、和前后说明文字挤在同一段里渲染 —— 用户看到的
+    /// "可复制命令"其实是一段正文。help.md 在这之前一个代码块都没有,这条路径从未
+    /// 被走过,所以一直是坏的而没人发现。
+    #[test]
+    fn fenced_code_blocks_render_separately_in_monospace() {
+        // 生产文档里必须真有代码块,否则这条测试只是自娱自乐
+        assert!(
+            HELP_MD.contains("```bash"),
+            "help.md 里没有 bash 代码块,这条测试失去意义"
+        );
+        let md =
+            "说明文字在这里。\n\n```bash\nenv -u WAYLAND_DISPLAY ./scrcpy-pad\n```\n\n后面的正文。";
+        let ctx = egui::Context::default();
+        let th = Theme::dark();
+        let texts = run_md(&ctx, &th, md);
+
+        // 阳性样本:代码块内容 → 等宽字体 + 有底色
+        let code = texts
+            .iter()
+            .find(|(t, _, _, _)| t.contains("env -u WAYLAND_DISPLAY ./scrcpy-pad"))
+            .expect("代码块内容没有被单独画出来(多半又被混进正文段落了)");
+        assert_eq!(
+            code.2,
+            egui::FontFamily::Monospace,
+            "代码块没有用等宽字体:它被当成正文排了"
+        );
+        assert_ne!(
+            code.3,
+            egui::Color32::TRANSPARENT,
+            "代码块没有底色:和正文分不开"
+        );
+
+        // 阴性对照:同一帧里的普通正文必须是正文格式 —— 证明这条判据能区分两种样本,
+        // 而不是"一律 Monospace"这种恒绿写法
+        let para = texts
+            .iter()
+            .find(|(t, _, _, _)| t.contains("说明文字在这里"))
+            .expect("正文段落没画出来");
+        assert_eq!(para.2, egui::FontFamily::Proportional);
+        assert_eq!(para.3, egui::Color32::TRANSPARENT);
     }
 }

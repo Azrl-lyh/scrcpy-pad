@@ -367,16 +367,25 @@ mod tests {
 
         // 等子进程真正拿到守卫(最多 10s;机器被别的编译/测试压满时启动会慢)。
         // 这期间本进程每次尝试都该失败。
+        // 等子进程真正拿到守卫(最多 40s)。预算为什么这么大:2026-10-26 在 WSL 上
+        // 与 Windows 侧的 cargo 同时跑,子进程(测试二进制在 /mnt/d)启动就要十几秒,
+        // 10s 预算直接判红 —— 那是机器忙,不是守卫失效。宁可慢也不误报。
         let mut detected = false;
-        for _ in 0..400 {
+        for _ in 0..1600 {
             match acquire_test_guard(&token) {
-                // 拿到了 = 子进程还没起好。这个守卫必须**当场放掉** ——
-                // 留着不但让子进程拿不到,还会把后续断言变成假阳性。
                 Ok(guard) => drop(guard),
                 Err(_) => {
                     detected = true;
                     break;
                 }
+            }
+            // 子进程要是自己已经退出,再等下去没有意义 —— 立刻带退出状态报错,
+            // 别让人去猜"是守卫坏了还是子进程根本没起来"。
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!(
+                    "等待期间子进程已退出({status}),守卫检测未完成 —— \
+                     先确认 `child_holds_guard` 这条测试自己是否通过"
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }

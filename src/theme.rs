@@ -328,15 +328,14 @@ pub struct Look {
     pub preset: Preset,
     #[serde(default)]
     pub density: Density,
-    /// 背景图路径(空=不启用)
-    #[serde(default)]
-    pub bg_path: String,
-    #[serde(default)]
-    pub bg_fit: BgFit,
-    /// 背景图上的暗化遮罩不透明度(0=不遮,保证可读性的兜底)
-    #[serde(default = "default_bg_dim")]
-    pub bg_dim: u8,
     /// 面板不透明度(255=完全不透明;有背景图时才会透出)
+    ///
+    /// 注:背景图本身(`bg_path`/`bg_fit`/`bg_dim`)**不在这个结构里**,它从 2026-10-26 起是
+    /// **程序级**设置,存在 settings.json(见 `crate::settings::Settings`)。
+    /// 原因与 `mouse_capture` 当初搬走时**完全同型**(P22 事故,见 settings.rs 那段注释):
+    /// 放在这里会跟着「按键组合」走 —— 换一套配置(导入别人的 YAML)就整体被替换,
+    /// 用户实测症状:「只有第一个组合继承默认设置的图片,导入后连图片都变成虚无缥缈的东西」。
+    /// 换键位不该换图片:背景图是这台机器的界面偏好,不是键位方案的一部分。
     #[serde(default = "default_panel_alpha")]
     pub panel_alpha: u8,
     /// 键位浮层(键位/摇杆的响应范围圈与标注)的显示亮度档位,见 [`tone_color`]。
@@ -372,23 +371,45 @@ impl MouseCaptureMode {
 
     pub fn hint(self) -> &'static str {
         match self {
-            MouseCaptureMode::Shield => {
-                "在**钩子层**吞掉鼠标消息(默认,与从前行为一致)。\n\
-                 优点:不新增窗口、不依赖投屏窗口位置。\n\
-                 缺点:本界面在独占期间也点不了(键盘不受影响)。"
-            }
-            MouseCaptureMode::Mask => {
-                "在**窗口层**挡鼠标:一块透明置顶窗贴在投屏区域上,事件落在它身上,\n\
-                 底下的投屏窗口收不到 ⇒ 双份输入从根上消失;本界面照常可点。\n\
-                 它还会把键位/轮盘/锚点画在画面上(不透明的地方只有圈和字)。\n\
-                 注意:需要能定位到投屏窗口的位置;定位不到时会**自动退回隔膜**。"
-            }
+            MouseCaptureMode::Shield => shield_hint(cfg!(windows)),
+            MouseCaptureMode::Mask => mask_hint(crate::mask::available()),
         }
     }
 
     pub const ALL: [MouseCaptureMode; 2] = [MouseCaptureMode::Shield, MouseCaptureMode::Mask];
 }
 
+/// 隔膜一档的说明文案(按「本平台**能不能真吞鼠标消息**」分叉;用户 2026-10-26 第2/3条)。
+///
+/// 为什么平台判断做成**参数**而不是在文案里内联 cfg:这段字是**给用户看的承诺**,
+/// 两个分支都必须能在同一台机器上被测到(§3.3 阳/阴对照) —— 在 Windows 上跑测试
+/// 也能验证「Linux 那句『不支持』确实存在且没被改掉」。
+pub fn shield_hint(supported: bool) -> &'static str {
+    if supported {
+        "在**钩子层**吞掉鼠标消息(默认,与从前行为一致)。\n\
+         优点:不新增窗口、不依赖投屏窗口位置。\n\
+         缺点:本界面在独占期间也点不了(键盘不受影响)。"
+    } else {
+        "本平台**不支持**隔膜:它靠 Windows 低级鼠标钩子实现,Linux 没有对应能力,\n\
+         选它不会有任何效果 —— 鼠标事件照旧同时进本程序和投屏窗口。\n\
+         这一档保留只为让 Windows 的配置能导入;详见帮助「Linux 上做不到的几项」。"
+    }
+}
+
+/// 遮板一档的说明文案(同上:按「本平台支持遮板吗」分叉)。
+pub fn mask_hint(mask_available: bool) -> &'static str {
+    if mask_available {
+        "在**窗口层**挡鼠标:一块透明置顶窗贴在投屏区域上,事件落在它身上,\n\
+         底下的投屏窗口收不到 ⇒ 双份输入从根上消失;本界面照常可点。\n\
+         它还会把键位/轮盘/锚点画在画面上(不透明的地方只有圈和字)。\n\
+         注意:需要能定位到投屏窗口的位置;定位不到时会**自动退回隔膜**。"
+    } else {
+        "本平台**不支持**遮板:它要在别的进程的窗口上方开一块自己的窗口,\n\
+         Linux(Wayland)不允许客户端定位或覆盖其他程序的 surface,\n\
+         所以选它只会**自动退回隔膜**(界面上会红字提示)。\n\
+         这一档保留只为让 Windows 的配置能导入;详见帮助「Linux 上做不到的几项」。"
+    }
+}
 /// 「隔膜此刻该不该开」的**纯判定**(用户 2026-10-13;便于单测)。
 ///
 /// 输入:
@@ -415,11 +436,6 @@ pub fn shield_effective(
     shield_wanted
 }
 
-fn default_bg_dim() -> u8 {
-    // 压暗到 120/255:背景图清晰可见,同时保证文字可读
-    120
-}
-
 fn default_panel_alpha() -> u8 {
     // 150/255:面板半透明,背景图能透出来(255=完全不透明,就看不到图了)
     150
@@ -436,9 +452,6 @@ impl Default for Look {
             style: UiStyle::default(),
             preset: Preset::default(),
             density: Density::default(),
-            bg_path: String::new(),
-            bg_fit: BgFit::default(),
-            bg_dim: default_bg_dim(),
             panel_alpha: default_panel_alpha(),
             overlay_tone: 0.0,
             overlay_auto: true,
@@ -449,16 +462,6 @@ impl Default for Look {
 impl Look {
     pub fn theme(&self) -> Theme {
         self.preset.theme()
-    }
-
-    /// 是否配置了背景图
-    pub fn has_bg(&self) -> bool {
-        !self.bg_path.is_empty()
-    }
-
-    /// 清空背景图(保留其它外观设置)
-    pub fn clear_bg(&mut self) {
-        self.bg_path.clear();
     }
 }
 
@@ -852,10 +855,18 @@ mod tests {
         );
     }
 
-    /// 老配置(没有 overlay_tone 字段)读入后必须是 0.0 —— 观感与旧版逐一致
+    /// 老配置(没有 overlay_tone 字段)读入后必须是 0.0 —— 观感与旧版逐一致。
+    ///
+    /// 同一个断言顺带守**删字段的容忍性**(AGENTS §5「配置字段删除」行):
+    /// 2026-10-26 把 `bg_path`/`bg_fit`/`bg_dim` 从外观搬到 settings.json,
+    /// 老 look.json 里这三个键还会留着 —— 必须被静默忽略,而不是让整份外观解析失败
+    /// (那会把用户调好的配色/密度一起打回默认)。
     #[test]
     fn look_overlay_tone_defaults_to_neutral() {
-        let look: Look = serde_json::from_str(r#"{ "preset": "Nord", "bg_dim": 135 }"#).unwrap();
+        let look: Look = serde_json::from_str(
+            r#"{ "preset": "Nord", "bg_dim": 135, "bg_path": "D:/pics/x.png", "bg_fit": "Tile" }"#,
+        )
+        .unwrap();
         assert_eq!(look.overlay_tone, 0.0);
         // 档位为 0 时颜色不做任何改动(连 alpha 也不动)
         let c = Color32::from_rgba_unmultiplied(0, 200, 0, 60);
@@ -1000,5 +1011,34 @@ mod tests {
             assert!(!m.hint().is_empty(), "{m:?} 必须有悬停说明");
         }
         assert_eq!(MouseCaptureMode::ALL.len(), 2, "用户要求就两项:遮板 / 隔膜");
+    }
+
+    /// 守护:`hint()` 的**平台分叉**必须真的存在且如实(用户 2026-10-26 第2/3条)。
+    ///
+    /// 用户原话:「蒙版不能在linux上用。修复他。」「linux鼠标消隐只能在scrcpy-pad界面上生效」。
+    /// 这两个能力在 Linux 上是**原理性做不到**的,界面若不说明,用户只会以为程序坏了。
+    #[test]
+    fn mouse_capture_hints_disclose_platform_gaps() {
+        // 阳:支持时描述机制,且不得出现「不支持」这种误导
+        assert!(super::shield_hint(true).contains("钩子层"));
+        assert!(!super::shield_hint(true).contains("不支持"));
+        assert!(super::mask_hint(true).contains("窗口层"));
+        assert!(!super::mask_hint(true).contains("不支持"));
+        // 阴:不支持时必须明说,并给出退路(不能只说「不支持」就完事)
+        assert!(super::shield_hint(false).contains("不支持"));
+        assert!(super::shield_hint(false).contains("Windows"));
+        assert!(super::mask_hint(false).contains("不支持"));
+        assert!(super::mask_hint(false).contains("自动退回隔膜"));
+        // 接线:真实入口 `hint()` 必须与平台可用性一致(不是另一份写死的文案)
+        assert_eq!(
+            super::MouseCaptureMode::Shield.hint(),
+            super::shield_hint(cfg!(windows)),
+            "隔膜说明必须按平台分叉"
+        );
+        assert_eq!(
+            super::MouseCaptureMode::Mask.hint(),
+            super::mask_hint(crate::mask::available()),
+            "遮板说明必须按遮板可用性分叉"
+        );
     }
 }

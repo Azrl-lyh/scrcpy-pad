@@ -2424,7 +2424,7 @@ mod linux {
     use crate::{diag_debug, diag_info, diag_warn};
     use anyhow::Result;
     use std::collections::{HashMap, HashSet};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::Sender;
     use std::sync::{Arc, Mutex};
@@ -2456,6 +2456,13 @@ mod linux {
     /// 停止标志、`grab` 开关、槽位令牌。20ms = 每秒 50 次空醒(旧实现 500 次/秒)。
     const POLL_TIMEOUT_MS: i32 = 20;
 
+    /// 打开设备失败时,**同一轮扫描里**最多再退避重试几次(第 20 条)。
+    ///
+    /// 3 次 × 50ms = 150ms,仍在一次重扫(≈500ms)之内,不会拖慢重扫节奏。
+    const OPEN_RETRIES: u32 = 3;
+    /// 打开重试的退避间隔(毫秒)。50ms 是"USB 复位那种一闪而过的真空窗"的量级。
+    const OPEN_RETRY_DELAY_MS: u64 = 50;
+
     /// 等这个 fd 变成可读,最多 `timeout_ms` 毫秒。返回 true 表示可以读了。
     ///
     /// 为什么用 `poll` 而不是把设备设成阻塞再 `read`:阻塞 `read` 睡着之后,
@@ -2482,6 +2489,13 @@ mod linux {
         token: u64,
         keyboard: bool,
         mouse: bool,
+        /// **这台设备自己**仍按着的键码(第 20 条)。
+        ///
+        /// 为什么不能只靠全局 `delivered`:那是"所有设备合起来"的账。一台键盘被
+        /// 拔掉时拿它去补抬,会把**另一把**正按着的键一起抬掉 —— 两把设备同时用
+        /// (左手方向键 + 鼠标键)时立刻表现为"无故松手"。设备消失时只补抬它自己的
+        /// 这一份,并且只有当没有别的设备也按着同一个码时,才把全局账划掉。
+        pressed: HashSet<u16>,
     }
 
     #[derive(Default)]
@@ -2512,6 +2526,61 @@ mod linux {
     /// 带容错的加锁:某处 panic 让锁中毒之后,输入捕获必须还能继续工作
     fn lock(st: &Shared) -> std::sync::MutexGuard<'_, State> {
         st.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 打开设备失败之后,**本轮**是否再退避重试一次(纯函数,单测直接喂 errno/次数)。
+    ///
+    /// 只对两种"可能马上自己好起来"的错误重试:
+    ///
+    /// - EACCES/EPERM:设备复位过程中节点会被短暂收回权限,那一瞬的 Permission denied
+    ///   不是配置问题(用户日志里正是"放弃一个设备后紧接着打不开另一个节点")。
+    /// - ENODEV:节点还在 read_dir 的结果里,但设备已经不在了 —— 重新枚举中的正常竞态。
+    ///
+    /// 其它错误(ENOENT、EIO 等)重试也白搭,直接计入 denied,免得把日志刷成噪音。
+    ///
+    /// `attempts` 是**已经失败过的次数**(0 = 第一次就失败,还没有重试过)。
+    fn retry_open_after(errno: Option<i32>, attempts: u32) -> bool {
+        if attempts >= OPEN_RETRIES {
+            return false;
+        }
+        matches!(
+            errno,
+            Some(libc::EACCES) | Some(libc::EPERM) | Some(libc::ENODEV)
+        )
+    }
+
+    /// 设备消失的补抬决策(纯函数:单测用假设备直接跑)。
+    ///
+    /// 从 `alive` 里摘掉这台设备,**只**取它自己 pressed 集合里的键,返回要补发抬起
+    /// 的键码(升序,日志与断言都稳定)。
+    ///
+    /// 全局 `delivered` 只在"没有别的设备也按着同一个码"时才划掉:两把键盘同时
+    /// 按 W 的时候,拔掉其中一把不该让另一把的账凭空消失(否则 400ms 后的权威
+    /// 对账会认为"我们漏了 release",再补一次抬起,把还按着的键抬掉)。
+    ///
+    /// 令牌不匹配 ⇒ 这个节点已经被更新的线程接管(设备换号/重新枚举),那台"新
+    /// 设备"的账不归我们管,一根都不动。
+    fn take_vanished_pressed(
+        alive: &mut HashMap<PathBuf, Slot>,
+        delivered: &mut HashSet<u16>,
+        path: &Path,
+        token: u64,
+    ) -> Vec<u16> {
+        if alive.get(path).map(|s| s.token) != Some(token) {
+            return Vec::new();
+        }
+        let Some(slot) = alive.remove(path) else {
+            return Vec::new();
+        };
+        let mut released: Vec<u16> = slot.pressed.into_iter().collect();
+        released.sort_unstable();
+        for code in &released {
+            let still_held = alive.values().any(|s| s.pressed.contains(code));
+            if !still_held {
+                delivered.remove(code);
+            }
+        }
+        released
     }
 
     pub fn start(
@@ -2610,26 +2679,45 @@ mod linux {
                 continue;
             }
 
-            let device = match evdev::Device::open(&path) {
-                Ok(d) => d,
-                Err(e) => {
-                    denied += 1;
-                    // 权限与"设备已消失"要分开说:前者要用户去改组,后者是正常竞态
-                    let hint = match e.kind() {
-                        std::io::ErrorKind::PermissionDenied => {
-                            " → 当前用户不在 input 组,或未重新登录"
+            // 第 20 条:设备复位/换节点的那一瞬,这里会拿到 EACCES 或 ENODEV。
+            // 以前一次失败就放弃整轮 —— 用户日志里正是"放弃一个设备之后紧接着
+            // 打不开另一个节点:Permission denied",而重扫周期 ≈500ms,那整段
+            // 时间里这个设备的按键没人读。现在同轮退避重试(见 retry_open_after)。
+            let mut attempts = 0u32;
+            let opened = loop {
+                match evdev::Device::open(&path) {
+                    Ok(d) => break Some(d),
+                    Err(e) => {
+                        let errno = e.raw_os_error();
+                        if retry_open_after(errno, attempts) {
+                            attempts += 1;
+                            std::thread::sleep(Duration::from_millis(OPEN_RETRY_DELAY_MS));
+                            continue;
                         }
-                        _ => "",
-                    };
-                    diag_warn!(
-                        "capture",
-                        "打不开 {}: {e} (errno {:?}){hint}",
-                        path.display(),
-                        e.raw_os_error()
-                    );
-                    continue;
+                        denied += 1;
+                        // 权限与"设备已消失"要分开说:前者要用户去改组,后者是正常竞态
+                        let hint = match e.kind() {
+                            std::io::ErrorKind::PermissionDenied => {
+                                " → 当前用户不在 input 组,或未重新登录"
+                            }
+                            _ => "",
+                        };
+                        let retried = if attempts > 0 {
+                            format!(",已退避重试 {attempts} 次仍失败")
+                        } else {
+                            String::new()
+                        };
+                        diag_warn!(
+                            "capture",
+                            "打不开 {}: {e} (errno {:?}){hint}{retried}",
+                            path.display(),
+                            e.raw_os_error()
+                        );
+                        break None;
+                    }
                 }
             };
+            let Some(device) = opened else { continue };
 
             let name = device.name().unwrap_or("(无名)").to_string();
             let id = device.input_id();
@@ -2656,10 +2744,17 @@ mod linux {
                 continue;
             }
 
+            // 第 15 条:日志里同时给出**稳定身份**(by-id 链接名),这样两份日志
+            // 比对时不会因为 eventN 换号而误判"设备换了"。设备消失的那条 WARN
+            // 也用它:用户贴出来的永远是 event15/event19,而"哪一把"只有 by-id 说得清。
+            let stable = by_id_map()
+                .get(&path.file_name().map(|n| n.to_owned()).unwrap_or_default())
+                .cloned()
+                .unwrap_or_else(|| "(无 by-id)".to_string());
             let token = {
                 let mut s = lock(st);
-                // 先把令牌算出来再借用 `alive`:直接在字段初始化式里读
-                // `s.next_token` 会与外层的可变借用冲突
+                // 先把令牌算出来再借用 alive:直接在字段初始化式里读
+                // s.next_token 会与外层的可变借用冲突
                 let token = s.next_token + 1;
                 s.next_token = token;
                 s.alive.insert(
@@ -2668,16 +2763,11 @@ mod linux {
                         token,
                         keyboard: is_kb,
                         mouse: is_mouse_dev,
+                        pressed: HashSet::new(),
                     },
                 );
                 token
             };
-            // 第 15 条:日志里同时给出**稳定身份**(by-id 链接名),这样两份日志
-            // 比对时不会因为 eventN 换号而误判"设备换了"。
-            let stable = by_id_map()
-                .get(&path.file_name().map(|n| n.to_owned()).unwrap_or_default())
-                .cloned()
-                .unwrap_or_else(|| "(无 by-id)".to_string());
             diag_info!(
                 "capture",
                 "已接管 {} 「{name}」{id:?} 键数={key_count} 键盘={is_kb} 鼠标={is_mouse_dev} 身份={stable}",
@@ -2712,6 +2802,7 @@ mod linux {
                     stop2,
                     st2,
                     is_mouse_dev,
+                    stable,
                 );
             });
         }
@@ -2885,6 +2976,7 @@ mod linux {
         stop: Arc<AtomicBool>,
         st: Shared,
         mouse: bool,
+        identity: String,
     ) {
         let mut grabbed = false;
         // 设备名先取成 owned 字符串:`fetch_events` 期间 `device` 是可变借用的,
@@ -2949,10 +3041,23 @@ mod linux {
                                 let pressed = value == 1;
                                 {
                                     let mut s = lock(&st);
+                                    // 两份账:全局 delivered(对账用),以及**本设备**
+                                    // 自己那一份(设备消失时只抬自己的键,第 20 条)。
                                     if pressed {
                                         s.delivered.insert(key.0);
                                     } else {
                                         s.delivered.remove(&key.0);
+                                    }
+                                    // 只写"令牌仍是自己"的那一份:节点名被新设备复用时,
+                                    // 旧线程不许把新设备的账改坏。
+                                    if let Some(slot) = s.alive.get_mut(&path) {
+                                        if slot.token == token {
+                                            if pressed {
+                                                slot.pressed.insert(key.0);
+                                            } else {
+                                                slot.pressed.remove(&key.0);
+                                            }
+                                        }
                                     }
                                 }
                                 let _ = tx.send(CaptureEvent::Button {
@@ -3029,18 +3134,44 @@ mod linux {
                     if hard_errors >= 20 {
                         // 设备确实没了:登记注销,让重扫有机会重新接管。
                         // 注销时校验令牌,避免把复用同一节点名的新设备登记抹掉。
-                        {
+                        //
+                        // 第 20 条:**立刻补抬这台设备自己的键**,不等 400ms 的权威对账。
+                        // 独占(grab)状态下设备消失,抬起事件永远收不到;等到对账周期才
+                        // 补抬,中间那段时间游戏里看到的就是"一直按着" —— 用户报的
+                        // "死键/卡键"正是这个窗。只抬它自己的集合,另一把设备正按着的键
+                        // 一根都不许动。
+                        let released = {
                             let mut s = lock(&st);
-                            if s.alive.get(&path).map(|x| x.token) == Some(token) {
-                                s.alive.remove(&path);
-                                s.truth_devs.remove(&path);
-                            }
+                            // 拆开字段借用:alive 与 delivered 要同时可变(s 整体借两次会被拒绝)
+                            let State {
+                                alive,
+                                delivered,
+                                truth_devs,
+                                ..
+                            } = &mut *s;
+                            let released = take_vanished_pressed(alive, delivered, &path, token);
+                            truth_devs.remove(&path);
+                            released
+                        };
+                        for code in &released {
+                            let _ = tx.send(CaptureEvent::Button {
+                                code: *code,
+                                pressed: false,
+                                at: Instant::now(),
+                            });
                         }
+                        let listed = if released.is_empty() {
+                            "(无)".to_string()
+                        } else {
+                            names(released.iter().copied())
+                        };
                         diag_warn!(
                             "capture",
-                            "放弃 {} 「{}」(连续 {hard_errors} 次读取失败;它被拔掉或复位了,重扫会重新接管)",
+                            "放弃 {} 「{}」(连续 {hard_errors} 次读取失败;它被拔掉或复位了,重扫会重新接管)。身份={identity} 时刻={} 仍按着 {} 个键,已立刻补发抬起防卡键: {listed}",
                             path.display(),
-                            &dev_name
+                            &dev_name,
+                            crate::diag::clock_now(),
+                            released.len()
                         );
                         return;
                     }
@@ -3236,7 +3367,10 @@ mod linux {
 
     #[cfg(test)]
     mod tests {
-        use super::{POLL_TIMEOUT_MS, parse_by_id, reduce_by_id, sort_by_identity, wait_readable};
+        use super::{
+            OPEN_RETRIES, POLL_TIMEOUT_MS, Slot, parse_by_id, reduce_by_id, retry_open_after,
+            sort_by_identity, take_vanished_pressed, wait_readable,
+        };
 
         /// T1(第 19 条):`wait_readable` 必须在"有数据"时立刻返回、在"没数据"时
         /// 按超时返回。用 pipe 造这两种状态 —— 不依赖任何真实输入设备,
@@ -3423,6 +3557,138 @@ mod linux {
                 std::path::PathBuf::from("/dev/input/event2"),
                 "排序没按 by-id 身份走(按路径名字典序 event10 会在前面)"
             );
+        }
+
+        /// 第 20 条:两台假设备各按自己的键,移除其一 ⇒ **只有它的键**被补抬。
+        ///
+        /// 守护 `take_vanished_pressed` 里"只取这台设备自己的 pressed"那一行。
+        /// 变异验证用:把它改成遍历全局 `delivered`,另一台设备的 31 会被一起返回,
+        /// 第一条断言立刻红。
+        #[test]
+        fn vanished_device_releases_only_its_own_keys() {
+            let a = std::path::PathBuf::from("/dev/input/event15");
+            let b = std::path::PathBuf::from("/dev/input/event20");
+            let mut alive = std::collections::HashMap::new();
+            alive.insert(
+                a.clone(),
+                Slot {
+                    token: 1,
+                    keyboard: true,
+                    mouse: false,
+                    pressed: [17u16, 30].into_iter().collect(),
+                },
+            );
+            alive.insert(
+                b.clone(),
+                Slot {
+                    token: 2,
+                    keyboard: true,
+                    mouse: false,
+                    pressed: [31u16].into_iter().collect(),
+                },
+            );
+            let mut delivered: std::collections::HashSet<u16> =
+                [17u16, 30, 31].into_iter().collect();
+            let released = take_vanished_pressed(&mut alive, &mut delivered, &a, 1);
+            assert_eq!(
+                released,
+                vec![17, 30],
+                "只该补抬它自己的键(升序,日志与断言都稳定)"
+            );
+            assert!(!alive.contains_key(&a), "消失的设备必须从登记里摘掉");
+            assert!(alive.contains_key(&b), "另一台设备不许受影响");
+            assert!(
+                !delivered.contains(&17) && !delivered.contains(&30),
+                "它自己的键要从全局账里划掉,否则 400ms 后的对账会再补一次"
+            );
+            assert!(
+                delivered.contains(&31),
+                "另一台设备的键必须留在全局账里,否则对账会把它当成\"我们漏了 release\""
+            );
+        }
+
+        /// 阴性对照:令牌不匹配(节点名已被更新的线程接管)⇒ 一根键都不许动。
+        ///
+        /// 守护函数开头那条 `alive.get(path).token != token` 的早退:少了它,
+        /// 旧线程退出时会把复用同一节点名的**新设备**的账一起抹掉。
+        #[test]
+        fn vanished_device_with_stale_token_touches_nothing() {
+            let a = std::path::PathBuf::from("/dev/input/event19");
+            let mut alive = std::collections::HashMap::new();
+            alive.insert(
+                a.clone(),
+                Slot {
+                    token: 7,
+                    keyboard: false,
+                    mouse: true,
+                    pressed: [272u16].into_iter().collect(),
+                },
+            );
+            let mut delivered: std::collections::HashSet<u16> = [272u16].into_iter().collect();
+            let released = take_vanished_pressed(&mut alive, &mut delivered, &a, 6);
+            assert!(released.is_empty(), "旧令牌不许补抬任何键");
+            assert!(alive.contains_key(&a), "更不许把新线程的登记删掉");
+            assert!(delivered.contains(&272), "全局账也不许动");
+        }
+
+        /// 两把设备同时按同一个码:拔掉一把时全局账不能划掉 ——
+        /// 否则 400ms 后的权威对账会认为"我们漏了 release",再补一次抬起,
+        /// 把另一把**还按着**的键抬掉(这正是第 20 条要消灭的卡键/死键)。
+        #[test]
+        fn shared_code_stays_in_the_ledger_while_another_device_holds_it() {
+            let a = std::path::PathBuf::from("/dev/input/event15");
+            let b = std::path::PathBuf::from("/dev/input/event20");
+            let mut alive = std::collections::HashMap::new();
+            for (p, token) in [(&a, 1u64), (&b, 2u64)] {
+                alive.insert(
+                    (*p).clone(),
+                    Slot {
+                        token,
+                        keyboard: true,
+                        mouse: false,
+                        pressed: [30u16].into_iter().collect(),
+                    },
+                );
+            }
+            let mut delivered: std::collections::HashSet<u16> = [30u16].into_iter().collect();
+            let released = take_vanished_pressed(&mut alive, &mut delivered, &a, 1);
+            assert_eq!(released, vec![30], "这把设备确实按着 30,抬起要补");
+            assert!(
+                delivered.contains(&30),
+                "另一台设备也按着 30:全局账不许划掉"
+            );
+        }
+
+        /// 第 20 条:打开失败的退避决策 —— 只重试"可能自己好起来"的 errno,且封顶。
+        ///
+        /// 阳性:EACCES(设备复位时节点权限短暂为空,用户日志里正是它)与
+        /// ENODEV(重新枚举中)必须重试;
+        /// 阴性:ENOENT / EIO / 没有 errno 立刻放弃(重试只会把日志刷成噪音),
+        /// 第 OPEN_RETRIES 次之后也立刻放弃(不许无限重试拖住整轮重扫)。
+        #[test]
+        fn open_retry_only_retries_transient_errnos_and_is_bounded() {
+            assert!(
+                retry_open_after(Some(libc::EACCES), 0),
+                "EACCES 是第一号重试对象:设备复位中途的权限真空窗"
+            );
+            assert!(
+                retry_open_after(Some(libc::EPERM), 1),
+                "EPERM 与 EACCES 同类"
+            );
+            assert!(
+                retry_open_after(Some(libc::ENODEV), 2),
+                "第 3 次失败之后还允许最后一次重试"
+            );
+            assert!(
+                !retry_open_after(Some(libc::EACCES), OPEN_RETRIES),
+                "重试次数必须封顶,否则一次拔插能拖住重扫好几百毫秒"
+            );
+            assert!(
+                !retry_open_after(Some(libc::ENOENT), 0),
+                "节点不存在重试也白搭"
+            );
+            assert!(!retry_open_after(Some(libc::EIO), 0), "I/O 错误重试也白搭");
+            assert!(!retry_open_after(None, 0), "没有 errno 的错误码不该重试");
         }
     }
 }

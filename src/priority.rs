@@ -73,15 +73,73 @@ pub fn boost(class: Class) {
     let r = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
     if r != 0 {
         let err = std::io::Error::last_os_error();
-        crate::diag_warn!(
-            "priority",
-            "提高线程优先级失败(nice={nice}): {err}。\
-             满载时输入线程仍可能被游戏线程拖后几十毫秒。\
-             补救:sudo setcap cap_sys_nice+ep <二进制>(重编译后需重做),\
-             或在 systemd user unit 里设 LimitNICE=10"
-        );
+        // 只告警**一次**(2026-10-26 第 5 条):每台输入设备一条读取线程,每条线程
+        // 都会调一次 boost。nice 被系统策略拒绝(EPERM/EACCES,常见于收紧的
+        // RLIMIT_NICE 的桌面会话)时,原先是每条线程各打一行 WARN ——
+        // 用户那份日志里同一句话刷了几十遍,真正的一次性异常反而被淹没。
+        // 副作用说明:级别提升是"尽力而为",失败**不影响功能**,只是在游戏吃满
+        // CPU 时输入线程可能排队几十毫秒;所以一条 WARN 加上两条补救足够了。
+        if warn_once(&NICE_WARNED) {
+            // 把**本程序实际路径**写进补救命令里:用户复制粘贴就能用,
+            // 不必自己去找二进制在哪(发行包/自编译/cargo 缓存路径各不相同)。
+            let exe = std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<本程序的二进制>".to_string());
+            crate::diag_warn!(
+                "priority",
+                "提高线程优先级失败(nice={nice}): {err}。\
+                 只影响满载时的排队延迟(游戏吃满 CPU 时输入可能晚几毫秒到几十毫秒),\
+                 不影响功能。两条补救任选其一,做一次即可:\
+                 ① sudo setcap cap_sys_nice+ep {exe}(替换或重新编译二进制之后要重做);\
+                 ② 让程序跑在 systemd user 服务里,并在 unit 里加 LimitNICE=-5。\
+                 本条只提示一次,之后同类失败不再重复刷屏。"
+            );
+        }
     }
 }
 
+/// "同一个异常只告警一次"的闸门。
+///
+/// 语义:swap(true) 是原子的"取旧值并置位" —— 第一次调用看到 false,返回
+/// true(该告警);之后一律看到 true,返回 false(闭嘴)。用 swap 而不是
+/// load + store:多台设备的读取线程会**并发**进来,只有拿到旧值 false
+/// 的那个线程才该打日志,否则两个线程可能同时判定"我是第一个"。
+///
+/// 为什么不按 Class 分别记:同一个 nice 请求失败就是同一个系统策略问题,
+/// 按类分开只会把同一句话打两遍。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn warn_once(flag: &std::sync::atomic::AtomicBool) -> bool {
+    !flag.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// nice 提升失败的"已告警"标记(进程级,所有读取线程共享)。
+///
+/// 只放在 Linux 分支里:Windows 侧的告警频率与文案按任务要求**逐字不变**。
+#[cfg(target_os = "linux")]
+static NICE_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[cfg(not(any(windows, target_os = "linux")))]
 pub fn boost(_class: Class) {}
+
+#[cfg(test)]
+mod tests {
+    use super::warn_once;
+    use std::sync::atomic::AtomicBool;
+
+    /// 守护 Linux 分支 boost() 里那句 `if warn_once(&NICE_WARNED)`:
+    /// 第一次失败必须打 WARN,之后的(并发的)同类失败必须闭嘴。
+    ///
+    /// 阳性对照:全新标记的第一次调用返回 true;
+    /// 阴性对照:同一标记的第二、三次调用必须返回 false —— 如果把实现改回
+    /// "每条线程都告警"(即改前每台设备刷一行的行为),后两条断言立刻红。
+    #[test]
+    fn priority_warning_fires_once_then_stays_quiet() {
+        let flag = AtomicBool::new(false);
+        assert!(warn_once(&flag), "第一次失败必须告警");
+        assert!(!warn_once(&flag), "第二次失败必须闭嘴");
+        assert!(!warn_once(&flag), "第三次失败仍必须闭嘴");
+        // 另一份标记不能被前一处置位影响(将来复用同一个闸门时不会互相吞掉)
+        let other = AtomicBool::new(false);
+        assert!(warn_once(&other), "不同标记之间不得互相污染");
+    }
+}

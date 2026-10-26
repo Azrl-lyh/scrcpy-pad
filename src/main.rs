@@ -20,6 +20,28 @@ mod timer;
 mod trace;
 
 fn main() -> eframe::Result<()> {
+    let argv: Vec<String> = std::env::args().collect();
+    // ---- 命令行开关(纯解析,不碰文件也不读环境变量)----
+    // 必须排在最前面:级别是**第一行日志之前**就要定下来的东西(diag::init 会整体
+    // 重写诊断文件并写头部,头部那句"级别 …(来源)"就是给人排查用的)。非法值也不能
+    // 变成"半个程序启动再崩":打印用法 + 明确退出码,连日志文件都不去动。
+    let cli = match parse_cli(&argv) {
+        Ok(cli) => cli,
+        Err(e) => {
+            eprintln!("scrcpy-pad: {e}");
+            eprint!("{}", usage());
+            std::process::exit(EXIT_USAGE);
+        }
+    };
+    // "命令行 > 环境变量 > settings.json"的优先级由 diag::pick_level 实现,这里只把
+    // "命令行说过话"这一事实先钉进去,好让 init 写进头部的那句来源是准的。
+    if let Some(level) = cli.log_level {
+        diag::set_cli_level(level);
+    }
+    // 镜像开关可以提前置位:真正的落点要等 trace 打开,在那之前
+    // diag_mirror_enabled() 恒为 false,不会白写。
+    trace::set_diag_mirror(cli.trace_diag);
+
     // 定时器精度必须最先提升:否则引擎主循环的 recv_timeout 会被量化到 ~10ms 网格,
     // 计划动作(点按抬起/连发/宏步进)误差 ±6~10ms。见 timer.rs 的实测说明。
     timer::raise();
@@ -49,9 +71,19 @@ fn main() -> eframe::Result<()> {
     // **两者都没有时也落盘到配置目录**(双击启动不会继承环境变量,用户 2026-10-11
     // 因此整局没留下现场;总量限制见 trace::prune_old_traces)。
     // 放在 diag 之后、任何输入设备枚举之前 —— 第一条按键事件也要能被记下。
-    trace::init_from_args(&std::env::args().collect::<Vec<_>>());
+    trace::init_from_args(&argv);
 
-    if std::env::args().any(|a| a == "--selftest") {
+    // `--trace-diag` 的语义是**自动开启轨迹**(而不是"轨迹没开就忽略")。
+    // 理由:这个参数的全部用途就是把诊断行并进轨迹;轨迹没开时静默忽略 = 参数
+    // 无声失效,用户会以为拿到了合并现场。轨迹本来就默认开启,所以"自动开启"不
+    // 引入任何新的默认行为 —— 它只在 open 因权限/只读失败时补一次尝试。
+    // 已知取舍:diag::init 写的那几行头部进不了轨迹(单实例守卫必须早于 trace,
+    // 见上面的注释;头部又是 diag::init 写的),顺序上无法两全,这里如实留着。
+    if cli.trace_diag {
+        trace::ensure_enabled();
+    }
+
+    if argv.iter().any(|a| a == "--selftest") {
         diag::snapshot_environment();
         let code = selftest();
         finish(code);
@@ -59,7 +91,7 @@ fn main() -> eframe::Result<()> {
 
     // 蒙版窗口自检(批次 0):透明 / 置顶 / 绘制 / 点击归属 / 不抢焦点 / 无残窗。
     // 与 `--selftest` 分开:那个要连真机,这个纯本机窗口层,几秒钟就能跑完。
-    if std::env::args().any(|a| a == "--mask-selftest") {
+    if argv.iter().any(|a| a == "--mask-selftest") {
         diag::snapshot_environment();
         let code = mask::selftest();
         finish(code);
@@ -115,6 +147,76 @@ fn main() -> eframe::Result<()> {
 /// 已有实例在跑时的退出码(与"自检失败 = 1"分开:脚本/启动器能分辨
 /// "起不来"和"跑失败"是两回事)。
 const EXIT_ALREADY_RUNNING: i32 = 2;
+
+/// 命令行用法给错时的退出码(sysexits.h 的 EX_USAGE)。
+///
+/// 与"起不来 = 2""跑失败 = 1"都分开:启动脚本能一眼分辨"我参数写错了"
+/// 和"程序自己出了问题",不用去翻 stderr 文本。
+const EXIT_USAGE: i32 = 64;
+
+/// 命令行用法串。级别写错时**必须**能看到正确写法 —— 否则用户只能靠猜,
+/// 而这条链路上本来就有一个环境变量和一份配置文件,已经够绕了。
+fn usage() -> String {
+    let mut s = String::new();
+    s.push_str("用法:scrcpy-pad [选项]\n\n选项:\n");
+    s.push_str("  --log-level <级别>   日志级别:error/warn/info/debug/trace(默认 info)\n");
+    s.push_str(&format!(
+        "                       优先级:命令行 > 环境变量 {} > settings.json\n",
+        diag::ENV_LEVEL
+    ));
+    s.push_str("  --trace-diag         把诊断日志每行同时追加进轨迹 jsonl(kind=\"diag\");\n");
+    s.push_str("                       轨迹未开启时自动开启\n");
+    s.push_str("  --trace [路径]       注入轨迹的落盘位置(默认写配置目录,保留最近 3 份)\n");
+    s.push_str("  --selftest           自检(需要真机)\n");
+    s.push_str("  --mask-selftest      蒙版窗口自检(纯本机)\n");
+    s
+}
+
+/// 命令行解析结果(只收本程序自己消费的开关,其余参数原样留给下游)。
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Cli {
+    /// `--log-level` 指定的级别;None = 命令行没说话(交给环境变量/配置)。
+    log_level: Option<diag::Level>,
+    /// `--trace-diag`:诊断日志每行同时追加进轨迹。
+    trace_diag: bool,
+}
+
+/// 解析命令行。**纯函数**(不读环境变量、不碰文件),所以能直接单测;
+/// 也因此 main 必须**先**调它,再让任何东西去碰配置目录。
+///
+/// 不认识的参数一律忽略:本程序允许把陌生开关透传给下游(例如 `--trace` 的路径),
+/// 解析器不该替它们做主 —— 但它自己那两个参数的**取值**是严格的。
+fn parse_cli(args: &[String]) -> Result<Cli, String> {
+    let mut cli = Cli::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--log-level" => {
+                let Some(v) = args.get(i + 1) else {
+                    return Err("--log-level 后面缺少级别".to_string());
+                };
+                if v.starts_with("--") {
+                    return Err(format!("--log-level 后面缺少级别(读到的是开关 {v})"));
+                }
+                let Some(level) = diag::Level::parse(v) else {
+                    return Err(format!(
+                        "无法识别的日志级别 {v:?}(可用 error / warn / info / debug / trace)"
+                    ));
+                };
+                // 重复给以**最后一个**为准:命令行习惯如此,也让"先给默认值再覆盖"
+                // 这种包装脚本写法能用。
+                cli.log_level = Some(level);
+                i += 2;
+            }
+            "--trace-diag" => {
+                cli.trace_diag = true;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(cli)
+}
 
 /// **所有**退出路径的唯一收尾:刷轨迹 -> 还原定时器精度 -> 写"正常退出"标记 -> 退出。
 ///
@@ -453,4 +555,104 @@ fn selftest() -> i32 {
         }
     );
     if failed { 1 } else { 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, parse_cli, usage};
+    use crate::diag::Level;
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 守护 parse_cli 里 `--log-level` 的**取值分支**(程序每次启动都走这段)。
+    /// 变异验证用:把 `i += 2` 改成 `i += 1`,"trace" 会被当成陌生参数再解一遍,
+    /// 下面的断言立刻红;或把 `Some(level)` 改成 `None`,首个断言红。
+    #[test]
+    fn log_level_is_parsed_from_the_command_line() {
+        assert_eq!(parse_cli(&argv(&["x.exe"])), Ok(Cli::default()));
+        let cli = parse_cli(&argv(&["x.exe", "--log-level", "trace"])).expect("应当解析成功");
+        assert_eq!(cli.log_level, Some(Level::Trace));
+        // 与 SCRCPY_PAD_LOG 同一套写法(大小写不敏感 + 常见别名都容错)
+        assert_eq!(
+            parse_cli(&argv(&["x.exe", "--log-level", "DEBUG"]))
+                .unwrap()
+                .log_level,
+            Some(Level::Debug),
+            "大小写必须容错(环境变量那边就是这样)"
+        );
+        assert_eq!(
+            parse_cli(&argv(&["x.exe", "--log-level", "warning"]))
+                .unwrap()
+                .log_level,
+            Some(Level::Warn),
+            "别名要和 SCRCPY_PAD_LOG 一致,否则同一个词在两处行为不同"
+        );
+        // 重复给以最后一个为准
+        assert_eq!(
+            parse_cli(&argv(&[
+                "x.exe",
+                "--log-level",
+                "info",
+                "--log-level",
+                "error"
+            ]))
+            .unwrap()
+            .log_level,
+            Some(Level::Error)
+        );
+    }
+
+    /// 守护"非法值 / 缺值 ⇒ Err":main 据此打印用法并非零退出(EXIT_USAGE),
+    /// 而不是带着一个"什么都没配"的状态照常启动。
+    #[test]
+    fn bad_or_missing_log_level_is_rejected() {
+        assert!(parse_cli(&argv(&["x.exe", "--log-level", "loud"])).is_err());
+        assert!(parse_cli(&argv(&["x.exe", "--log-level", ""])).is_err());
+        assert!(
+            parse_cli(&argv(&["x.exe", "--log-level"])).is_err(),
+            "结尾缺值必须报错,不能静默当没写"
+        );
+        assert!(
+            parse_cli(&argv(&["x.exe", "--log-level", "--trace-diag"])).is_err(),
+            "下一个是开关而不是级别时必须报错,不能把开关当级别吞掉"
+        );
+    }
+
+    /// 守护 `--trace-diag` 的开/关二态,以及"陌生参数原样放行"
+    /// (尤其 `--trace <路径>`:路径可能长得像任何东西,解析器不许误伤它)。
+    #[test]
+    fn trace_diag_flag_and_foreign_arguments_are_handled() {
+        assert!(!parse_cli(&argv(&["x.exe"])).unwrap().trace_diag);
+        assert!(
+            parse_cli(&argv(&["x.exe", "--trace-diag"]))
+                .unwrap()
+                .trace_diag
+        );
+        let cli = parse_cli(&argv(&[
+            "x.exe",
+            "--trace",
+            "C:\\临时 目录\\轨迹 1.jsonl",
+            "--trace-diag",
+            "--selftest",
+        ]))
+        .expect("陌生参数必须原样忽略");
+        assert!(cli.trace_diag, "--trace-diag 夹在陌生参数中间也要认出来");
+        assert_eq!(cli.log_level, None, "没有 --log-level 时不许凭空给一个级别");
+    }
+
+    /// 守护用法串:两个新参数必须**出现在用法里**,否则用户只能靠猜。
+    /// (命令行 > 环境变量 > 配置 的优先级本身由
+    /// diag::tests::level_priority_is_cli_then_env_then_settings 守护)
+    #[test]
+    fn usage_lists_both_new_switches() {
+        let u = usage();
+        assert!(u.contains("--log-level"), "用法串缺 --log-level:{u}");
+        assert!(u.contains("--trace-diag"), "用法串缺 --trace-diag:{u}");
+        assert!(
+            u.contains(crate::diag::ENV_LEVEL),
+            "用法串要写清环境变量名字,不然优先级那句没意义"
+        );
+    }
 }

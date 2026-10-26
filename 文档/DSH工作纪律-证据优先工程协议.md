@@ -200,6 +200,11 @@
 | P32 | V2-2 滑动轨迹录制 | **已实现 + 引擎级实测**：折返轨迹 `down 1 up 1 move 3`，设备端 x 同时到过左右两半 |
 | P33 | 测试 flaky（`interface_log_reaches_the_diagnostics_file` 单跑绿/全量红） | **已修**：加 `diag::DIAG_TEST_LOCK` 串行锁；连跑 3 次全绿 |
 | P34 | V2-3 轨迹录制重做（UI / 操作逻辑 / 蒙版 / 截图风格四件套） | **已实现**，见下方「V2-3 交付登记」。三条根因②③（**录制点从未被渲染**、**遮板不画轨迹**）都有变异验证 |
+| P35 | 第1条「只有第一个组合继承默认设置的图片」——换键位却换了背景图 | **已修**：背景图三字段从随方案的 `theme::Look` 搬到程序级 `settings::Settings`；迁移优先级按用户原话实现；7 条守护测试 + M1–M5 变异验证。详见下方「B1 交付登记」 |
+| P36 | 第7条「build.sh 碰到不是 glibc ≤2.31 的环境就不给编译」 | **已修**：默认宽松（只警告继续构建），`--strict-glibc` / `SCRCPY_PAD_REQUIRE_GLIBC_BASELINE=1` 恢复两道硬拒绝；11 例 shim 行为验证。详见下方「B1 交付登记」 |
+| P37 | 第4条「录制内容太大、组合键每个按键的设置也藏起来」 | **已修（三处均已落盘）**：组合键页——第一次=常显标题+内层折叠，被用户否决（"折叠里面还要有参数编辑按钮"），第二次=**整卡一层折叠**（`CollapsingState::load_with_default_open` + `("combo_card", index)`，标题行常显概览/删除/新增成员，`.body` 里直接放成员格、动作编辑器与三个选项，内层折叠整个删除），`track_rec_card` 保留只读明细折叠；轮盘映射页 `("wheel_card", i)` 与 FPS 页四卡 `("aim_card_input/feel/recoil/shield", n)` 同口径一层折叠（m01044 末句「另外还有两处」由此裁定）。**行为变更**：压枪档位表的内层折叠与常量 `RECOIL_TIER_COLLAPSE_AT` 删除，档位表恒定内联。守护测试 `fold_sections_default_to_closed` 改写（②组合键 / ③轮盘 / ④FPS 三段）+ M-A~M-E、M1–M6 变异全红 | m01028/m01044 |
+| P38 | 第5条「Linux 出现死键卡键」+ 用户要求的 `--log-level` / `--trace-diag` 两个全平台参数 | **已修**：每设备 pressed 记账 + 设备消失立即补抬 + open 退避重试 + priority 只告警一次；diag 级别优先级链 + 轨迹镜像（`kind:"diag"`）；CLI 非法值 exit 64。Windows 463 / Linux 451 passed，G1–G6 变异验证。真机复验属 B 级。详见下方登记 |
+| P39 | 第2/3条「Linux 没蒙版」「Linux 鼠标消隐只在自家窗口生效」 | **A 档已修**（如实说明）：`theme::MouseCaptureMode::hint` 平台分叉 + `src/help.md` 新节「Linux 上做不到的几项」+ `README.md` §13 补遮板行 + `旧时代完整版Readme.md` §8.1 + XWayland 启动命令。**B 档（X11 真实现）未做**，等用户裁决 |
 
 ### V2-3 交付登记：轨迹录制重做（2026-10-13）
 
@@ -2190,6 +2195,338 @@ subagent d45d2939 把 `文档/Linux优势与妙想清单-2026-10-19.md` **整份
 #### 教训（补进纪律）
 「回写容器实际高度」是**伪修复**：当容器实际高度本身由内容决定时，回写只是把内容高度改名成状态再喂回去。判据：这个数字的**来源**是否最终来自内容/可用空间 —— 若是，必须换成**外部固定值**（常量或用户拖拽），并令 `min == max == 该值`、内容按该值精确分配。
 
+
+### B1 交付登记：第1条「换键位不该换背景图」（背景图升为程序级）+ 第7条「build.sh 把非 20.04 环境挡在门外」（2026-10-26 21:0x）
+
+**用户原话（m00128，同一段共 7 条，本批交付其中第 1、7 条）**：
+> 1.「只有第一个组合继承默认设置的图片，否则导入后，连图片都会变成虚无缥缈的东西(因为所谓配置文件里面，图片也算做配置文件)。换键位为啥要换图片呢?改程序逻辑，如果当前图片位置为假的，那么就自动在配置文件里找第一个图片路径为显示的图片。」
+> 7.「release里的build.sh碰到不是glibc2.31以下的环境就不给编译了很傻逼，解除这个限制，我个人编译他会手动选择glibc2.31以下的源，但github上fork的用户就不用管这个环境了吧! 不过你要确保我以后交叉编译和打包发布版的时候用正确glibc版本」
+
+#### A. 第 1 条：背景图从 `Look`（随方案）搬到 `Settings`（程序级）
+
+**根因（结构性，不是猜测）**：`theme::Look` 是「按键组合」`Profile` 的字段（`src/keymap.rs` 里 `Profile.look`），`look.json` 只是它的缓存 —— 换方案 / 导入别人的 YAML 就是把整份 `Profile` 换掉，背景图三字段随之被覆盖。这与 10-13 的 **P22 事故完全同型**（`mouse_capture` 放在 `Look` 里 ⇒ 用户实测「选了遮板却跑成隔膜」），AGENTS §7 红线本就写着「**程序级配置放 `Settings`（settings.json），禁止放 `Look`**」。
+
+**改动清单**
+
+| 文件 | 改动 | 为什么 |
+|---|---|---|
+| `src/theme.rs` | `Look` 删 `bg_path`/`bg_fit`/`bg_dim`，删 `default_bg_dim()`/`has_bg()`/`clear_bg()`；**保留** `pub enum BgFit`（类型搬到 settings 侧使用）；`panel_alpha` 上方写清背景图已搬走的原因 | 字段跟着方案走是根因 |
+| `src/settings.rs` | `Settings` 新增 `bg_path`/`bg_fit`/`bg_dim`（`#[serde(default)]`，压暗默认 120 与旧值一致）+ `default_bg_dim()` + 纯函数 `pub fn pick_bg(candidates, exists)` | 程序级记忆必须放 settings.json |
+| `src/app.rs` | `PadApp` 三字段 + `settings_snapshot()` 打包；启动链新增 `legacy_profile_bgs()`/`migrate_background()`/`load_look_cache()` 改三返；`DialogPurpose::PickBackground` 改写背景图只写 settings；`ui_look` 背景段改用局部量并写回 `settings_dirty`（原 `capture_or_filter_dirty` 改名）；`paint_background(ctx)` 不再读 `look`；`look.json` 落盘不再有 `bg_` 键 | 接线 + 一次性迁移 |
+| `src/keymap.rs` | 内存度量（u13）里删掉 `p.look.bg_path.capacity()` 与 `empty.look.bg_path = String::new()` | 字段已不存在 |
+
+**迁移优先级（逐条对应用户原话「当前图片位置为假 ⇒ 找配置文件里第一个能显示的」）**：
+1. `settings.json` 里 `bg_path` 非空 ⇒ 原样用（用户已经在新架构下选过图，永不被老配置覆盖）；
+2. 否则取**老 `look.json`** 里的 `bg_*`（老版本把图写在这儿，是「当前图片」最接近的来源）；
+3. 再否则按 `profile.yaml` 里各 scheme 的**文件顺序**，选第一个「路径非空**且文件真的存在**」的 ⇒ 这就是「找到第一个能显示的」；
+4. 都不存在但仍有非空路径 ⇒ 保留第一条非空路径（**保住记忆**：界面仍显示文件名，可 `[更换]/[清除]`，不静默退成「从没设过」）；
+5. 全空 ⇒ 空路径、不画背景（与旧版逐位一致）。
+
+**A 级验证**
+
+| 项 | 命令 | 实际输出 |
+|---|---|---|
+| fmt | `cargo fmt --check` | `FMT=0` |
+| Windows 测试 | `cargo test --locked --bin scrcpy-pad` | **450 passed / 0 failed**（Windows 宿主；443→450，+7 全为本轮新守护测试） |
+| clippy（Windows） | `python ci/clippy_diff.py` | 当前 36 / 基线 36，「与基线零差异」 |
+| Linux 目标检查 | `cargo check --locked --target x86_64-unknown-linux-gnu --bin scrcpy-pad` | `Finished dev profile`，`CHECK=0` |
+| clippy（Linux 目标） | `python ci/clippy_diff.py --target linux` | 36:36，「与基线零差异」 |
+
+**用户真实配置的只读迁移实测**（把 `%APPDATA%/scrcpy-pad/config/` 的 `profile.yaml`(32,619 B) + `look.json`(253 B) + `settings.json`(1,149 B) 复制到临时目录，`SCRCPY_PAD_CONFIG_DIR` 指向副本，跑 debug exe 12s ⇒ `RUN_RC=124` 即被 timeout 正常终止）：
+
+| 观察点 | 改前副本 | 运行后 |
+|---|---|---|
+| `look.json` 里的背景图 | `bg_path=C:\Users\36124\Pictures\9f24ece47c62e286f70f27145f0fe233.png` / `bg_fit=Cover` / `bg_dim=135` | **`bg_` 键全部消失**，其余 6 字段原样保留（`style=Visual` / `preset=Dark` / `density=Loose` / `panel_alpha=145` / `overlay_tone=1.0` / `overlay_auto=true`） |
+| `settings.json` | `saved_at=1792944877`，无任何 `bg_` 字段 | 新增 `bg_path=` 同一张 png / `bg_fit=Cover` / `bg_dim=135`（取自老 `look.json`），`saved_at=1793019542` |
+| 解析容错 | —— | 无 `.broken` 文件；`profile.yaml` md5 与原件**逐位相同**（迁移不碰方案文件） |
+| 残留 | —— | `tasklist` 零进程 |
+
+> 迁移那一次会写一次 `settings.json`（新增三个字段 + `saved_at` 更新），这是**预期行为**：迁移结果必须落盘，否则下次启动会再迁一遍。
+
+**变异验证（§3.1，5 条全部变红并报出精确位置；变异均逐位还原，还原后 md5 复算与变异前逐位一致）**
+
+| 变异 | 内容 | 结果 |
+|---|---|---|
+| M1 | `settings::pick_bg` 把 `exists(p)` 短路成恒真（丢掉「文件真的存在」这一档） | `settings::tests::pick_bg_prefers_existing_then_first_nonempty` FAILED，panicked at `src/settings.rs:805` |
+| M2 | `migrate_background` 的「settings 已有值优先」分支加 `&& false` | `app::tests::migrate_background_prefers_a_file_that_exists` FAILED，panicked at `src/app.rs:22681` |
+| M3 | `legacy_default_bg_dim()` 120 → 0 | `app::tests::legacy_look_bg_is_readable_from_old_look_json` FAILED，panicked at `src/app.rs:22611` |
+| M4 | `legacy_profile_bgs` 收集后 `v.reverse()` | `app::tests::legacy_profile_bgs_collects_schemes_in_order` FAILED，panicked at `src/app.rs:22634` |
+| M5 | 给 `theme::Look` 加回 `#[serde(default)] pub bg_path_legacy: String`（+ `Default` 一行） | `app::tests::background_lives_in_settings_not_in_look` FAILED，panicked at `src/app.rs:22743` |
+
+> M1–M5 里有 3 条是「反向证明字段真的搬走了」：M5 直接证明 `Look` 一旦重新序列化 `bg_` 键，守护测试立刻红。
+
+**B 级未验证（需用户在界面上点 1 分钟）**
+1. 外观页选一张背景图 → 右栏「键位组合」切到**第二套** → 图片应当**还在**（旧版会变成该方案的图/消失）。
+2. 导入一份别人带背景图的 YAML → 本机背景**不被替换**（这是用户最初的症状）。
+3. 点「清除」→ 切方案 → 仍然是**没有背景**（清除必须真的清掉程序级值）。
+
+#### B. 第 7 条：`release/build.sh` 的 glibc 死线改成「默认宽松 + `--strict-glibc` 严格」
+
+**改动**：
+- 新增 `--strict-glibc`（等价环境变量 `SCRCPY_PAD_REQUIRE_GLIBC_BASELINE=1`）：**两道**检查保持**硬拒绝** —— ① 主机 `ldd --version` 高于基线 2.31 ⇒ `die`；② 产物 `readelf` 实测最高 `GLIBC_x.y` 高于基线 ⇒ `die`。
+- 不带该开关时默认**宽松**：上述两处改为 `warn`（仍然**打印实测最高 `GLIBC_x.y`**，并提示「发布前请在 Ubuntu 20.04 重建」）后继续构建/打包 ⇒ fork 用户在自己新发行版上能直接编。
+- 老开关 `SCRCPY_PAD_ALLOW_NEW_GLIBC=1` 语义收窄：**只豁免「主机版本」那一道**，不豁免产物复核（此前它对产物检查没有任何影响，容易误以为「设了就安全」）。
+- 用法串更新为 `用法: build.sh [--strict-glibc] [all|linux|windows|clean]`；未知选项直接 `die`。
+
+**A 级验证**：`bash -n release/build.sh` ⇒ `SYNTAX_OK`；用临时 shim（假 `cargo`/`ldd`/`readelf`）+ 假 root 跑 **11 例**，全部符合设计：
+
+| 例 | 场景 | 结果 |
+|---|---|---|
+| A | 宽松：主机 2.39 / 产物 2.39 | 两行 `warn` 后继续打包，`rc=0` |
+| B | 严格：主机 2.39 | `die` 主机版本，`rc=1` |
+| C | 严格：主机 2.31 / 产物 2.39 | `die` 产物符号，`rc=1` |
+| D | 严格：主机 2.31 / 产物 2.31 | `GLIBC baseline check passed`，`rc=0` |
+| E | 仅设 env `SCRCPY_PAD_REQUIRE_GLIBC_BASELINE=1` | `die`，`rc=1`（等价于 `--strict-glibc`） |
+| F | `--strict-glibc` + `SCRCPY_PAD_ALLOW_NEW_GLIBC=1`：主机 2.39 / 产物 2.31 | `rc=0`（只豁免主机那一道，产物仍必须合格） |
+| G | `--bad-option` | 未知选项 `die` |
+| H | 严格 + 无 `readelf` | `die`（严格模式下拿不到证据就是失败） |
+| I | 宽松 + 无 `readelf` | `warn` 跳过产物复核，`rc=0` |
+
+> 临时 shim 目录已删除（零残留）。**以后我构建/打包发布包一律带 `--strict-glibc`**，已同步写入 AGENTS.md §6 交付纪律。
+
+#### C. 测试账本（§3.10）
+Windows 宿主：**443 → 450 passed**（+7：`app::tests` 5 条 + `settings::tests` 2 条，全部为本轮新增守护测试；**无删除**）。Linux 目标本轮只做 `cargo check` + clippy（未跑 Linux 测试，按本轮范围）。
+
+#### D. 本轮改动文件 md5
+
+| 文件 | md5 | 大小/行数 |
+|---|---|---|
+| `src/app.rs` | `863aacd9d8dfbd219c30ffc423538fc0` | 25,501 行 |
+| `src/theme.rs` | `b7a6c3c1246d04d14e030c66c054d8cb` | 993 行 |
+| `src/settings.rs` | `4c9d4745863a8695a5620670bcac7e3b` | 988 行 |
+| `src/keymap.rs` | `0002abacb1920cb41a3d984c10a82ef8` | — |
+| `release/build.sh` | `3a1869eb142b4f5f06072b323f773f58` | — |
+
+> **发布物（`release/` 下 exe/zip/tar.gz）本轮未重建** —— 本批只改源码与构建脚本，未要求出包；四个发布物仍停在 10-23 登记值（C9 对账一致）。下次出包时一并重建并在登记节更新 md5。
+
+#### E. 已知问题 / 诚实备注
+1. **迁移只做一次**：若用户此后手动把 `settings.json` 的 `bg_path` 清空、而 `look.json` 已被改写成无 `bg_` 键，则没有第二个迁移源，背景不会自动回来（需重新选图）。这是「一次性迁移 + 用户可以真的清除」的必然边界；不做常驻兜底，否则「清除背景」永远失效。
+2. **`look.json` 首次启动会被重写**（去掉 `bg_` 三键，其余字段原样）；`profile.yaml` 一行不动。
+3. **背景图不再进「外观」的撤销栈**：`push_undo_snapshot` 只在「选图导致面板不透明度被自动调整」时才压，因为背景图已是程序级设置、不属于某个方案的外观。这是**有意的行为变化**，界面文案也已改成「背景图是程序级设置，不随配置切换」。
+4. 第 2/3/5 条（Linux 遮板 / Linux 光标消隐 / Linux 死键卡键）与第 4 条（折叠）**尚未开工**，按用户批准顺序排在 B2–B5。
+
+#### F. 承诺销账
+第 1 条 ✅、第 7 条 ✅（见 P35/P36 行）。B1 批次完成。
+
+### B2+B3+B4 交付登记：折叠 UI / Linux 死键(卡键)+两个全平台 CLI 参数 / Linux 缺能力如实说明（2026-10-26 21:0x–22:2x）
+
+> **本节的 B2 部分记录的是第一次实现（常显标题 + 内层折叠），它当日被用户否决**：原话「不要折叠里面还要有参数编辑按钮，太丑陋太不优雅了。把这些参数编辑器从折叠里移出去」。最终形态见本节末尾追加的 `#### B2R 第 4 条第二次重做：整卡只有一层折叠`；P37 行描述以 B2R 为准。
+
+
+**用户原话（m00128 同一段话三遍）**
+- 第4条：「录制相关内容很不错，就是太大了，给他做一个折叠的功能，只有点击一个倒三角形状的展开的东西之后，才显现出来。包括组合键中每一个按键的具体设置，也这样隐藏起来，更整洁。」
+- 第5条：「linux出现了windows端许久没出现的死键卡键类似状态，由于出现的突然且随机，没办法给你现状，我只能复制消息记录给你。」（附 trace 级日志：`capture` 反复报 `权威对账:内核认为这些键已抬起,但我们从未收到 release —— 补发抬起以防卡键: KEY_W / BTN_LEFT / KEY_D / KEY_A`，同批出现 `读取 /dev/input/event19 出错(第 1/20 次): No such device` → `打不开 /dev/input/event15: Permission denied`。）
+- 第2/3条：「蒙版不能在linux上用。修复他。」「linux鼠标消隐只能在scrcpy-pad界面上生效，跑到scrcpy上一覆盖就不生效了。」
+
+#### B2 折叠（P37 已修）
+
+写面唯一：`src/app.rs`（25,779 行）。
+
+| 改动 | 位置 | 要点 |
+|---|---|---|
+| `enum TrackTarget` derive 追加 `Hash` | :12030 附近 | egui 0.36.1 的 `AsIdSalt` 需要 Hash+Debug，稳定 id 才能跨帧记住开合状态 |
+| 新增 `fn track_points_detail(ui, pts, pixel)` | :20543 | 逐点坐标明细只列首尾各 12 点（轨迹上限 2000 点，全列会把面板撑爆） |
+| `fn track_rec_card` 拆常显/收起 | :20603 | 常显：● 录制中/已记 N 点、■ 结束并保存、取消、已录轨迹 N 点、重录、清除、● 录制轨迹；收起：`CollapsingHeader::new("轨迹明细与说明").id_salt(("trackrec_fold", target)).default_open(false)`（:20692） |
+| `fn ui_combos` 拆常显/收起 | :12045 | 常显标题行（组合 N + N 个键 + 动作名 + 启用状态 + 删除组合 + ＋新增成员，仍在 `add_enabled_ui(enabled)` 内）；收起：`CollapsingHeader::new("成员与动作详细设置").id_salt(("combo_fold", index)).default_open(false)`（:12127）。折叠头**不**套 `add_enabled_ui`，停用的组合也能点开查看 |
+| `track_rec_config_ui` 留在折叠外 | — | 否则全收起时「录制快捷键」整块配置消失，用户找不到入口 |
+
+守护测试：`app::tests::fold_sections_default_to_closed`（:25681）+ 工具 `fold_statements`/`fold_is_closed`/`fold_salt_has`/`line_offset`。判据：先切 `mod tests {` 之前的生产片段，再按「函数头 → 下一个顶格 fn」切出 `track_rec_card` / `ui_combos` 函数体，逐行切折叠语句 —— 每函数**恰好 1 处**折叠头、含 `.default_open(false)`、id_salt 含规定 token，且常显项的字节偏移早于折叠头、收起项晚于折叠头；另带两条阴性对照（没写 default_open(false) 不算收起；自动 id 不算稳定 id）。按 §3.2 不用转义串模式，只用「这几个词出现在某一行」，与 fmt 重排无关。
+
+**Lead 在冻结树上亲做的变异验证（§3.1，全部变红后逐位还原，还原后 `src/app.rs` md5 `6c48bf7ff42f49c6c74a52e0ce0ef0f7` 与变异前一致 + touch 强制重编）**
+
+| 变异 | 结果 |
+|---|---|
+| F1 删掉 trackrec 折叠的 `.default_open(false)` | FAILED，panicked at `src/app.rs:25694` |
+| F2 trackrec `.default_open(false)` → `true` | FAILED，panicked at `src/app.rs:25695` |
+| F3 trackrec `id_salt(("trackrec_fold", target))` → `("trackrec_foldx", target)` | FAILED，panicked at `src/app.rs:25699` |
+| F4 combo `.default_open(false)` → `true` | FAILED，panicked at `src/app.rs:25735` |
+| F5 combo `("combo_fold", index)` → `("combo", index)` | FAILED，panicked at `src/app.rs:25739` |
+
+**B 级（未验证）**：折叠的 GUI 观感（倒三角位置、默认收起时信息是否够用、长列表滚动是否别扭）只有人能判，观察点：默认风格 + 可视化风格各开一次，[宏] 页录一条轨迹、[键位映射] 页展开一套组合，确认折叠头可见、默认收起、点开后内容完整。
+
+#### B2R 第 4 条第二次重做：整卡只有一层折叠（2026-10-26 21:2x–21:3x，Lead 亲做）
+
+**用户批示（m01044 原话，末尾被截断）**：「凡是加了参数的地方都可以折叠，不要折叠里面还要有参数编辑按钮，太丑陋太不优雅了。把这些参数编辑器从折叠里移出去。另外还有两处」——
+「另外还有两处」后面的内容没有到达，**我按最合理解读只改了组合键卡片，另外两处等用户补完再动**（不在本登记范围内）。
+
+**改法（`src/app.rs` `fn ui_combos`）**
+
+| 项 | 第一次实现（已被否决） | 现在 |
+| --- | --- | --- |
+| 折叠层数 | 2 层：外层 `Frame::group` 卡片常显标题，内层 `CollapsingHeader("成员与动作详细设置")` | **1 层**：卡片自身就是折叠头 |
+| 折叠控件 | `egui::CollapsingHeader::new(..).id_salt(("combo_fold", index)).default_open(false)` | `CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id(("combo_card", index)), false)` |
+| 标题行 | 常显在卡片体里（与折叠头分开） | 放进 `show_header(ui, |ui| {..})`：`组合 N` / `N 个键` / 动作名 / 已启用·已停用 / `删除组合` / `＋ 新增成员` |
+| 参数编辑器 | 在内层折叠里（点两次才看得到） | 直接在 `.body(..)` 里：成员键格、`combo_action_editor`、轨迹录制卡、`仅 FPS` / `长按重复` / `按后延迟` |
+| 停用态 | 折叠头不套 `add_enabled_ui`（可点开查看） | 标题行与卡片体各自套 `add_enabled_ui(enabled, ..)`；折叠头本身不受影响 |
+| id 稳定性 | `(combo_fold, index)` | `(combo_card, index)`，仍是每套组合各记各的展开状态 |
+
+`track_rec_card` 保持「卡片常显状态与按钮 + `轨迹明细与说明` 只读明细折叠」—— 用户反对的是**折叠里还藏着参数编辑器**，而轨迹明细是只读内容（首尾各 12 点 + 说明），没有参数编辑按钮，因此保留；`track_rec_config_ui` 仍在折叠外。
+
+**守护测试改写（`app::tests::fold_sections_default_to_closed` 第②段）**
+
+- 判据从「恰好 1 处 `CollapsingHeader` + `id_salt` 含 combo_fold」改为：组合键页 `CollapsingState::load_with_default_open(` 恰好 1 处；
+  **函数体里出现任何 `CollapsingHeader::new(` 都判红**（这条直接钉住"折叠里不许再套折叠"）；折叠头窗口（前 160 字节到后 220 字节，UTF-8 边界安全）折掉空白后必须含 `"combo_card"`、`index`、`,false,`；
+  常显项四个**代码字面量**（`small_button("删除组合")` / `small_button("＋ 新增成员")` / `format!("{} 个键"` / `"已启用" } else { "已停用"`）必须早于 `.body(`；三个编辑器（`begin_combo_member_capture(` / `key_button_sized(ui, waiting, shown, 62.0)` / `combo_action_editor(`）必须晚于 `.body(`。
+- 第一版判据踩了两个坑（都自己抓出来了）：① 裸词 `"个键"` 被上一行注释「一个键 62px」满足 ⇒ 变异 M-D 假绿；改成整串代码字面量后真红。② 切片起点 `head_at - 160` 落在中文中间 ⇒ `byte index is not a char boundary` panic；改为 `while !page.is_char_boundary(lo) { lo -= 1 }`。
+
+**变异验证 M-A…M-E（Lead 亲跑，全部变红并报出精确位置，逐位还原后 md5 一致 + `touch` 强制重编）**
+
+| 变异 | 结果 |
+| --- | --- |
+| M-A `load_with_default_open(.., false)` → `true`（卡片默认展开） | FAILED at `src/app.rs:25761` |
+| M-B `("combo_card", index)` → `("combo", index)`（id 去掉稳定前缀） | FAILED at `src/app.rs:25753` |
+| M-C 在折叠头前再插一个 `CollapsingState::load_with_default_open`（等于再套一层折叠） | FAILED at `src/app.rs:25733` |
+| M-D1 标题行 `format!("{} 个键"` → `format!("{} 键"` | FAILED at `src/app.rs:25778` |
+| M-D2 `small_button("删除组合")` → `small_button("删掉这套")` | FAILED at `src/app.rs:25778` |
+| M-E `.body(|ui| {` → `.body_unindented(|ui| {`（判据依赖的卡片体标记消失） | FAILED at `src/app.rs:25765` |
+
+**A 级验证（Lead 亲跑，Windows 宿主）**：`cargo fmt --check` ⇒ `FMT_OK`；`cargo test --locked --bin scrcpy-pad` ⇒ **463 passed / 0 failed**（没有新增测试，是改写原有守护测试，所以数不变）；`python ci/clippy_diff.py` ⇒ 36:36 零差异；`cargo check --locked --target x86_64-unknown-linux-gnu --bin scrcpy-pad` ⇒ Finished；`python ci/clippy_diff.py --target linux` ⇒ 36:36 零差异；冒烟 `SCRCPY_PAD_CONFIG_DIR=$(mktemp -d) timeout 10 ./target/debug/scrcpy-pad.exe` ⇒ `RUN_RC=124`（正常被 timeout 终止）、无 panic、`tasklist` 零残留 —— 默认页就是「键位组合」左页，组合卡片这一轮**真的渲染过**。
+
+**文件 md5**：`src/app.rs` `2d958468a9f4c6afbe5eea9b2c827683`（25,810 行）。
+
+#### B3 Linux 死键/卡键 + 两个全平台 CLI 参数（P38 已修）
+
+写面：`src/capture.rs`（改动全在 `#[cfg(target_os="linux")] mod linux` 内，Windows 分支零改动）、`src/priority.rs`、`src/diag.rs`、`src/trace.rs`、`src/main.rs`、`src/engine.rs`。
+
+| 文件 | 改动 | 针对哪条症状 |
+|---|---|---|
+| `src/capture.rs` | `struct Slot` 增 `pressed: HashSet<u16>`（每设备自己的按下集合）；新增 `fn retry_open_after(errno, attempts) -> bool`（仅 EACCES/EPERM/ENODEV 且 attempts<3）与 `fn take_vanished_pressed(alive, delivered, path, token) -> Vec<u16>`（令牌不符不动；只移出该设备自己的键，仅当没有其他设备也按着同一码才从全局 `delivered` 删除）；`scan` 的 open 改同轮退避 3×50ms；`device_loop` 收 `identity: String`（by-id 稳定名），连续 20 次读失败放弃时**立刻**把该设备还按着的键补抬（不等 400ms 的 `reconcile_keys`），WARN 带 by-id 名 + 设备名 + path + 时刻 + 键列表 | 「死键卡键」两个方向：设备复位/换号导致 release 永久丢失；重扫时 EACCES 造成的无读者真空窗 |
+| `src/priority.rs` | `fn warn_once(&AtomicBool) -> bool`（swap 语义）+ `static NICE_WARNED`；Linux nice 失败**只 WARN 一次**，文案给 `sudo setcap cap_sys_nice+ep <二进制>` 与 systemd `LimitNICE=-5` 两条补救 | Fedora 44 上 `nice=-5: Permission denied` 每线程刷屏，用户看不出是「一条可修的策略问题」 |
+| `src/diag.rs` | `fn pick_level(cli, env, settings)`（命令行 → 环境变量 → settings → 默认 Info）；`pub fn set_cli_level` + `CLI_PINNED`/`CLI_LEVEL` + `fn should_apply(source, pinned)`（命令行钉住的级别不许被后续来源冲掉）；`pub fn clock_now()`；`write_raw` → `write_raw_meta`，**在拿 diag 锁之前**把每行镜像进轨迹（避免互锁） | 第5条要求「诊断也重定向到轨迹内」——用户要一个文件就能看到全部现场 |
+| `src/trace.rs` | `set_diag_mirror`/`diag_mirror_enabled`/`ensure_enabled`/`pub fn diag`/`diag_line`/`esc`；记录形状 `{"t":..,"k":"diag","e":"diag","lv":..,"tag":..,"at":..,"text":..}`；旧 `read()` 的 `match (k,e)` 走 `_ => {}` ⇒ 天然向后兼容；`--trace-diag` 时轨迹未开会自动开启 | 同上 |
+| `src/main.rs` | `struct Cli` + `fn usage()` + `fn parse_cli(&[String]) -> Result<Cli,String>`；非法/缺值 ⇒ 打印用法 + `exit(64)`，且发生在 `diag::init` 之前（不碰配置目录、不占实例锁） | 用户点名要「从终端启动加参数，直接以 trace 启动并重定向」 |
+| `src/engine.rs` | **未改机制**：`self_heal_decision` 本来就不看时间（走设备端账本 `ZeroWhileDown` + 连续 2 份新采样、`SELF_HEAL_MIN_GAP=300ms`），只补 doc 说明「为什么刻意没有按住多久的阈值」「本函数只是兜底不是主触发」（AGENTS §7 红线）+ 1 条长按不误抬测试 | 排除「引擎侧超时回收」是错误主触发 |
+
+新增 14 条测试（Windows 侧可编译 10 条 + Linux 独占 4 条）：`capture::linux::tests` 的 `vanished_device_releases_only_its_own_keys` / `vanished_device_with_stale_token_touches_nothing` / `shared_code_stays_in_the_ledger_while_another_device_holds_it` / `open_retry_only_retries_transient_errnos_and_is_bounded`；`priority::tests::priority_warning_fires_once_then_stays_quiet`；`diag::tests::level_priority_is_cli_then_env_then_settings` / `cli_level_pin_rejects_other_sources`；`trace::diag_mirror_tests::diag_line_is_valid_json_and_escapes_text` / `diag_records_are_invisible_to_the_existing_reader`；`tests::log_level_is_parsed_from_the_command_line` / `bad_or_missing_log_level_is_rejected` / `trace_diag_flag_and_foreign_arguments_are_handled` / `usage_lists_both_new_switches`；`engine::tests::a_long_healthy_press_is_never_lifted_by_elapsed_time`。
+
+**Lead 亲做的变异验证（6 条，全部变红后逐位还原）**
+
+| 变异 | 结果 |
+|---|---|
+| G1 `warn_once` 的 `swap(true)` → `swap(false)`（每线程都告警） | FAILED，panicked at `src/priority.rs:139`（「第二次失败必须闭嘴」） |
+| G2 `pick_level` 的 `cli` 分支加 `.filter(\|_\| false)`（命令行不再优先） | FAILED，panicked at `src/diag.rs:1007` |
+| G3 `should_apply` 恒真（忽略命令行 pin） | FAILED，panicked at `src/diag.rs:1050` |
+| G4 `diag_line` 的 `esc(text)` → `text`（不转义） | FAILED，panicked at `src/trace.rs:911` |
+| G5 `parse_cli` 把 `"--log-level"` 分支改名（参数不认） | FAILED，panicked at `src/main.rs:576` |
+| G6 `parse_cli` 把 `"--trace-diag"` 分支改名 | FAILED，panicked at `src/main.rs:628` |
+
+注意：G5/G6 首轮用过滤词 `main::tests` 跑出「0 passed / 463 filtered out」——bin 目标的 crate root 就是 `main.rs`，模块路径里没有 `main::`，正确过滤词是 `tests::log_level` / `tests::trace_diag`。这条记进来是因为「筛选词写错 ⇒ 看起来全绿」和假守护测试同样危险。
+
+**A 级实测（本机 Windows 宿主，target/debug 二进制）**
+
+| 命令 | 实测 |
+|---|---|
+| `scrcpy-pad.exe --log-level bogus` | `BAD_RC=64`，首行 `scrcpy-pad: 无法识别的日志级别 "bogus"(可用 error / warn / info / debug / trace)` + 完整用法 |
+| `scrcpy-pad.exe --log-level`（缺值） | `MISSING_RC=64`，首行 `scrcpy-pad: --log-level 后面缺少级别` |
+| `SCRCPY_PAD_CONFIG_DIR=<mktemp> scrcpy-pad.exe --log-level trace --trace-diag`（8s） | `RUN_RC=124`（正常被 timeout 终止）；`diagnostics.log` 第 3 行 `# 级别 trace (命令行 --log-level)` ⇒ 命令行来源已生效 |
+| 同上，`--trace-diag` 不带 `--trace` | 轨迹文件自动开启：`trace-1793020749.jsonl` 共 302 行，其中 `"k":"diag"` 20 行、`"k":"in"` 256 行；逐行 `json.loads` ⇒ `JSON_OK=302 JSON_BAD=0` |
+| `SCRCPY_PAD_CONFIG_DIR=<mktemp>` 跑完 | 临时目录 `rm -rf`，`tasklist` 无残留进程 |
+
+**Linux 侧实跑（WSL Ubuntu-20.04，`CARGO_TARGET_DIR=/tmp/lintarget`）**：`cargo test --locked --bin scrcpy-pad` ⇒ **451 passed / 0 failed**，其中包含 4 条 Windows 上根本不存在的死键测试（`capture::linux::tests::*`）。这些测试第一次真的跑起来就发现了 Lead 自己的一个误判：它与 Windows 侧 cargo 并发跑时，子进程启动（测试二进制在 `/mnt/d`）超过 10s 预算，`instance::tests::another_process_holding_the_guard_is_detected` 判红 —— **不是守卫失效，是机器忙**（§3.9 flaky 必须查根因：单独重跑 1.53s 全绿）。已加固：等待预算 10s→40s（1600×25ms），并在等待循环里 `child.try_wait()` 一旦发现子进程自己退出就立刻报「子进程已退出(status)」而不是让人去猜；变异「`0..1600` → `0..1`」⇒ FAILED，panicked at `src/instance.rs:393`。
+
+**B 级（未验证，需用户 Fedora 真机一轮）**
+1. 死键是否真的消失：复现一次（切窗口/插拔键鼠/唤醒），观察点是 `diagnostics.log` 里出现 `设备消失…还按着: KEY_X` 之后**紧接着**出现补发抬起，且游戏里不再卡键；`priority` 的 `nice=-5` 告警**只出现一次**。
+2. `--trace-diag` 在真机 trace 级别下的体积（已知会明显变大，仍只保留最近 3 份）。
+3. 已知缺口（写在注释里、非缺陷）：panic hook 直接写 sink（不经 `write_raw`）⇒ panic 那一行不会进轨迹；`diag::init` 头部几行进不了轨迹（单实例守卫必须先于 trace，否则被拒的那次启动会多留一份轨迹）。
+
+#### B4 Linux 缺能力如实说明（P39 已修，A 档）
+
+| 文件 | 改动 |
+|---|---|
+| `src/theme.rs` | `MouseCaptureMode::hint` 改平台分叉：`hint(self) -> &str` 转调 `shield_hint(cfg!(windows))` / `mask_hint(crate::mask::available())`；不支持分支明说「本平台不支持」+ 给退路（隔膜写「选它不会有任何效果」并指向帮助节；遮板写「选它只会自动退回隔膜(界面上会红字提示)」）。平台判断做成**参数**而不是内联 cfg，理由是这段字是给用户的承诺，两个分支必须在同一台机器上都能被测到（§3.3 阳/阴对照）。守护测试 `theme::tests::mouse_capture_hints_disclose_platform_gaps` |
+| `src/help.md` | 新增整节 `## Linux 上做不到的几项（如实说明）`（遮板 / 鼠标独占(隔膜) / 指针消隐 / 钉住光标 四条 + 两段可复制命令 + 「强制 X11 只是启动方式、不改变结论」免责句）；新增 `## 命令行参数`（`--log-level` / `--trace-diag` / `--trace` / `--selftest` / `--mask-selftest` + 组合示例）；「诊断日志级别」条补命令行优先级。**用嵌套列表不用表格**——`src/help.rs` 的渲染器不支持 markdown 表格（`Event::Start(Tag::Table/TableCell)` 全落在 `_ => {}`），表格会变成一长串 run-on 文本；`grep -c "^|" src/help.md` = 0 |
+| `README.md` | §13 平台差异表补 `遮板（蒙版）` 行（Linux 不支持、选它自动退回隔膜）、`鼠标独占（隔膜）` 行补原因、`指针消隐` 行改成「Windows 全系统生效 / Linux 只在本程序窗口内生效，光标移到 scrcpy 窗口会重新出现」；表后追加「Linux 上为什么没有遮板/隔膜」原理段 + `env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET ./scrcpy-pad` 与 `Exec=` 写法 |
+| `旧时代完整版Readme.md` | 新增 `### 8.1 Linux 上做不到的几项（如实说明）`，同四条 + XWayland 命令 + `Exec=` 写法 |
+| `src/help.rs` | 修两个真实缺陷（不是为测试让路）：① 围栏代码块被当正文渲染 —— `Event::Text` 原先无条件 append 到 `job`，`Tag::CodeBlock` 只登记缓冲、`TagEnd::CodeBlock` 推的是**空** LayoutJob；现在 Text/SoftBreak/HardBreak 三支都先判 `code_block` 缓冲（块内换行保留）。`help.md` 此前一个代码块都没有，这条路径从未被走过。新增 `fenced_code_blocks_render_separately_in_monospace`（合成 markdown 驱动 + 阳性 Monospace/非透明底色 + 阴性 Proportional/透明底色 + 先断言 `HELP_MD` 里真有代码块，防自娱自乐；必须连跑 3 帧，窗口第一帧只登记尺寸）。为可测性把 `render` 拆成壳 + `render_markdown(ui, md)`。② 索引点击测试 `clicking_index_entry_scrolls_body` 的红不是假红 —— 窗口 `default_height(640)`，而测试选的是「文档最后一节」索引行（实测 y=655）落在窗口外，点击送不到；改为在 `SAFE_TOP=60 / SAFE_BOTTOM=520` 带内选当前可见的最靠后一节 |
+
+变异验证（help.rs，全部变红后逐位还原，`src/help.rs` md5 恒为 `2f9322f97a2ca902b6e56b4bdd2cc60d`）：M9 `Tag::CodeBlock(_) => self.code_block = Some(String::new())` 改 `=> {}` ⇒ FAILED at `src/help.rs:718`；M10 `TagEnd::CodeBlock` 的 `fmt(true)` → `fmt(false)` ⇒ FAILED at `:718`；M11（theme）见 B1 之前 M6–M8：`shield_hint` 的 `if supported` → `if true`、`mask_hint(crate::mask::available())` → `!…`、遮板不支持文案删「**自动退回隔膜**」⇒ 全部红；M12 `SAFE_BOTTOM` 520 → 880 ⇒ `clicking_index_entry_scrolls_body` FAILED at `:612`。
+
+**行尾事故（已修）**：`src/help.rs` 原是 CRLF（autocrlf 检出产物），我用 python 以 `\n` 插行后变成混合行尾；已整份规范化为 LF（`.gitattributes` 规定 LF）。`src/help.md` 是纯 CRLF，始终按 `\r\n` 处理。另有一次「去围栏做 bisect」用 `str.replace("```bash\n", …)` 对 CRLF 文本永不匹配 ⇒ 该次 bisect 结论无效（真根因是点击坐标），别把它当证据。
+
+#### B2R2 轮盘映射页 + FPS 功能页（用户 m01044「另外还有两处」）—— 2026-10-26 22:0x–22:5x（队友 fold-wheel-fps 落盘，Lead 复核修复）
+
+**裁定**：m01044 末句「另外还有两处」被截断 ⇒ Lead 按上下文裁定为**轮盘映射页**（`fn ui_wheels`）与 **FPS 功能页**（`fn ui_aim_body`），键位映射行不动（它本来就是一行一键、没有参数堆）。执行方式：派 fresh 队友 `fold-wheel-fps`（subagent `01182f77`）只改 `src/app.rs`、只许 `cargo fmt` + `cargo check`；Lead 在冻结树上复核并亲跑门禁。
+
+| 位置 | 改动 |
+|---|---|
+| `fn ui_wheels`（原 :12276） | 每套轮盘 = `Frame::group` 里一张**一层折叠卡**：`ui.make_persistent_id(("wheel_card", i))` + `CollapsingState::load_with_default_open(ui.ctx(), card_id, false)`。折叠头常显 `ui.label(title)` / `ui.small(old_kind.label())` / 仅 `WheelKind::Standard` 时 `ui.small(old_mode.label())` / `small_button("删除")`。`.body` 内是全部参数编辑器：kind/mode 下拉、`KeySlot::WheelEnable(i)`、方向数 2..=8、`KeySlot::WheelDir{wheel:i,dir:d}`、`CoordSlot::WheelDir`/`WheelCenter(i)`、`radius_input(ui, &mut pr, RADIUS_RANGE_WHEEL_PX, None)`、`execute_duration_ms` 等（逐行搬运，未改语义/顺序） |
+| `fn ui_aim_body`（原 :16420） | FPS 页拆成 4 张一层折叠卡：`("aim_card_input", 0)` 摘要「启用、视角输入与锚点」/ `("aim_card_feel", 1)`「灵敏度、归中与开关按键」/ `("aim_card_recoil", 2)`「压枪(后坐力)」/ `("aim_card_shield", 3)`「鼠标独占与自救」。折叠头只有标题，正文保留原 `ui.heading(...)` 分组标题与全部分组内容（顺序未变，`aim_page_keeps_its_field_order` 仍绿）。新增 `let aim_scrcpy_foreground = self.scrcpy_is_foreground();`（:17526）：`let aim = &mut g.profile.aim;` 之后不能再整份借 `self`，故在借用建立前取出该标量 |
+
+**行为变更（登记，不许静默）**：删除常量 `RECOIL_TIER_COLLAPSE_AT` 与压枪档位表的内层折叠 ⇒ **档位表恒定内联展开**（原先档位一多就自动收起）。理由：第 4 条明确否决「折叠里再藏折叠/按钮」；档位表不再是折叠项。核对：`grep -rn RECOIL_TIER_COLLAPSE_AT src/` = **0 命中**。用户从未见过「自动收起」这个行为（默认全关时档位表只有一档），故不视为回退；若日后档位表变得很长，应改为页内分组而非二层折叠。
+
+**守护测试**：`app::tests::fold_sections_default_to_closed` 新增 ③ 轮盘段（:25870 起）与 ④ FPS 段（:25934 起），沿用 ② 组合键段的四条口径：① 页面里 `CollapsingState::load_with_default_open(` 恰 1 处/每卡；② 函数体里出现任何 `CollapsingHeader::new(` 即红；③ 折叠头窗口（`head_at-160 … head_at+220`，两端口都要 `is_char_boundary` 回退）折空白后须含 `("wheel_card", i)` / `,false,`；④ 常显项必须早于 `.body(`、参数编辑器必须晚于 `.body(`（④ 段还加了 `owner_body(at)` 归属判据：分组标题必须落在**它所属那张卡**的 body 之后，不是任意卡之后）。
+
+**Lead 复核抓到两个真问题（都已修）**
+
+1. **队友自报「全部通过」不成立**：首跑 `cargo test` = `462 passed / 1 failed`，失败者是队友自己写的守护测试 —— `thread 'app::tests::fold_sections_default_to_closed' panicked at src\app.rs:25945:28: end byte index 13445 is not a char boundary; it is inside '重' (bytes 13443..13446 of string)`。根因：④ 段 `&page[salt_at..(salt_at + 520).min(page.len())]` 只对**起点**做了 `is_char_boundary`，**终点**落在多字节字符中间。修法：新增 `fn slice_within(s: &str, start: usize, max_len: usize) -> &str`（:25741，终点向前回退到边界），②③④ 三处切片统一改用它。**教训（补进 §3.2 口径）：切片两端都要回退，起点对了不代表终点对；队友用 Node 复刻判据时，覆盖不到 Rust 按字节切分的 panic。**
+2. **clippy 新增告警（队友只跑 fmt+check，没跑 clippy）**：`cargo clippy --all-targets` 报 `src/app.rs:25975:13: warning: called Iterator::last on a DoubleEndedIterator` —— 命中 `ci/clippy_diff.py` 的 `(文件, 消息)` 集合 ⇒ **Windows 与 Linux 两侧都算新增**。改 `.filter(|p| p.0 < at).last()` → `.rev().find(|p| p.0 < at)`（语义等价，`spans` 按位置递增）。修后 clippy 双侧 36:36 零差异。**教训：`--all-targets` 才把测试代码算进去；我第一次用 `cargo clippy --bin` 找它零命中（测试代码不在 bin 目标里）。**
+
+**变异验证（Lead 亲做，脚本 `%TEMP%/mut_guard.py` + `%TEMP%/mut6b.py`：二进制读写、每次从 `%TEMP%` 备份还原并复算 md5）**
+
+| 变异 | 结果 |
+|---|---|
+| M1 `("wheel_card", i)` → `("wheel", i)` | red @25890 |
+| M2 轮盘折叠头里插回 `egui::CollapsingHeader::new("x")` | red @25878 |
+| M3 删掉常显项 `ui.small(old_kind.label())` | red @25908 |
+| M4 轮盘 `load_with_default_open(..., false,)` → `true,` | red @25894 |
+| M5 `("aim_card_recoil", 2)` 卡的 `false,` → `true,` | red @25960 |
+| M6 把 `ui.heading("压枪")` 挪进 recoil 卡折叠头 | red @25994（`owner_body` 判据） |
+
+还原后 `src/app.rs` md5 逐位一致（M1–M5 批 = `6559b5dee3b5e74e22bbfc478b249b3f`；改 `.rev().find()` 之后重跑 M6 仍 red @25994，md5 `a28e18445502ccba89fd247c67cb7caf`）。踩坑：M6 第一次锚点 `count=0` —— Python **`bytes` 字面量不解释 `\u` 转义**，而 `decode("unicode_escape")` 又会把 UTF-8 汉字打乱；改法是把锚点正文写成 UTF-8 文件、脚本按 `rb` 读。
+
+**门禁（Lead 亲跑，冻结树）**：`cargo fmt --check` = 0；`cargo test --locked --bin scrcpy-pad` = **463 passed / 0 failed**；`python ci/clippy_diff.py` = 36:36 零差异；`python ci/clippy_diff.py --target linux` = 零差异；`cargo check --locked --target x86_64-unknown-linux-gnu --bin scrcpy-pad --tests` = `Finished`；冒烟 `SCRCPY_PAD_CONFIG_DIR=$(mktemp -d) timeout 10 ./target/debug/scrcpy-pad.exe` ⇒ `RUN_RC=124`、stderr 空、panic 0、`tasklist` 零残留、临时目录内生成 `diagnostics.log`/`look.json`/`settings.json`/`trace-*.jsonl`（默认页是「键位组合」，组合卡的一层折叠在真实渲染里跑过）。
+
+**B 级（未验证）**：轮盘页与 FPS 页的真实渲染没有自动化覆盖 —— 本项目没有「构造整个 `PadApp`」的测试脚手架（结构体字段太多），只有源结构护栏；「点开标签、逐卡展开不 panic / 观感」需用户看一眼。可视化风格（`ui_aim` / `ui_visual_fps`）本轮未改，仍是旧布局。
+
+**测试账本（§3.10）**：463 不变 —— 本轮只**改写**现有守护测试（② 段）并向其中加 ③④ 两段判据，未新增 `#[test]`；`slice_within` 是辅助函数。Linux 侧本轮未重跑全量（改动全在测试代码与一处测试辅助函数，`--tests` 交叉 check 通过）。
+
+#### 测试账本（§3.10，带宿主标签）
+
+- Windows 宿主：443（B1 前）→ 450（B1 后）→ **463**（本批 +13 = B2 折叠 1 + B3 Windows 侧 10 + help/theme 各 1；`git diff` 里新增 `fn xxx()` 共 20 个：B1 的 7 + 本批 13）。
+- Linux 宿主（WSL Ubuntu-20.04）：**451 passed / 0 failed**（本批首测）。两宿主差 12 = Windows 独有 22 条 − Linux 独有 10 条，逐条名单已用 `cargo test -- --list` 两侧 diff 核对：Windows 独有是 `capture::windows::tests::*`（19 条）+ `keymap::tests::u5_enum_windows_sweep_cost_is_measured` + `app::tests::write_atomic_reports_readonly_target_and_keeps_old_content`；Linux 独有是 `capture::linux::tests::*`（9 条，含 4 条本批新增死键测试）+ `instance::tests::file_lock_rejects_a_second_holder`。
+
+#### 门禁（Lead 亲跑，冻结树）
+
+| 门 | 命令 | 结果 |
+|---|---|---|
+| fmt | `cargo fmt --check` | `FMT_OK`（0） |
+| test（Windows） | `cargo test --locked --bin scrcpy-pad` | `463 passed; 0 failed` |
+| clippy（Windows） | `python ci/clippy_diff.py` | 「与基线零差异」（36:36） |
+| test（Linux） | WSL `cargo test --locked --bin scrcpy-pad` | `451 passed; 0 failed` |
+| clippy（Linux） | `python ci/clippy_diff.py --target linux` | 「与基线零差异」 |
+| Linux 交叉 check | `cargo check --locked --target x86_64-unknown-linux-gnu --bin scrcpy-pad --tests` | `Finished`（含 4 条 linux-only 测试的类型检查） |
+
+#### 文件与 md5（本轮终态）
+
+| 文件 | md5 | 备注 |
+|---|---|---|
+| `src/app.rs` | `a28e18445502ccba89fd247c67cb7caf` | 26,024 行（B1 后 25,501 → B2 折叠 25,779 → B2R2 轮盘/FPS 页 26,011 → 切片修复+clippy 修正 26,024） |
+| `src/capture.rs` | `8e196cea6ba3dfd843e83dd6d55d36a7` | Linux mod 内死键修复 |
+| `src/priority.rs` | `22bbf64a903df48518853cc2584d8d09` | warn_once |
+| `src/diag.rs` | `e298fffff3c9705ed5200e9494b879d2` | 优先级链 + 轨迹镜像 |
+| `src/trace.rs` | `1ab94280eb6e54f52ce0f924f7e8b4d9` | diag 记录 |
+| `src/main.rs` | `690bb32505e68d0aa0f5d462d26e782d` | CLI |
+| `src/engine.rs` | `3aab5f2d51846080b0855bc8f5d35330` | 只补 doc + 1 测试 |
+| `src/theme.rs` | `293d710c4b1f4d8bef60b54eedf27fda` | 平台分叉文案（B1 终态值） |
+| `src/settings.rs` | `4c9d4745863a8695a5620670bcac7e3b` | B1 终态值 |
+| `src/keymap.rs` | `0002abacb1920cb41a3d984c10a82ef8` | B1 终态值 |
+| `src/help.rs` | `2f9322f97a2ca902b6e56b4bdd2cc60d` | 738 行（代码块渲染修复 + 索引测试修正） |
+| `src/help.md` | `55802d83fc151a954df7629c9eec7af0` | 325 行（新增两节） |
+| `src/instance.rs` | `2e7605a97d28f8f91a46ea3bceecc7b6` | 等待预算加固 |
+| `README.md` | `95f2ce6cf4796e39e78fa9240d36ec62` | §13 平台差异 |
+| `旧时代完整版Readme.md` | `1b22a3dd1c9cdda2a2678f268312f628` | §8.1 |
+| `release/build.sh` | `3a1869eb142b4f5f06072b323f773f58` | B1 终态值（第7条） |
+
+**发布物（release/ 下 exe/zip/tar.gz）本轮仍未重建**，仍停在 10-23 登记值（C9 一致）。出包时必须带 `--strict-glibc`（AGENTS §6.3 子条）。
+
+#### 已知问题 / 未做
+0. **第 4 条只改了组合键卡片**：用户 m01044 末尾「另外还有两处」被截断，未确认是哪两处（候选：轮盘映射页 / FPS 功能页 / 键位映射行），未动。
+1. **B5（第2/3条 B 档：X11 真实现）未做**。A 档已把「Linux 没遮板 / 光标消隐只在本窗口」变成用户可见事实；B 档要做的是在 X11/XWayland 下真的建一块覆盖投屏区的窗口（顺带解决指针消隐），需要 `x11rb` 提为直接依赖（`Cargo.lock` 里已有传递依赖，不新增下载）与真 X11 环境验证。本机没有 X server，盲写等于交付未验证代码 —— 按 §0.1/§0.2 不做，等用户决定是「先在 XWayland 下试」还是「放弃 B 档、保留 A 档」。
+2. GUI 观感（折叠、帮助新节排版）全部属 B 级，需要用户看一眼。
+3. `--trace-diag` 在 trace 级别下 jsonl 明显变大（保留策略仍是最新 3 份）。
+4. 本批没有触碰发布物，下次出包会同时重建 windows zip 与 linux tar.gz 并登记新 md5。
+
+第 4 条 ✅（B2）、第 5 条 ✅（B3，待真机复验）、第 2/3 条 A 档 ✅（B4）；B5 待裁决。
 
 ## 9. 交付前自检清单（逐项打勾才能交付）
 

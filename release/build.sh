@@ -10,6 +10,17 @@
 #   ./build.sh windows    # 只构建 Windows(需要 mingw-w64 交叉编译工具链)
 #   ./build.sh clean      # 删除所有构建产物
 #
+# 选项(可放在子命令之前):
+#   --strict-glibc        # 严格 glibc 基线:主机 glibc 与产物符号版本都必须 <= 2.31,
+#                         # 否则直接拒绝。**发布/打包时必须带**(见下)。
+#
+# glibc 基线模式(用户 2026-10-26 定):
+#   默认**宽松** —— 主机 glibc 比基线新只警告并继续构建,产物 readelf 复核也降为警告
+#   (仍然打印实测最高 GLIBC_x.y),方便 Fedora/Arch 等新发行版直接编译自用。
+#   带 --strict-glibc(等价 env SCRCPY_PAD_REQUIRE_GLIBC_BASELINE=1)恢复硬拒绝:
+#   保证对外发布的二进制能被 glibc 2.31 及以上的发行版加载。
+#   老开关 SCRCPY_PAD_ALLOW_NEW_GLIBC=1 仍然只豁免「主机版本」那一道,不豁免产物复核。
+#
 # 产物:
 #   linux-x86_64/                        可直接发布的 Linux 包
 #   windows-x86_64/                      可直接发布的 Windows 包
@@ -103,9 +114,17 @@ build_linux() {
     if [ -z "$libc_ver" ]; then
         die "cannot detect glibc version with ldd --version"
     fi
-    if [ "$(printf '%s\n%s\n' "$baseline" "$libc_ver" | sort -V | tail -n 1)" != "$baseline" ] \
-        && [ "${SCRCPY_PAD_ALLOW_NEW_GLIBC:-0}" != "1" ]; then
-        die "glibc $libc_ver is newer than baseline $baseline; build Linux in Ubuntu 20.04 or set SCRCPY_PAD_ALLOW_NEW_GLIBC=1"
+    if [ "$STRICT_GLIBC" = "1" ]; then
+        info "glibc 基线:严格模式(主机与产物都必须 <= $baseline)"
+    else
+        info "glibc 基线:宽松模式(只提示;发布打包请加 --strict-glibc)"
+    fi
+    if [ "$(printf '%s\n%s\n' "$baseline" "$libc_ver" | sort -V | tail -n 1)" != "$baseline" ]; then
+        if [ "$STRICT_GLIBC" = "1" ] && [ "${SCRCPY_PAD_ALLOW_NEW_GLIBC:-0}" != "1" ]; then
+            die "glibc $libc_ver is newer than baseline $baseline; build Linux in Ubuntu 20.04 or set SCRCPY_PAD_ALLOW_NEW_GLIBC=1"
+        fi
+        warn "主机 glibc $libc_ver 高于基线 $baseline:继续构建,但产物可能无法在旧发行版运行"
+        warn "  发布前请在 Ubuntu 20.04(glibc 2.31)重建,或加 --strict-glibc 让本脚本直接拒绝"
     fi
 
     local target_dir="${CARGO_TARGET_DIR:-$ROOT/target-linux-glibc231}"
@@ -117,12 +136,19 @@ build_linux() {
     local max_glibc
     if command -v readelf >/dev/null 2>&1; then
         max_glibc="$(readelf --version-info "$exe" | grep -o 'GLIBC_[0-9.]*' | sed 's/^GLIBC_//' | sort -V | tail -n 1)"
-        [ -n "$max_glibc" ] || die "cannot read GLIBC symbol versions from $exe"
-        if [ "$(printf '%s\n%s\n' "$baseline" "$max_glibc" | sort -V | tail -n 1)" != "$baseline" ]; then
-            die "artifact requires GLIBC_$max_glibc, above baseline $baseline"
+        if [ -z "$max_glibc" ]; then
+            # 严格模式下"读不出符号版本"= 无法证明兼容性,fail-closed
+            [ "$STRICT_GLIBC" = "1" ] && die "cannot read GLIBC symbol versions from $exe"
+            warn "无法从 $exe 读出 GLIBC 符号版本,跳过基线校验"
+        elif [ "$(printf '%s\n%s\n' "$baseline" "$max_glibc" | sort -V | tail -n 1)" != "$baseline" ]; then
+            [ "$STRICT_GLIBC" = "1" ] && die "artifact requires GLIBC_$max_glibc, above baseline $baseline"
+            warn "产物需要 GLIBC_$max_glibc > 基线 $baseline:该二进制无法在 glibc $baseline 的系统上运行!"
+            warn "  发布前请在 Ubuntu 20.04 重建;--strict-glibc 会把这一条变成硬错误"
+        else
+            info "GLIBC baseline check passed: max GLIBC_$max_glibc"
         fi
-        info "GLIBC baseline check passed: max GLIBC_$max_glibc"
     else
+        [ "$STRICT_GLIBC" = "1" ] && die "readelf not found; cannot verify GLIBC baseline in --strict-glibc mode"
         warn "readelf not found; GLIBC symbol check skipped"
     fi
 
@@ -217,6 +243,32 @@ clean() {
 
 # ---------------------------------------------------------------- 入口
 
+# 第7条实现(用户 2026-10-26):glibc 基线默认宽松、显式 --strict-glibc 才严格。
+# 两个来源取"或":命令行开关 或 环境变量,任一为 1 即严格(fail-closed)。
+STRICT_GLIBC=0
+if [ "${SCRCPY_PAD_REQUIRE_GLIBC_BASELINE:-0}" = "1" ]; then
+    STRICT_GLIBC=1
+fi
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --strict-glibc)
+        STRICT_GLIBC=1
+        shift
+        ;;
+    --)
+        shift
+        break
+        ;;
+    -*)
+        die "未知选项: $1(可用: --strict-glibc;子命令: all|linux|windows|clean)"
+        ;;
+    *)
+        break
+        ;;
+    esac
+done
+
 case "${1:-all}" in
 all)
     build_linux
@@ -235,7 +287,7 @@ clean)
     clean
     ;;
 *)
-    echo "用法: $0 [all|linux|windows|clean]"
+    echo "用法: $0 [--strict-glibc] [all|linux|windows|clean]"
     exit 1
     ;;
 esac
